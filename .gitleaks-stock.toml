@@ -1,0 +1,6 @@
+# The stock gitleaks secret rules, run by scripts/privacy-scan.sh as a pass of
+# its own (explicit, so it can never be shadowed by the project rule file).
+title = "scia stock secret rules"
+
+[extend]
+useDefault = true

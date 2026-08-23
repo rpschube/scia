@@ -1,0 +1,44 @@
+name: privacy
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: privacy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+jobs:
+  privacy:
+    name: privacy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -sSL -o gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gl.tgz" | sha256sum -c -
+          sudo tar -xzf gl.tgz -C /usr/local/bin gitleaks
+          rm gl.tgz
+          gitleaks version
+
+      - name: Every rule bites
+        run: scripts/privacy-selftest.sh
+
+      - name: Scan history, tree, messages, identities
+        env:
+          SCIA_SCAN_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+        run: scripts/privacy-scan.sh --ci

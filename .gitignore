@@ -1,0 +1,39 @@
+# Build output
+/target/
+**/target/
+
+# Local-only files (never committed)
+*.local
+*.local.*
+.env
+.env.*
+*.pem
+*.key
+
+# Logs, dumps, transcripts, scratch — deny by default
+*.log
+*.logs
+*.jsonl
+*.dump
+*.trace
+*.hprof
+core.*
+/logs/
+/scratch/
+/tmp/
+/transcripts/
+/dumps/
+/out/
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Merge leftovers
+*.orig
+*.rej

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Pushes are public. Nothing leaves this machine without a clean privacy scan.
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+"$root/scripts/privacy-selftest.sh"
+"$root/scripts/privacy-scan.sh"

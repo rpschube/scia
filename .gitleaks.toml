@@ -1,0 +1,86 @@
+# scia privacy & information-hygiene rules.
+#
+# The repository is public. These rules run locally (pre-push, `just gate`) and
+# in CI on every pull request and push. scripts/privacy-scan.sh runs them as a
+# separate pass next to the stock gitleaks secret rules: the stock global
+# allowlist (stopwords such as "home") would otherwise swallow path matches,
+# so this file deliberately does NOT extend the default configuration.
+# Some product/workspace names are written as hex escapes so that this file
+# does not itself contain the strings it blocks.
+
+title = "scia privacy rules"
+
+[extend]
+useDefault = false
+
+[allowlist]
+description = "Files that legitimately contain matching text"
+paths = [
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)scripts/privacy-selftest\.sh$''',
+]
+
+# --- Local machine paths -----------------------------------------------------
+
+[[rules]]
+id = "scia-home-path"
+description = "Local home-directory path (Linux, macOS, Windows)"
+regex = '''(?:/home/|/Users/|[A-Za-z]:\\+Users\\+)[A-Za-z0-9._-]+'''
+keywords = ["/home/", "/Users/", "Users"]
+
+[[rules.allowlists]]
+description = "Placeholder user names used in documentation"
+regexTarget = "match"
+regexes = [
+  '''(?i)(?:/home/|/Users/|Users\\+)(?:user|you|username|yourname|me|runner|\$USER|\$\{USER\}|<user>|<you>|<name>)\b''',
+]
+
+# --- E-mail addresses --------------------------------------------------------
+
+[[rules]]
+id = "scia-email"
+description = "E-mail address other than the project's public contact"
+regex = '''[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'''
+keywords = ["@"]
+
+[[rules.allowlists]]
+description = "The public project identity and well-known placeholder domains"
+regexTarget = "match"
+regexes = [
+  '''^ryan@stomale\.cc$''',
+  '''@example\.(?:com|net|org)$''',
+  '''@(?:localhost|invalid|test|example)$''',
+  '''^noreply@github\.com$''',
+  '''@users\.noreply\.github\.com$''',
+]
+
+# --- Private workspace / vault references ------------------------------------
+
+[[rules]]
+id = "scia-private-workspace-ref"
+description = "Reference to the maintainer's private notes workspace"
+regex = '''(?i)\b\x62ivio\b|\.sessions/|/handoffs/'''
+
+# --- Tool / assistant product references -------------------------------------
+
+[[rules]]
+id = "scia-tooling-ref"
+description = "Assistant / AI-tooling product names never appear in this repository"
+regex = '''(?i)\b(?:\x63laude|\x61nthropic|\x63opilot|\x63hatgpt|\x6fpenai|\x63odex\x2dcli)\b'''
+
+# --- Machine / host identifiers ----------------------------------------------
+
+[[rules]]
+id = "scia-host-identifier"
+description = "Local network hostnames, LAN addresses and mDNS names"
+regex = '''(?i)\b(?:[a-z0-9-]+\.(?:local|lan|home|internal|home\.arpa)|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b'''
+keywords = [".local", ".lan", ".home", ".internal", "192.168.", "10.", "172."]
+
+[[rules.allowlists]]
+description = "Documentation examples"
+regexTarget = "match"
+regexes = [
+  '''(?i)^(?:example|host|hostname|yourhost|my-?pc)\.(?:local|lan|home|internal)$''',
+  '''^10\.0\.0\.[0-9]$''',
+  '''^192\.168\.0\.[0-9]$''',
+]
