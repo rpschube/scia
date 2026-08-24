@@ -8,3 +8,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rtrb = "0.3"
+thiserror = "2"
+triple_buffer = "8"
