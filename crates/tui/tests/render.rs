@@ -6,7 +6,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 
-use scia_core::FeatureSnapshot;
+use scia_core::{Activity, EngineStats, FeatureSnapshot};
 use scia_tui::{UiState, draw};
 
 /// Render one frame at `w`×`h` and return the resulting buffer.
@@ -74,12 +74,26 @@ fn bars_map_height_to_glyphs() {
     assert_eq!(sym(&buf, 3, 8), "▁", "col 3 second cell is one eighth");
 }
 
+/// A `UiState` carrying just an activity state on its stats.
+fn ui_with_activity(activity: Activity) -> UiState {
+    UiState {
+        stats: EngineStats {
+            activity,
+            ..EngineStats::default()
+        },
+        ..UiState::default()
+    }
+}
+
 #[test]
-fn header_shows_label_and_state() {
-    let mut snap = snapshot_with(&[0.5; 8]);
-    snap.starved = true;
+fn header_shows_label_and_activity() {
+    let snap = snapshot_with(&[0.5; 8]);
     let ui = UiState {
         label: Some("DEMO — synthetic feed".to_string()),
+        stats: EngineStats {
+            activity: Activity::Idle,
+            ..EngineStats::default()
+        },
         ..UiState::default()
     };
     let buf = render(60, 10, &snap, &ui);
@@ -90,22 +104,52 @@ fn header_shows_label_and_state() {
         "header missing full label: {header:?}"
     );
     assert!(
-        header.contains("starved"),
-        "header missing state: {header:?}"
+        header.contains("idle"),
+        "header missing activity indicator: {header:?}"
     );
     assert!(header.contains("scia"), "header missing name: {header:?}");
 }
 
 #[test]
-fn header_shows_live_when_not_starved() {
+fn header_shows_live_and_format_without_label() {
     let snap = snapshot_with(&[0.5; 8]);
-    let ui = UiState::default();
+    let ui = UiState {
+        source: "48000 Hz 2 ch".to_string(),
+        ..ui_with_activity(Activity::Active)
+    };
     let buf = render(60, 10, &snap, &ui);
     let header = row(&buf, 0, 60);
     assert!(
         header.contains("live"),
         "header should show live: {header:?}"
     );
+    assert!(
+        header.contains("48000 Hz 2 ch"),
+        "header should show the negotiated format: {header:?}"
+    );
+    // No demo highlight text leaks into a live header.
+    assert!(
+        !header.contains("DEMO"),
+        "live header must not show a demo label: {header:?}"
+    );
+}
+
+#[test]
+fn header_indicator_tracks_activity() {
+    let snap = snapshot_with(&[0.5; 8]);
+    for (activity, word) in [
+        (Activity::Active, "active"),
+        (Activity::Quiet, "quiet"),
+        (Activity::Idle, "idle"),
+    ] {
+        let ui = ui_with_activity(activity);
+        let buf = render(60, 10, &snap, &ui);
+        let header = row(&buf, 0, 60);
+        assert!(
+            header.contains(word),
+            "header for {activity:?} should show {word:?}: {header:?}"
+        );
+    }
 }
 
 #[test]
@@ -117,10 +161,16 @@ fn debug_line_toggles() {
         debug: true,
         ..UiState::default()
     };
-    let buf = render(60, 10, &snap, &ui_on);
-    let last = row(&buf, 9, 60);
+    let buf = render(120, 10, &snap, &ui_on);
+    let last = row(&buf, 9, 120);
     assert!(last.contains("fps"), "debug row missing fps: {last:?}");
     assert!(last.contains("p99"), "debug row missing p99: {last:?}");
+    assert!(last.contains("act"), "debug row missing activity: {last:?}");
+    assert!(
+        last.contains("push"),
+        "debug row missing push count: {last:?}"
+    );
+    assert!(last.contains("gap"), "debug row missing gap: {last:?}");
 
     // Debug off: no debug row.
     let ui_off = UiState::default();

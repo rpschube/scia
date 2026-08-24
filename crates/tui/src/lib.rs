@@ -33,7 +33,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use scia_core::{EngineStats, FeatureReader};
+use scia_core::{Activity, EngineStats, FeatureReader, StreamHealth};
 
 pub use render::{UiState, VERSION, draw};
 
@@ -48,6 +48,11 @@ pub struct TuiOptions {
     /// Header label, e.g. `"DEMO — synthetic feed"`, shown highlighted so demo
     /// mode is never mistaken for live capture. `None` for live capture.
     pub label: Option<String>,
+    /// Live-capture source description shown in the header centre when [`label`]
+    /// is `None`, e.g. `"48000 Hz 2 ch"`. Ignored in demo mode.
+    ///
+    /// [`label`]: TuiOptions::label
+    pub source: String,
     /// Exit after this many rendered frames. `None` runs until the user quits;
     /// `Some(n)` is used by cold-start timing and smoke tests.
     pub frames: Option<u64>,
@@ -60,6 +65,7 @@ impl Default for TuiOptions {
         Self {
             fps: 60,
             label: None,
+            source: String::new(),
             frames: None,
             debug: false,
         }
@@ -67,7 +73,7 @@ impl Default for TuiOptions {
 }
 
 /// What [`run`] reports back after the loop ends.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunSummary {
     /// Total frames rendered.
     pub frames: u64,
@@ -75,6 +81,10 @@ pub struct RunSummary {
     pub p50_frame_ms: f32,
     /// 99th-percentile frame render time in milliseconds.
     pub p99_frame_ms: f32,
+    /// `Some(message)` when the loop aborted because the capture stream reported
+    /// an error; `None` on a clean quit or frame-limit exit. The caller reports
+    /// the message and exits non-zero.
+    pub error: Option<String>,
 }
 
 /// Run the terminal frontend until the user quits (or `opts.frames` frames have
@@ -85,7 +95,10 @@ pub struct RunSummary {
 /// panic (a panic hook restores the terminal, then re-raises).
 ///
 /// `reader` is polled once per frame for the freshest snapshot; `stats` is
-/// called once per frame for the engine counters shown on the debug line.
+/// called once per frame for the engine counters shown on the debug line, and
+/// `health` is polled once per frame — when it reports
+/// [`StreamHealth::Errored`] the loop leaves the terminal cleanly and returns a
+/// [`RunSummary`] whose [`error`](RunSummary::error) carries the message.
 ///
 /// # Errors
 /// Returns any I/O error from terminal setup, drawing, or input polling. The
@@ -93,12 +106,13 @@ pub struct RunSummary {
 pub fn run(
     reader: FeatureReader,
     stats: impl FnMut() -> EngineStats,
+    health: impl FnMut() -> StreamHealth,
     opts: TuiOptions,
 ) -> io::Result<RunSummary> {
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;
     // The guard restores the terminal on every exit path, including `?`.
-    run_loop(&mut guard.terminal, reader, stats, &opts)
+    run_loop(&mut guard.terminal, reader, stats, health, &opts)
 }
 
 /// Owns the terminal for the lifetime of a run and restores it on drop, so
@@ -147,11 +161,13 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut reader: FeatureReader,
     mut stats: impl FnMut() -> EngineStats,
+    mut health: impl FnMut() -> StreamHealth,
     opts: &TuiOptions,
 ) -> io::Result<RunSummary> {
     let mut frame_times = stats::FrameTimes::new();
     let mut ui = UiState {
         label: opts.label.clone(),
+        source: opts.source.clone(),
         debug: opts.debug,
         fps_measured: opts.fps as f32,
         ..UiState::default()
@@ -177,6 +193,22 @@ fn run_loop(
 
         let snap = *reader.latest();
 
+        // Refresh the engine counters first: activity feeds the idle downshift.
+        ui.stats = stats();
+        ui.fps_measured = fps_ema;
+
+        // Abort cleanly if the capture stream faulted. The guard restores the
+        // terminal on return; the caller reports the message.
+        if let StreamHealth::Errored(msg) = health() {
+            let (p50, p99) = frame_times.percentiles();
+            return Ok(RunSummary {
+                frames,
+                p50_frame_ms: p50,
+                p99_frame_ms: p99,
+                error: Some(msg),
+            });
+        }
+
         // Track continuous starvation for the idle downshift.
         if snap.starved {
             starved_since.get_or_insert(frame_start);
@@ -186,11 +218,13 @@ fn run_loop(
         let starved_for = starved_since
             .map(|since| frame_start.duration_since(since))
             .unwrap_or_default();
-        let interval = pacing::target_interval(opts.fps, starved_for);
-
-        // Refresh the debug fields.
-        ui.stats = stats();
-        ui.fps_measured = fps_ema;
+        // Downshift to the idle rate once the engine reports `Idle`, or after the
+        // starved-for-2-s rule trips — whichever comes first.
+        let interval = if ui.stats.activity == Activity::Idle {
+            pacing::active_interval(pacing::IDLE_FPS)
+        } else {
+            pacing::target_interval(opts.fps, starved_for)
+        };
         let (p50, p99) = frame_times.percentiles();
         ui.p50_frame_ms = p50;
         ui.p99_frame_ms = p99;
@@ -233,6 +267,7 @@ fn run_loop(
                             frames,
                             p50_frame_ms: p50,
                             p99_frame_ms: p99,
+                            error: None,
                         });
                     }
                     // A resize or debug toggle: redraw promptly on the next
@@ -249,6 +284,7 @@ fn run_loop(
         frames,
         p50_frame_ms: p50,
         p99_frame_ms: p99,
+        error: None,
     })
 }
 
