@@ -1710,6 +1710,7 @@ name = "scia-meta"
 version = "0.0.0"
 dependencies = [
  "scia-core",
+ "windows",
 ]
 
 [[package]]
