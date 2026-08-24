@@ -255,6 +255,11 @@ fn install_panic_hook() {
 }
 
 /// The render loop: pace, read, draw, handle input, repeat.
+///
+/// The parameter list mirrors the seams `run` exposes (engine closures, the
+/// reload channel, options, presenter) — grouping them into a struct would
+/// only relocate the same eight names, so the lint is waived here.
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut reader: FeatureReader,
