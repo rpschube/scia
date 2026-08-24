@@ -26,7 +26,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
-use toml_edit::{DocumentMut, Item, Table, Value, value as toml_value};
+use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::palette;
 
@@ -312,16 +312,59 @@ pub fn apply_params_edit(src: &str, edits: &[(&str, f32)]) -> Result<String, tom
 /// the value) *and* the key's leading comment survive — only the value token
 /// changes. A new key is appended with default formatting.
 fn set_param_value(table: &mut Table, key: &str, v: f32) {
-    let clean = clean_f64(v);
+    set_value_in_place(table, key, Value::from(clean_f64(v)));
+}
+
+/// Apply expression-string edits to preset `src`'s `[map]` table, preserving
+/// every comment, key order and untouched entry outside the changed keys, and
+/// return the rendered document. Each `(target, expr)` sets `map.<target>` to the
+/// string `"<expr>"`, replacing whatever form that key held — an inline response
+/// table becomes a plain string — while every other entry, table-form rows the
+/// user never touched included, is left byte-for-byte intact. Creates the `[map]`
+/// table when it is absent.
+///
+/// This is the `[map]` sibling of [`apply_params_edit`]: the expression-mapping
+/// overlay writes only the rows the user edited, as expression strings.
+///
+/// # Errors
+/// Returns the `toml_edit` parse error when `src` is not valid TOML.
+pub fn apply_map_edit(src: &str, edits: &[(&str, &str)]) -> Result<String, toml_edit::TomlError> {
+    let mut doc: DocumentMut = src.parse()?;
+    let item = doc
+        .entry("map")
+        .or_insert_with(|| Item::Table(Table::new()));
+    // A `[map]` that is somehow not a table is replaced with a fresh one; a
+    // preset that validates never hits this, but write-back must not panic.
+    if item.as_table_mut().is_none() {
+        *item = Item::Table(Table::new());
+    }
+    let table = item.as_table_mut().expect("map is a table");
+    for (key, expr) in edits {
+        set_map_expr(table, key, expr);
+    }
+    Ok(doc.to_string())
+}
+
+/// Set `key` = `"expr"` in `table` as an expression string. An existing key —
+/// whether it held an inline response table or a string — is replaced in place,
+/// carrying the value's own decor when it had one so the surrounding whitespace
+/// survives; a new key is appended with default formatting.
+fn set_map_expr(table: &mut Table, key: &str, expr: &str) {
+    set_value_in_place(table, key, Value::from(expr));
+}
+
+/// Set `key` to `value` in `table`, mutating an existing entry's value in place
+/// (carrying its decor when it is a value) so the key's leading comment and the
+/// value's own whitespace survive, or appending a fresh entry when the key is
+/// new. Shared by the `[params]` and `[map]` writers.
+fn set_value_in_place(table: &mut Table, key: &str, mut value: Value) {
     if let Some(item) = table.get_mut(key) {
-        let decor = item.as_value().map(|val| val.decor().clone());
-        let mut value = Value::from(clean);
-        if let Some(decor) = decor {
+        if let Some(decor) = item.as_value().map(|val| val.decor().clone()) {
             *value.decor_mut() = decor;
         }
         *item = Item::Value(value);
     } else {
-        table.insert(key, toml_value(clean));
+        table.insert(key, Item::Value(value));
     }
 }
 
@@ -332,24 +375,33 @@ fn clean_f64(v: f32) -> f64 {
     format!("{v}").parse().unwrap_or_else(|_| f64::from(v))
 }
 
-/// Write the adjusted edits back to an existing preset file (the `--scene-file`
-/// path): read it, apply the edits comment-preserving, and write it atomically
-/// (temp file + rename in the same directory).
+/// Write the adjusted `[params]` edits back to an existing preset file (the
+/// `--scene-file` path): read it, apply the edits comment-preserving, and write
+/// it atomically (temp file + rename in the same directory).
 ///
 /// # Errors
 /// Returns an I/O error if the file cannot be read or written, or an
 /// `InvalidData` error if it is not valid TOML.
 pub fn write_back_file(path: &Path, edits: &[(&str, f32)]) -> io::Result<()> {
-    let src = fs::read_to_string(path)?;
-    let edited = apply_params_edit(&src, edits).map_err(to_io)?;
-    atomic_write(path, &edited)
+    write_edited_file(path, |src| apply_params_edit(src, edits))
+}
+
+/// Write the edited `[map]` expression rows back to an existing preset file (the
+/// `--scene-file` path): the `[map]` sibling of [`write_back_file`], writing each
+/// dirty row as an expression string, comments intact, atomically.
+///
+/// # Errors
+/// Returns an I/O error if the file cannot be read or written, or an
+/// `InvalidData` error if it is not valid TOML.
+pub fn write_map_file(path: &Path, edits: &[(&str, &str)]) -> io::Result<()> {
+    write_edited_file(path, |src| apply_map_edit(src, edits))
 }
 
 /// Export a builtin preset to `<base_dir>/presets/<name>.toml`, applying the
-/// adjusted edits. The source is the exported file itself when it already exists
-/// (so repeated writes edit the same file), otherwise the embedded builtin source
-/// (comments intact). Creates the `presets` directory and writes atomically.
-/// Returns the file written.
+/// adjusted `[params]` edits. The source is the exported file itself when it
+/// already exists (so repeated writes edit the same file), otherwise the embedded
+/// builtin source (comments intact). Creates the `presets` directory and writes
+/// atomically. Returns the file written.
 ///
 /// # Errors
 /// Returns an I/O error if the directory or file cannot be created / written, or
@@ -360,6 +412,51 @@ pub fn write_back_export(
     builtin_src: &str,
     edits: &[(&str, f32)],
 ) -> io::Result<PathBuf> {
+    write_edited_export(base_dir, name, builtin_src, |src| {
+        apply_params_edit(src, edits)
+    })
+}
+
+/// Export a builtin preset applying the edited `[map]` expression rows: the
+/// `[map]` sibling of [`write_back_export`], writing each dirty row as an
+/// expression string. Returns the file written.
+///
+/// # Errors
+/// Returns an I/O error if the directory or file cannot be created / written, or
+/// an `InvalidData` error if the existing file is not valid TOML.
+pub fn write_map_export(
+    base_dir: &Path,
+    name: &str,
+    builtin_src: &str,
+    edits: &[(&str, &str)],
+) -> io::Result<PathBuf> {
+    write_edited_export(base_dir, name, builtin_src, |src| {
+        apply_map_edit(src, edits)
+    })
+}
+
+/// Read `path`, transform its contents with `apply` (a comment-preserving
+/// `toml_edit` edit), and write the result atomically. The seam both the
+/// `[params]` and `[map]` file writers share.
+fn write_edited_file(
+    path: &Path,
+    apply: impl FnOnce(&str) -> Result<String, toml_edit::TomlError>,
+) -> io::Result<()> {
+    let src = fs::read_to_string(path)?;
+    let edited = apply(&src).map_err(to_io)?;
+    atomic_write(path, &edited)
+}
+
+/// Resolve the `<base_dir>/presets/<name>.toml` export target, read its current
+/// source (the existing export, or the embedded builtin the first time),
+/// transform it with `apply`, and write the result atomically. The seam both the
+/// `[params]` and `[map]` export writers share.
+fn write_edited_export(
+    base_dir: &Path,
+    name: &str,
+    builtin_src: &str,
+    apply: impl FnOnce(&str) -> Result<String, toml_edit::TomlError>,
+) -> io::Result<PathBuf> {
     let presets_dir = base_dir.join("presets");
     fs::create_dir_all(&presets_dir)?;
     let target = presets_dir.join(format!("{name}.toml"));
@@ -368,7 +465,7 @@ pub fn write_back_export(
         Err(err) if err.kind() == io::ErrorKind::NotFound => builtin_src.to_string(),
         Err(err) => return Err(err),
     };
-    let edited = apply_params_edit(&src, edits).map_err(to_io)?;
+    let edited = apply(&src).map_err(to_io)?;
     atomic_write(&target, &edited)?;
     Ok(target)
 }
@@ -655,6 +752,138 @@ scene = \"spectra\"
         let read2 = fs::read_to_string(&again).expect("read export again");
         assert!(read2.contains("release = 0.5"), "new edit applied");
         assert!(read2.contains("gap = 0.9"), "the earlier edit is preserved");
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    // -- [map] expression write-back ---------------------------------------
+
+    const MAP_FIXTURE: &str = "\
+# a preset with mapped params
+[preset]
+name = \"demo\"
+scene = \"spectra\"
+
+[params]
+gap = 0.15
+
+# feature -> parameter mappings
+[map]
+# punch rides the onset envelope
+punch = { feature = \"onset\", curve = \"linear\", decay_ms = 250, scale = 0.9 }
+# release is already an expression
+release = \"loud * 0.5\"
+
+[palette]
+source = \"static\"
+";
+
+    #[test]
+    fn map_edit_writes_only_the_touched_row_as_an_expression() {
+        // Editing `punch` (a table row) rewrites just that key as a string; the
+        // untouched `release` expression and every other line stay byte-for-byte.
+        let out = apply_map_edit(MAP_FIXTURE, &[("punch", "onset * 0.7 + bass * 0.2")])
+            .expect("valid toml");
+        let expected = "\
+# a preset with mapped params
+[preset]
+name = \"demo\"
+scene = \"spectra\"
+
+[params]
+gap = 0.15
+
+# feature -> parameter mappings
+[map]
+# punch rides the onset envelope
+punch = \"onset * 0.7 + bass * 0.2\"
+# release is already an expression
+release = \"loud * 0.5\"
+
+[palette]
+source = \"static\"
+";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn map_edit_leaves_untouched_table_rows_in_table_form() {
+        // With only `release` edited, the `punch` table row is preserved verbatim.
+        let out = apply_map_edit(MAP_FIXTURE, &[("release", "loud * 0.8")]).expect("valid toml");
+        assert!(
+            out.contains(
+                "punch = { feature = \"onset\", curve = \"linear\", decay_ms = 250, scale = 0.9 }"
+            ),
+            "the untouched table row stays table form: {out}"
+        );
+        assert!(
+            out.contains("release = \"loud * 0.8\""),
+            "the edit lands: {out}"
+        );
+        assert!(
+            out.contains("# punch rides the onset envelope"),
+            "comments intact: {out}"
+        );
+        let _: DocumentMut = out.parse().expect("edited output re-parses");
+    }
+
+    #[test]
+    fn map_edit_creates_the_map_table_when_absent() {
+        let src = "\
+[preset]
+name = \"demo\"
+scene = \"spectra\"
+";
+        let out = apply_map_edit(src, &[("gap", "bass")]).expect("valid toml");
+        assert!(out.contains("[map]"), "the table is created: {out}");
+        assert!(out.contains("gap = \"bass\""), "the key is written: {out}");
+        let _: DocumentMut = out.parse().expect("edited output re-parses");
+    }
+
+    #[test]
+    fn write_map_file_is_atomic_and_preserves_comments() {
+        let dir = std::env::temp_dir().join(format!("scia-map-file-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("preset.toml");
+        fs::write(&path, MAP_FIXTURE).expect("seed fixture");
+
+        write_map_file(&path, &[("punch", "onset * 0.5")]).expect("write-back");
+
+        let read = fs::read_to_string(&path).expect("read back");
+        assert!(read.contains("punch = \"onset * 0.5\""));
+        assert!(
+            read.contains("release = \"loud * 0.5\""),
+            "untouched row intact"
+        );
+        assert!(
+            read.contains("# a preset with mapped params"),
+            "comments intact"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .expect("list dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file remains: {leftovers:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn map_export_writes_under_the_config_relative_presets_dir() {
+        let base = std::env::temp_dir().join(format!("scia-map-export-{}", std::process::id()));
+        fs::remove_dir_all(&base).ok();
+
+        let written = write_map_export(&base, "spectra", MAP_FIXTURE, &[("punch", "bass")])
+            .expect("export write");
+        assert_eq!(written, base.join("presets").join("spectra.toml"));
+        let read = fs::read_to_string(&written).expect("read export");
+        assert!(read.contains("punch = \"bass\""));
+        assert!(
+            read.contains("# a preset with mapped params"),
+            "builtin comments carried"
+        );
 
         fs::remove_dir_all(&base).ok();
     }

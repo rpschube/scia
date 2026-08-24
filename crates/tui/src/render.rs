@@ -13,6 +13,7 @@ use scia_scenes::{SceneInfo, builtin_scenes};
 
 use crate::chrome::ChromeState;
 use crate::keymap::{InputAction, Keymap};
+use crate::mapping_ui::MappingUi;
 use crate::nowplaying::{self, NowPlayingState};
 use crate::palette;
 use crate::tuning::TuningStrip;
@@ -115,6 +116,16 @@ pub struct UiState {
     /// A one-shot request from the strip's write key, consumed by the render loop
     /// to write the adjusted values back to the preset file.
     pub tuning_write_pending: bool,
+    /// The expression-mapping overlay model: the mapping rows on show, the
+    /// selection, the inline edit, and the rows committed this session. Drawn
+    /// over the body bottom when open.
+    pub mapping: MappingUi,
+    /// A one-shot request from the mapping key to open the overlay, consumed by
+    /// the render loop (which owns the presenter it seeds the overlay from).
+    pub mapping_open_pending: bool,
+    /// A one-shot request from the overlay's write key, consumed by the render
+    /// loop to write the edited expression rows back to the preset file.
+    pub mapping_write_pending: bool,
 }
 
 impl UiState {

@@ -43,12 +43,14 @@ pub enum InputAction {
     Palette,
     /// Toggle the quick tuning strip (default `t`).
     Tuning,
+    /// Toggle the expression-mapping overlay (default `m`).
+    Mapping,
 }
 
 impl InputAction {
     /// Every action, in a stable order. [`Keymap::action_for`] scans this order,
     /// so an earlier action wins if two are ever bound to the same chord.
-    pub const ALL: [InputAction; 10] = [
+    pub const ALL: [InputAction; 11] = [
         InputAction::SceneNext,
         InputAction::ScenePrev,
         InputAction::Browser,
@@ -59,6 +61,7 @@ impl InputAction {
         InputAction::NowPlaying,
         InputAction::Palette,
         InputAction::Tuning,
+        InputAction::Mapping,
     ];
 
     /// The config `[keys]` name this action is bound under.
@@ -75,6 +78,7 @@ impl InputAction {
             InputAction::NowPlaying => "now_playing",
             InputAction::Palette => "palette",
             InputAction::Tuning => "tuning",
+            InputAction::Mapping => "mapping",
         }
     }
 
@@ -92,6 +96,7 @@ impl InputAction {
             InputAction::NowPlaying => "now playing",
             InputAction::Palette => "apply palette",
             InputAction::Tuning => "tuning strip",
+            InputAction::Mapping => "expression map",
         }
     }
 
@@ -248,6 +253,8 @@ pub struct Keymap {
     pub palette: Option<KeyChord>,
     /// Toggle the quick tuning strip.
     pub tuning: Option<KeyChord>,
+    /// Toggle the expression-mapping overlay.
+    pub mapping: Option<KeyChord>,
 }
 
 impl Default for Keymap {
@@ -263,6 +270,7 @@ impl Default for Keymap {
             now_playing: Some(KeyChord::plain(KeyCode::Char('n'))),
             palette: Some(KeyChord::plain(KeyCode::Char('p'))),
             tuning: Some(KeyChord::plain(KeyCode::Char('t'))),
+            mapping: Some(KeyChord::plain(KeyCode::Char('m'))),
         }
     }
 }
@@ -282,6 +290,7 @@ impl Keymap {
             InputAction::NowPlaying => self.now_playing,
             InputAction::Palette => self.palette,
             InputAction::Tuning => self.tuning,
+            InputAction::Mapping => self.mapping,
         }
     }
 
@@ -298,6 +307,7 @@ impl Keymap {
             InputAction::NowPlaying => &mut self.now_playing,
             InputAction::Palette => &mut self.palette,
             InputAction::Tuning => &mut self.tuning,
+            InputAction::Mapping => &mut self.mapping,
         };
         *slot = chord;
     }
@@ -439,6 +449,29 @@ mod tests {
             Some(InputAction::Tuning)
         );
         assert_eq!(km.action_for(&key(KeyCode::Char('t'), false)), None);
+    }
+
+    #[test]
+    fn mapping_defaults_to_m_and_rebinds() {
+        let km = Keymap::default();
+        assert!(km.mapping.unwrap().matches(&key(KeyCode::Char('m'), false)));
+        assert_eq!(
+            km.action_for(&key(KeyCode::Char('m'), false)),
+            Some(InputAction::Mapping)
+        );
+        assert_eq!(InputAction::parse("mapping"), Some(InputAction::Mapping));
+
+        // Rebinding moves it and frees the old key.
+        let mut km = Keymap::default();
+        km.rebind(
+            InputAction::Mapping,
+            Some(KeyChord::plain(KeyCode::Char('x'))),
+        );
+        assert_eq!(
+            km.action_for(&key(KeyCode::Char('x'), false)),
+            Some(InputAction::Mapping)
+        );
+        assert_eq!(km.action_for(&key(KeyCode::Char('m'), false)), None);
     }
 
     #[test]

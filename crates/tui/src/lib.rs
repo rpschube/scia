@@ -18,6 +18,7 @@
 mod chrome;
 mod keymap;
 mod kitty;
+mod mapping_ui;
 mod mosaic;
 mod nowplaying;
 mod pacing;
@@ -53,6 +54,7 @@ use scia_scenes::{Palette, Preset, ReloadEvent, builtin_preset, builtin_presets,
 pub use chrome::{ChromeMode, ChromeState, Fade};
 pub use keymap::{ChordParseError, InputAction, KeyChord, Keymap, parse_chord};
 pub use kitty::{CLEANUP as KITTY_CLEANUP, KittyEncoder};
+pub use mapping_ui::{MappingUi, SourceSignal, draw_mapping, table_display};
 pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
 pub use nowplaying::{
     ArtResult, DecodeJob, MetaRuntime, NowPlayingState, TrackArt, art_palette_to_scene,
@@ -69,7 +71,8 @@ pub use probe::{
 pub use render::{SceneNav, UiState, VERSION, draw, draw_help, draw_notice};
 pub use sixel::{SIXEL_REGISTERS, SixelEncoder, quantize as sixel_quantize};
 pub use tuning::{
-    TuningParam, TuningStrip, apply_params_edit, draw_tuning, write_back_export, write_back_file,
+    TuningParam, TuningStrip, apply_map_edit, apply_params_edit, draw_tuning, write_back_export,
+    write_back_file, write_map_export, write_map_file,
 };
 
 /// The crate name, resolved at compile time from Cargo metadata.
@@ -476,6 +479,28 @@ fn run_loop(
             notice_deadline = Some(frame_start + NOTICE_TTL);
         }
 
+        // Fulfil an expression-mapping open request: seed the overlay from the
+        // presenter's first-layer `[map]` rows. With no presenter (direct-bars)
+        // or no mappings it stays shut.
+        if std::mem::take(&mut ui.mapping_open_pending) {
+            if let Some(p) = presenter.as_ref() {
+                ui.mapping.open(p.layer0_mapping_entries());
+            }
+        }
+
+        // Fulfil an expression-mapping write request: write the edited rows back
+        // as expression strings to the `--scene-file` (comments intact) or the
+        // builtin export under the config dir, leaving a status notice either way.
+        if std::mem::take(&mut ui.mapping_write_pending) {
+            ui.notice = Some(write_mapping(
+                presenter.as_ref(),
+                &ui.mapping,
+                &ui.scene_nav,
+                opts,
+            ));
+            notice_deadline = Some(frame_start + NOTICE_TTL);
+        }
+
         // Seam: keep the chrome's track line current from the metadata state.
         ui.track = ui
             .now_playing
@@ -520,6 +545,12 @@ fn run_loop(
                     match event.result {
                         Ok(preset) => {
                             p.swap_preset(&preset);
+                            // Rebuild the mapping overlay's rows against the new
+                            // preset when it is open, so its list never lags the
+                            // running scene.
+                            if ui.mapping.is_open() {
+                                ui.mapping.on_preset_swap(p.layer0_mapping_entries());
+                            }
                             ui.notice = Some(format!("reloaded {:.0}ms", event.elapsed_ms));
                         }
                         // A broken edit keeps the running scene; the error's
@@ -599,6 +630,15 @@ fn run_loop(
                                 p.set_param(tp.key, tp.value);
                             }
                         }
+                        // Feed the mapping overlay's sparklines from this frame's
+                        // features and swap in any edited mapping before the frame
+                        // advances, so a valid draft previews on this very frame.
+                        if ui.mapping.is_open() {
+                            ui.mapping.sample(&snap);
+                            if let Some(entry) = ui.mapping.drain_apply() {
+                                p.replace_layer0_mapping(entry);
+                            }
+                        }
                         p.frame(&snap, scene_dt);
                         // In a pixel mode `draw` paints only the text runs; the
                         // image is written as a graphics-protocol frame, placed at
@@ -629,6 +669,12 @@ fn run_loop(
                         // scene and now-playing panel; help still layers on top.
                         if ui.tuning.is_open() {
                             tuning::draw_tuning(frame.buffer_mut(), body, &ui.tuning);
+                        }
+                        // The expression-mapping overlay paints over the body
+                        // bottom, the sibling of the tuning strip; help layers on
+                        // top of it too.
+                        if ui.mapping.is_open() {
+                            mapping_ui::draw_mapping(frame.buffer_mut(), body, &ui.mapping);
                         }
                         // The help overlay is the topmost body layer.
                         render::draw_help(frame.buffer_mut(), body, &ui);
@@ -822,6 +868,52 @@ fn handle_event(event: Event, ui: &mut UiState) -> Action {
                     _ => {}
                 }
             }
+            // While the expression-mapping overlay is open its keys take
+            // priority. In edit mode the line editor swallows every key (chars,
+            // backspace, cursor moves, ⏎ commit, esc cancel) so typing `m`, `?`,
+            // `d` or `w` edits the draft rather than triggering an action. In
+            // browse mode ↑↓/tab move the selection, ⏎ opens an edit, `w` writes,
+            // esc closes; the arrows are swallowed so scene cycling never fires
+            // under the overlay, and everything else (the mapping key itself, `?`,
+            // `d`, the other actions) falls through unchanged.
+            if ui.mapping.is_open() {
+                if ui.mapping.is_editing() {
+                    match key.code {
+                        KeyCode::Esc => ui.mapping.cancel_edit(),
+                        KeyCode::Enter => ui.mapping.commit_edit(),
+                        KeyCode::Left => ui.mapping.cursor_left(),
+                        KeyCode::Right => ui.mapping.cursor_right(),
+                        KeyCode::Backspace => ui.mapping.backspace(),
+                        KeyCode::Char(c) => ui.mapping.insert_char(c),
+                        _ => {}
+                    }
+                    return Action::Redraw;
+                }
+                match key.code {
+                    KeyCode::Esc => {
+                        ui.mapping.close();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Tab | KeyCode::Down => {
+                        ui.mapping.select_next();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Up => {
+                        ui.mapping.select_prev();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Enter => {
+                        ui.mapping.begin_edit();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Left | KeyCode::Right => return Action::Redraw,
+                    KeyCode::Char('w') => {
+                        ui.mapping_write_pending = true;
+                        return Action::Redraw;
+                    }
+                    _ => {}
+                }
+            }
             // Esc is structural and context-sensitive: it closes the browser
             // (restoring the original scene) while open, otherwise it quits.
             if key.code == KeyCode::Esc {
@@ -922,6 +1014,18 @@ fn apply_action(action: InputAction, ui: &mut UiState, browsing: bool) -> Action
             }
             Action::Redraw
         }
+        // Toggle the expression-mapping overlay, the sibling of the tuning strip:
+        // closing is immediate, opening is a one-shot request the loop fulfils
+        // against the presenter's layer-0 `[map]` rows. Inert with no presenter or
+        // no mappings.
+        InputAction::Mapping => {
+            if ui.mapping.is_open() {
+                ui.mapping.close();
+            } else {
+                ui.mapping_open_pending = true;
+            }
+            Action::Redraw
+        }
         // The browser/cycle guards fall through here when not in scene mode.
         InputAction::Browser | InputAction::SceneNext | InputAction::ScenePrev => Action::None,
     }
@@ -1017,6 +1121,53 @@ fn write_tuning(
         return format!("no builtin source for {name}");
     };
     match tuning::write_back_export(base, name, src, edits) {
+        Ok(path) => format!("wrote {}", path.display()),
+        Err(err) => format!("write failed: {err}"),
+    }
+}
+
+/// Write the expression-mapping overlay's committed rows back to the preset,
+/// returning the status notice to show. The `[map]` sibling of [`write_tuning`]:
+/// with a `--scene-file` it edits that file in place (comments intact), each
+/// dirty row as an expression string; with a builtin it exports to
+/// `<config_dir>/presets/<name>.toml`. Never panics — every failure is a notice.
+fn write_mapping(
+    presenter: Option<&ScenePresenter>,
+    mapping: &MappingUi,
+    nav: &SceneNav,
+    opts: &TuiOptions,
+) -> String {
+    let edits = mapping.dirty_edits();
+    if edits.is_empty() {
+        return "nothing to write".to_string();
+    }
+    // An existing scene file is edited in place, comments preserved.
+    if let Some(path) = &opts.scene_file {
+        return match tuning::write_map_file(path, &edits) {
+            Ok(()) => format!("wrote {}", file_label(path)),
+            Err(err) => format!("write failed: {err}"),
+        };
+    }
+    // Otherwise export the running builtin preset under the config dir. The name
+    // is the currently running scene (cycling may have moved it off `--scene`).
+    let Some(base) = &opts.config_dir else {
+        return "no config dir for export".to_string();
+    };
+    let name = nav
+        .current_id()
+        .or(opts.scene.as_deref())
+        .or_else(|| presenter.and_then(ScenePresenter::layer0_scene_id));
+    let Some(name) = name else {
+        return "no preset to write".to_string();
+    };
+    let Some(src) = builtin_presets()
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, s)| *s)
+    else {
+        return format!("no builtin source for {name}");
+    };
+    match tuning::write_map_export(base, name, src, &edits) {
         Ok(path) => format!("wrote {}", path.display()),
         Err(err) => format!("write failed: {err}"),
     }
@@ -1457,6 +1608,109 @@ mod tests {
             Action::Redraw
         ));
         assert!(!ui.tuning.is_open());
+    }
+
+    /// A scene-mode UiState with the expression-mapping overlay already open on
+    /// two rows, as the loop would have seeded it from the presenter.
+    fn ui_with_open_map() -> UiState {
+        use scia_scenes::{ExprMapping, MapEntry};
+        let mut ui = UiState {
+            scene_mode: true,
+            ..UiState::default()
+        };
+        ui.mapping.open(vec![
+            MapEntry::Expr(ExprMapping::compile("gap", "bass").expect("compiles")),
+            MapEntry::Expr(ExprMapping::compile("punch", "onset").expect("compiles")),
+        ]);
+        ui
+    }
+
+    #[test]
+    fn m_requests_the_mapping_overlay() {
+        let mut ui = UiState::default();
+        assert!(!ui.mapping_open_pending);
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('m')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(
+            ui.mapping_open_pending,
+            "m asks the loop to open the overlay"
+        );
+    }
+
+    #[test]
+    fn m_closes_the_overlay_when_open() {
+        let mut ui = ui_with_open_map();
+        assert!(ui.mapping.is_open());
+        let _ = handle_event(press(KeyCode::Char('m')), &mut ui);
+        assert!(!ui.mapping.is_open(), "m closes an open overlay");
+        assert!(
+            !ui.mapping_open_pending,
+            "closing does not re-request an open"
+        );
+    }
+
+    #[test]
+    fn mapping_keys_take_priority_and_edit_swallows_chars() {
+        let mut ui = ui_with_open_map();
+        // Tab moves the selection; it does not open the browser.
+        let _ = handle_event(press(KeyCode::Tab), &mut ui);
+        assert_eq!(ui.mapping.selected(), 1);
+        assert!(!ui.scene_nav.is_open(), "tab did not open the browser");
+        // Down also moves the selection (wraps back to 0).
+        let _ = handle_event(press(KeyCode::Down), &mut ui);
+        assert_eq!(ui.mapping.selected(), 0);
+
+        // Enter opens an inline edit of the selected row.
+        let _ = handle_event(press(KeyCode::Enter), &mut ui);
+        assert!(ui.mapping.is_editing());
+
+        // While editing, `m`, `w` and `?` are literal characters, not actions.
+        for c in ['m', 'w', '?'] {
+            let _ = handle_event(press(KeyCode::Char(c)), &mut ui);
+        }
+        assert!(ui.mapping.is_open(), "typing m did not toggle the overlay");
+        assert!(
+            !ui.mapping_write_pending,
+            "typing w did not request a write"
+        );
+        assert!(!ui.help, "typing ? did not open help");
+        assert!(
+            ui.mapping.edit_buffer().unwrap().ends_with("mw?"),
+            "the chars landed in the draft: {:?}",
+            ui.mapping.edit_buffer()
+        );
+
+        // Esc cancels the edit but keeps the overlay open.
+        let _ = handle_event(press(KeyCode::Esc), &mut ui);
+        assert!(!ui.mapping.is_editing(), "esc left edit mode");
+        assert!(ui.mapping.is_open(), "esc did not close the overlay");
+
+        // `w` now raises a one-shot write request.
+        let _ = handle_event(press(KeyCode::Char('w')), &mut ui);
+        assert!(ui.mapping_write_pending, "w requests a write-back");
+
+        // Esc closes the overlay rather than quitting.
+        assert!(matches!(
+            handle_event(press(KeyCode::Esc), &mut ui),
+            Action::Redraw
+        ));
+        assert!(!ui.mapping.is_open());
+    }
+
+    #[test]
+    fn mapping_edit_commits_and_dirties_a_row() {
+        let mut ui = ui_with_open_map();
+        // Edit the first row: append " * 0.5" and commit with Enter.
+        let _ = handle_event(press(KeyCode::Enter), &mut ui);
+        for c in " * 0.5".chars() {
+            let _ = handle_event(press(KeyCode::Char(c)), &mut ui);
+        }
+        let _ = handle_event(press(KeyCode::Enter), &mut ui);
+        assert!(!ui.mapping.is_editing(), "enter committed the edit");
+        assert!(ui.mapping.is_dirty("gap"), "the row is dirty after commit");
+        assert_eq!(ui.mapping.dirty_edits(), vec![("gap", "bass * 0.5")]);
     }
 
     #[test]

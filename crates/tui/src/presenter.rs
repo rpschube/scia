@@ -15,8 +15,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
 use scia_scenes::{
-    Blend, Canvas, LayerInstance, Palette, ParamSpec, Params, Preset, Rgb, builtin_preset,
-    builtin_presets, scene_info,
+    Blend, Canvas, LayerInstance, MapEntry, Palette, ParamSpec, Params, Preset, Rgb,
+    builtin_preset, builtin_presets, scene_info,
 };
 
 use crate::mosaic::{CellGrid, FrameBuffer, TextRun, Tier};
@@ -247,6 +247,27 @@ impl ScenePresenter {
         if let Some(p) = self.params.first_mut() {
             p.set(key, v);
         }
+    }
+
+    /// The first layer's `[map]` entries as public [`MapEntry`] values, for the
+    /// expression-mapping overlay to list. Empty when there is no layer. The
+    /// mappings ride the first layer (see [`Preset::instantiate`]).
+    #[must_use]
+    pub fn layer0_mapping_entries(&self) -> Vec<MapEntry> {
+        self.layers
+            .first()
+            .map(|l| l.mappings.entries_view())
+            .unwrap_or_default()
+    }
+
+    /// Swap `entry` into the first layer's mapping set in place of the row with
+    /// the same target, so an edited expression previews on the next frame.
+    /// Returns whether a matching row was found. A no-op with no first layer.
+    pub fn replace_layer0_mapping(&mut self, entry: MapEntry) -> bool {
+        self.layers
+            .first_mut()
+            .map(|l| l.mappings.replace(entry))
+            .unwrap_or(false)
     }
 
     /// The active tier. In kitty mode there is no ladder rung, so the default
@@ -957,6 +978,38 @@ mod tests {
         assert_ne!(
             before, after,
             "an unmapped param set through set_param changes the rendered frame"
+        );
+    }
+
+    #[test]
+    fn replacing_a_layer0_mapping_takes_effect_on_the_params_bag() {
+        use scia_scenes::{ExprMapping, MapEntry};
+
+        // spectra's `punch` is a mapped key. Swapping its mapping for a constant
+        // expression makes the presenter write that constant into the params bag
+        // on the next frame, observable through `layer0_value`.
+        let preset = builtin_preset("spectra")
+            .expect("spectra is a built-in preset")
+            .expect("spectra parses");
+        let mut p = ScenePresenter::from_preset(&preset, Tier::Half);
+        p.resize(16, 8);
+        assert!(p.layer0_mapped("punch"), "punch is mapped in spectra");
+
+        // The row is listed for the overlay.
+        let entries = p.layer0_mapping_entries();
+        assert!(
+            entries.iter().any(|e| e.target() == "punch"),
+            "punch is listed as a mapping row"
+        );
+
+        let entry = MapEntry::Expr(ExprMapping::compile("punch", "0.7").expect("compiles"));
+        assert!(p.replace_layer0_mapping(entry), "the row is replaced");
+
+        p.frame(&FeatureSnapshot::default(), 0.05);
+        assert!(
+            (p.layer0_value("punch") - 0.7).abs() < 1e-6,
+            "the replaced mapping drives the bag: {}",
+            p.layer0_value("punch")
         );
     }
 
