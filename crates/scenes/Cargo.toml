@@ -9,3 +9,15 @@ rust-version.workspace = true
 
 [dependencies]
 scia-core = { path = "../core", version = "0.0.0" }
+
+# Probe-only (P5): the production scenes crate carries no normal dependency yet.
+# These exist solely for benches/tests that measure a Luau scene tick against
+# the real FeatureSnapshot shapes. See docs/probes/p5-luau-tick.md.
+[dev-dependencies]
+scia-core = { path = "../core", version = "0.0.0" }
+mlua = { version = "0.11", features = ["luau", "vendored"] }
+criterion = { version = "0.6", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "luau_tick"
+harness = false
