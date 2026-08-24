@@ -8,7 +8,9 @@ mod support {
 }
 
 use scia_core::FeatureSnapshot;
-use scia_scenes::{Canvas, Curve, Feature, Mapping, MappingSet, Params, Style};
+use scia_scenes::{
+    Canvas, Curve, Feature, Mapping, MappingSet, Params, SceneCtx, Style, create_builtin,
+};
 use support::alloc_watch::{CountingAllocator, watch};
 
 #[global_allocator]
@@ -125,6 +127,50 @@ fn mapping_apply_does_not_allocate() {
     assert!(
         stray_count == 0,
         "MappingSet::apply allocated {} time(s) across 1000 calls:\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
+
+/// The `lattice` scene must not allocate per frame once warmed: its dot grid
+/// and ring pool are fixed at init, and the canvas retains capacity.
+#[test]
+fn lattice_update_render_does_not_allocate() {
+    let mut scene = create_builtin("lattice").expect("lattice exists");
+    scene.init(&SceneCtx::default());
+    let mut canvas = Canvas::new(1.0);
+
+    // A driving snapshot with signal, bass and a toggled onset.
+    let mut f = FeatureSnapshot {
+        rms: 0.5,
+        onset: false,
+        onset_age_ms: 100.0,
+        ..FeatureSnapshot::default()
+    };
+    f.bands = [1.2, 1.0, 0.8];
+
+    // Warm up: realize every ring slot and grow the canvas to steady capacity.
+    for i in 0..16 {
+        f.onset = i % 2 == 0;
+        f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+        scene.update(&f, 0.016);
+        canvas.clear();
+        scene.render(&mut canvas);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for i in 0..500 {
+            f.onset = i % 7 == 0;
+            f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+            scene.update(&f, 0.016);
+            canvas.clear();
+            scene.render(&mut canvas);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "lattice update/render allocated {} time(s) across 500 frames:\n{}",
         stray_count,
         strays.join("\n---\n")
     );
