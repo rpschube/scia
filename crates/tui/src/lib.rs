@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+mod keymap;
 mod mosaic;
 mod pacing;
 mod palette;
@@ -38,16 +39,17 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use scia_core::{Activity, EngineStats, FeatureReader, StreamHealth};
+use scia_core::{Activity, EngineStats, FeatureReader, FeatureSnapshot, StreamHealth};
 use scia_scenes::{Preset, ReloadEvent, builtin_preset, builtin_scenes};
 
+pub use keymap::{ChordParseError, InputAction, KeyChord, Keymap, parse_chord};
 pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
 pub use presenter::{SceneError, ScenePresenter, build_scene_presenter};
 pub use probe::{
     CapabilityReport, Da1, SyncSupport, TermFamily, classify_family, default_tier, parse_cell_size,
     parse_da1, parse_decrqm_2026, probe, truecolor_from,
 };
-pub use render::{SceneNav, UiState, VERSION, draw, draw_notice};
+pub use render::{SceneNav, UiState, VERSION, draw, draw_help, draw_notice};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
@@ -86,6 +88,9 @@ pub struct TuiOptions {
     /// force one; [`run`] then falls back to [`Tier::default`]. Ignored when
     /// neither [`scene`](Self::scene) nor [`preset`](Self::preset) is set.
     pub tier: Option<Tier>,
+    /// The active key bindings, built at startup from the built-in defaults plus
+    /// any config overrides. The default is the built-in binding set.
+    pub keymap: Keymap,
 }
 
 impl Default for TuiOptions {
@@ -100,6 +105,7 @@ impl Default for TuiOptions {
             scene: None,
             preset: None,
             tier: None,
+            keymap: Keymap::default(),
         }
     }
 }
@@ -293,10 +299,14 @@ fn run_loop(
         tier: presenter.as_ref().map(|p| p.tier().label()),
         scene_mode,
         scene_nav: SceneNav::new(initial_scene),
+        keymap: opts.keymap,
         ..UiState::default()
     };
     // Frame period fed to the scene presenter; seeded to the target period.
     let default_dt = 1.0 / opts.fps.max(1) as f32;
+    // Holds the frozen snapshot while paused, so a paused scene renders an
+    // identical frame every tick.
+    let mut pause_state = PauseState::default();
 
     let mut frames: u64 = 0;
     // When the current continuous starvation began, if any.
@@ -323,7 +333,11 @@ fn run_loop(
         }
         prev_frame_start = Some(frame_start);
 
-        let snap = *reader.latest();
+        // While paused the scene freezes on the snapshot captured at the moment
+        // of pause and is advanced with `dt = 0`, so it renders an identical
+        // frame every tick; capture keeps running underneath. `scene_dt` drives
+        // the presenter and scene-nav timers, `snap` feeds the whole frame.
+        let (snap, scene_dt) = pause_state.resolve(ui.paused, *reader.latest(), dt);
 
         // Apply a scene switch the browser/cycle keys requested on the previous
         // frame, then age the cycle toast on the frame clock. The switch reuses
@@ -337,7 +351,7 @@ fn run_loop(
                 }
             }
         }
-        ui.scene_nav.tick(dt);
+        ui.scene_nav.tick(scene_dt);
 
         // Refresh the engine counters first: activity feeds the idle downshift.
         ui.stats = stats();
@@ -422,7 +436,7 @@ fn run_loop(
                 terminal.draw(|frame| {
                     if let Some(body) = render::draw_chrome(frame, &snap, &ui) {
                         p.resize(body.width, body.height);
-                        p.frame(&snap, dt);
+                        p.frame(&snap, scene_dt);
                         p.draw(frame.buffer_mut(), body);
                         // The overlay is drawn last, over the rasterized scene.
                         if ui.overlay {
@@ -431,6 +445,8 @@ fn run_loop(
                         // The browser panel and cycle toast paint over the live
                         // scene, like the meter bridge, so they draw after it.
                         render::draw_scene_nav(frame.buffer_mut(), body, &ui.scene_nav);
+                        // The help overlay is the topmost body layer.
+                        render::draw_help(frame.buffer_mut(), body, &ui);
                     }
                     // The reload notice lands on top of the scene body, so it
                     // draws after the presenter rather than inside the chrome.
@@ -504,66 +520,126 @@ enum Action {
     Quit,
 }
 
+/// Holds the frozen snapshot across paused frames.
+///
+/// While paused, [`resolve`](Self::resolve) returns the snapshot captured on the
+/// first paused frame and a `dt` of zero, so the presenter neither advances its
+/// animation nor responds to new features — every paused frame is identical.
+/// Resuming clears the freeze and passes the live snapshot and real `dt` through.
+#[derive(Default)]
+struct PauseState {
+    frozen: Option<FeatureSnapshot>,
+}
+
+impl PauseState {
+    /// The `(snapshot, dt)` the frame should render with, given the pause flag,
+    /// the live snapshot, and the measured frame period.
+    fn resolve(&mut self, paused: bool, live: FeatureSnapshot, dt: f32) -> (FeatureSnapshot, f32) {
+        if paused {
+            (*self.frozen.get_or_insert(live), 0.0)
+        } else {
+            self.frozen = None;
+            (live, dt)
+        }
+    }
+}
+
 /// Translate one input event into a loop [`Action`], mutating [`UiState`] for
 /// toggles.
+///
+/// The rebindable actions come from [`UiState::keymap`]; the browser's internal
+/// navigation (highlight up/down, accept), Esc's context-sensitive quit/cancel,
+/// Ctrl-C's always-on quit, the `d` debug-line toggle and the `?` help overlay
+/// are structural and stay hard-coded.
 fn handle_event(event: Event, ui: &mut UiState) -> Action {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             let browsing = ui.scene_mode && ui.scene_nav.is_open();
-            match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
-                KeyCode::Char('q') => Action::Quit,
-                // Esc closes the browser (restoring the original scene) while it
-                // is open; only outside the browser does it quit.
-                KeyCode::Esc => {
-                    if browsing {
-                        ui.scene_nav.cancel();
-                        Action::Redraw
-                    } else {
-                        Action::Quit
+
+            // Ctrl-C is a structural, always-on quit, independent of the keymap.
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Action::Quit;
+            }
+            // Esc is structural and context-sensitive: it closes the browser
+            // (restoring the original scene) while open, otherwise it quits.
+            if key.code == KeyCode::Esc {
+                return if browsing {
+                    ui.scene_nav.cancel();
+                    Action::Redraw
+                } else {
+                    Action::Quit
+                };
+            }
+            // While browsing, the navigation keys are structural.
+            if browsing {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        ui.scene_nav.highlight_prev();
+                        return Action::Redraw;
                     }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        ui.scene_nav.highlight_next();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Enter => {
+                        ui.scene_nav.accept();
+                        return Action::Redraw;
+                    }
+                    _ => {}
                 }
-                // Tab toggles the browser overlay.
-                KeyCode::Tab if ui.scene_mode => {
-                    ui.scene_nav.toggle_browser();
-                    Action::Redraw
-                }
-                // Up/k and Down/j move the highlight while browsing.
-                KeyCode::Up | KeyCode::Char('k') if browsing => {
-                    ui.scene_nav.highlight_prev();
-                    Action::Redraw
-                }
-                KeyCode::Down | KeyCode::Char('j') if browsing => {
-                    ui.scene_nav.highlight_next();
-                    Action::Redraw
-                }
-                // Enter accepts the highlighted scene and closes the browser.
-                KeyCode::Enter if browsing => {
-                    ui.scene_nav.accept();
-                    Action::Redraw
-                }
-                // Left/Right cycle scenes directly, only outside the browser.
-                KeyCode::Left if ui.scene_mode && !browsing => {
-                    ui.scene_nav.cycle_prev();
-                    Action::Redraw
-                }
-                KeyCode::Right if ui.scene_mode && !browsing => {
-                    ui.scene_nav.cycle_next();
-                    Action::Redraw
-                }
-                KeyCode::Char('d') => {
-                    ui.debug = !ui.debug;
-                    Action::Redraw
-                }
-                KeyCode::Char('`') => {
-                    ui.overlay = !ui.overlay;
-                    Action::Redraw
-                }
-                _ => Action::None,
+            }
+            // The `?` help overlay and the `d` debug line are structural toggles.
+            if key.code == KeyCode::Char('?') {
+                ui.help = !ui.help;
+                return Action::Redraw;
+            }
+            if key.code == KeyCode::Char('d') {
+                ui.debug = !ui.debug;
+                return Action::Redraw;
+            }
+            // Everything else comes from the rebindable keymap.
+            match ui.keymap.action_for(&key) {
+                Some(action) => apply_action(action, ui, browsing),
+                None => Action::None,
             }
         }
         Event::Resize(_, _) => Action::Redraw,
         _ => Action::None,
+    }
+}
+
+/// Apply a rebindable [`InputAction`], honouring the same context guards the
+/// hard-coded handler used: browser/cycle actions act only in scene mode, and
+/// cycling only outside the browser.
+fn apply_action(action: InputAction, ui: &mut UiState, browsing: bool) -> Action {
+    match action {
+        InputAction::Quit => Action::Quit,
+        InputAction::Browser if ui.scene_mode => {
+            ui.scene_nav.toggle_browser();
+            Action::Redraw
+        }
+        InputAction::SceneNext if ui.scene_mode && !browsing => {
+            ui.scene_nav.cycle_next();
+            Action::Redraw
+        }
+        InputAction::ScenePrev if ui.scene_mode && !browsing => {
+            ui.scene_nav.cycle_prev();
+            Action::Redraw
+        }
+        InputAction::Overlay => {
+            ui.overlay = !ui.overlay;
+            Action::Redraw
+        }
+        InputAction::Pause => {
+            ui.paused = !ui.paused;
+            Action::Redraw
+        }
+        // Reserved: the now-playing panel has not landed, so a bound key is a
+        // no-op for now. The browser/cycle guards fall through here too.
+        InputAction::NowPlaying
+        | InputAction::Browser
+        | InputAction::SceneNext
+        | InputAction::ScenePrev => Action::None,
     }
 }
 
@@ -576,6 +652,15 @@ mod tests {
         Event::Key(KeyEvent {
             code,
             modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        })
+    }
+
+    fn press_ctrl(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         })
@@ -764,5 +849,112 @@ mod tests {
             handle_event(press(KeyCode::Esc), &mut ui),
             Action::Quit
         ));
+    }
+
+    #[test]
+    fn space_toggles_pause() {
+        let mut ui = UiState::default();
+        assert!(!ui.paused);
+        assert!(matches!(
+            handle_event(press(KeyCode::Char(' ')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(ui.paused, "space should pause");
+        assert!(matches!(
+            handle_event(press(KeyCode::Char(' ')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(!ui.paused, "space should resume");
+    }
+
+    #[test]
+    fn question_mark_toggles_help() {
+        let mut ui = UiState::default();
+        assert!(!ui.help);
+        let _ = handle_event(press(KeyCode::Char('?')), &mut ui);
+        assert!(ui.help, "? should open the help overlay");
+        let _ = handle_event(press(KeyCode::Char('?')), &mut ui);
+        assert!(!ui.help, "? should close the help overlay");
+    }
+
+    #[test]
+    fn ctrl_c_quits_regardless_of_the_keymap() {
+        // Even with quit rebound elsewhere, Ctrl-C stays a structural quit.
+        let mut ui = UiState {
+            keymap: Keymap {
+                quit: Some(KeyChord::plain(KeyCode::Char('x'))),
+                ..Keymap::default()
+            },
+            ..UiState::default()
+        };
+        assert!(matches!(
+            handle_event(press_ctrl(KeyCode::Char('c')), &mut ui),
+            Action::Quit
+        ));
+        // The rebound quit key works too.
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('x')), &mut ui),
+            Action::Quit
+        ));
+        // The old quit key is now inert.
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('q')), &mut ui),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn rebinding_scene_next_drives_the_new_key() {
+        let mut ui = UiState {
+            scene_mode: true,
+            keymap: Keymap {
+                scene_next: Some(KeyChord::plain(KeyCode::Char('n'))),
+                ..Keymap::default()
+            },
+            ..UiState::default()
+        };
+        // The rebound key cycles forward.
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('n')), &mut ui),
+            Action::Redraw
+        ));
+        assert_eq!(ui.scene_nav.take_pending(), Some("lattice"));
+        // The old Right key no longer cycles.
+        assert!(matches!(
+            handle_event(press(KeyCode::Right), &mut ui),
+            Action::None
+        ));
+        assert_eq!(ui.scene_nav.take_pending(), None);
+    }
+
+    #[test]
+    fn pause_state_freezes_the_snapshot_and_zeroes_dt() {
+        use scia_core::FeatureSnapshot;
+        let a = FeatureSnapshot {
+            generation: 1,
+            ..FeatureSnapshot::default()
+        };
+        let b = FeatureSnapshot {
+            generation: 2,
+            ..FeatureSnapshot::default()
+        };
+
+        let mut ps = PauseState::default();
+        // Running: the live snapshot and the real dt pass straight through.
+        let (s, dt) = ps.resolve(false, a, 0.016);
+        assert_eq!(s.generation, 1);
+        assert_eq!(dt, 0.016);
+        // Paused: the first paused snapshot is captured and dt is zeroed.
+        let (s, dt) = ps.resolve(true, a, 0.016);
+        assert_eq!(s.generation, 1);
+        assert_eq!(dt, 0.0);
+        // A newer live snapshot does not leak in while paused.
+        let (s, dt) = ps.resolve(true, b, 0.033);
+        assert_eq!(s.generation, 1, "the frozen snapshot is held");
+        assert_eq!(dt, 0.0);
+        // Resuming clears the freeze and passes the live snapshot again.
+        let (s, dt) = ps.resolve(false, b, 0.02);
+        assert_eq!(s.generation, 2);
+        assert_eq!(dt, 0.02);
     }
 }

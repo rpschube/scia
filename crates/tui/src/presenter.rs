@@ -350,3 +350,44 @@ pub fn build_scene_presenter(name: &str, tier: Tier) -> Result<ScenePresenter, S
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    /// Rasterize the presenter's current grid into a fresh buffer of `cols × rows`.
+    fn snapshot_buffer(p: &ScenePresenter, cols: u16, rows: u16) -> Buffer {
+        let area = Rect::new(0, 0, cols, rows);
+        let mut buf = Buffer::empty(area);
+        p.draw(&mut buf, area);
+        buf
+    }
+
+    #[test]
+    fn a_paused_frame_holds_and_resuming_advances() {
+        // aurora animates purely on `dt` (its wave phases drift by `dt`), so a
+        // dt=0 frame is a true freeze and a dt>0 frame advances.
+        let preset = builtin_preset("aurora")
+            .expect("aurora is a built-in preset")
+            .expect("aurora parses");
+        let mut p = ScenePresenter::from_preset(&preset, Tier::Half);
+        let (cols, rows) = (24u16, 12u16);
+        p.resize(cols, rows);
+
+        let snap = FeatureSnapshot::default();
+        // Advance once so there is non-trivial state to hold.
+        p.frame(&snap, 0.1);
+        let before = snapshot_buffer(&p, cols, rows);
+
+        // Paused: dt = 0 must not advance the scene, so the frame is identical.
+        p.frame(&snap, 0.0);
+        let paused = snapshot_buffer(&p, cols, rows);
+        assert_eq!(before, paused, "a paused frame (dt=0) must not advance");
+
+        // Resume: a real dt advances the animation, so the frame changes.
+        p.frame(&snap, 0.1);
+        let resumed = snapshot_buffer(&p, cols, rows);
+        assert_ne!(before, resumed, "resuming (dt>0) must advance the scene");
+    }
+}

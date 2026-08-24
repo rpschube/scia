@@ -4,8 +4,15 @@
 //! feed drives the pipeline; otherwise `scia` captures real system audio through
 //! the cpal backend. The feature bus feeds either the terminal frontend or, with
 //! `--headless`, a once-a-second status line on stderr. `--list-devices` prints
-//! the device table and exits. Exit codes: `0` success, `1` runtime error, `2`
-//! usage / unsupported, `3` no capture device.
+//! the device table and exits.
+//!
+//! An optional config file supplies defaults and rebindable keys (see
+//! [`mod@config`]); precedence is built-in defaults < config < CLI flags.
+//!
+//! Exit codes: `0` success, `1` runtime error, `2` usage / unsupported, `3` no
+//! capture device.
+
+mod config;
 
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -14,7 +21,7 @@ use std::sync::mpsc::Receiver;
 use std::thread::sleep;
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use scia_core::{
     Activity, CaptureError, CpalBackend, DeviceKind, DeviceSelector, Engine, EngineConfig,
@@ -22,7 +29,33 @@ use scia_core::{
     list_devices,
 };
 use scia_scenes::{Preset, PresetWatcher, ReloadEvent, load_preset};
-use scia_tui::{RunError, Tier, TuiOptions, run};
+use scia_tui::{Keymap, RunError, Tier, TuiOptions, run};
+
+use config::Resolved;
+
+/// The `CONFIG`, `KEYS` and `EXIT CODES` sections appended to the long `--help`.
+const CONFIG_HELP: &str = "\
+CONFIG:
+  scia reads an optional TOML config for defaults and key bindings. Precedence,
+  lowest to highest: built-in defaults < config file < command-line flags. A
+  missing file is not an error.
+    Unix:     $XDG_CONFIG_HOME/scia/config.toml  (else ~/.config/scia/config.toml)
+    Windows:  %APPDATA%\\scia\\config.toml
+  [defaults]  scene, presenter, overlay, perf_mode, demo_bpm
+  [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
+              quit, now_playing. A value is a single character, a named key
+              (tab, esc, left, right, up, down, enter, space, backtick), or
+              ctrl+<key>. Unknown actions or unparseable keys warn and are
+              ignored.
+
+KEYS (defaults, all rebindable; press ? in-app for the active map):
+  right/left  next / prev scene      tab    scene browser
+  `           debug overlay          space  pause         q  quit
+  esc         back (browser) / quit  ?      toggle help
+
+EXIT CODES:
+  0  success            1  runtime error         2  usage / unsupported
+  3  no capture device";
 
 /// Per-query timeout for capability probing; the four queries stay well under
 /// ~600 ms total.
@@ -30,8 +63,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// A live, terminal audio spectrum.
 #[derive(Parser, Debug)]
-#[command(name = "scia", version, about, long_about = None)]
+#[command(name = "scia", version, about, long_about = None, after_long_help = CONFIG_HELP)]
 struct Cli {
+    /// Subcommand (optional). `list-scenes` mirrors `--list-scenes`.
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Use the built-in synthetic feed (no audio capture).
     #[arg(long)]
     demo: bool,
@@ -41,10 +78,11 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = DemoSignal::Music)]
     demo_signal: DemoSignal,
 
-    /// Tempo for the `music` demo signal, in BPM (clamped 40..=220). Ignored by
-    /// the `sine` and `clicks` signals.
-    #[arg(long, default_value_t = 112.0)]
-    demo_bpm: f32,
+    /// Tempo for the `music` demo signal, in BPM (clamped 40..=220). Defaults to
+    /// 112 (overridable via the config `[defaults] demo_bpm`). Ignored by the
+    /// `sine` and `clicks` signals.
+    #[arg(long)]
+    demo_bpm: Option<f32>,
 
     /// Capture device name (exact match from --list-devices). Defaults to the
     /// system mix (Windows loopback / PipeWire sink) or the default input.
@@ -127,8 +165,17 @@ struct Cli {
     list_scenes: bool,
 }
 
-/// The mosaic tiers selectable with `--presenter`.
-#[derive(Clone, Copy, Debug, ValueEnum)]
+/// The subcommands. Kept minimal: `list-scenes` is a subcommand alias for the
+/// `--list-scenes` flag (both work).
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// List every registered scene and built-in preset, then exit.
+    ListScenes,
+}
+
+/// The mosaic tiers selectable with `--presenter` (or the config
+/// `[defaults] presenter`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum PresenterTier {
     /// `2×4` block octants.
     Octant,
@@ -187,21 +234,40 @@ fn main() -> ExitCode {
         return print_device_table();
     }
 
-    if cli.list_scenes {
+    // The `list-scenes` subcommand mirrors the `--list-scenes` flag.
+    if cli.list_scenes || matches!(cli.command, Some(Command::ListScenes)) {
         return print_scene_list();
     }
 
     // A scene needs the TUI body; there is nothing to render in the headless
-    // status loop.
+    // status loop. Only an *explicit* scene flag conflicts — a config scene
+    // default is simply ignored under --headless.
     if cli.headless && (cli.scene.is_some() || cli.scene_file.is_some()) {
         eprintln!("--scene/--scene-file cannot be combined with --headless");
         return ExitCode::from(2);
     }
 
+    // Load the config (one small file read; a missing file is not an error) and
+    // merge it under the flags: built-in defaults < config < CLI flags.
+    let cfg = config::load();
+    for warning in &cfg.warnings {
+        eprintln!("{warning}");
+    }
+    let resolved = config::resolve(
+        config::CliLayer {
+            scene: cli.scene.clone(),
+            presenter: cli.presenter,
+            overlay: cli.overlay,
+            perf_mode: cli.perf_mode,
+            demo_bpm: cli.demo_bpm,
+        },
+        &cfg.defaults,
+    );
+
     if cli.demo {
-        run_demo(&cli)
+        run_demo(&cli, &resolved, cfg.keymap)
     } else {
-        run_live(&cli)
+        run_live(&cli, &resolved, cfg.keymap)
     }
 }
 
@@ -222,8 +288,8 @@ fn print_scene_list() -> ExitCode {
 /// skips probing), otherwise the default tier from a capability probe. Prints
 /// the capability one-liner to stderr when probing a real terminal. Called only
 /// on the TUI path (never headless).
-fn select_tier(cli: &Cli) -> Tier {
-    if let Some(forced) = cli.presenter {
+fn select_tier(resolved: &Resolved) -> Tier {
+    if let Some(forced) = resolved.presenter {
         return forced.tier();
     }
     let report = scia_tui::probe(PROBE_TIMEOUT);
@@ -263,8 +329,8 @@ fn print_device_table() -> ExitCode {
 }
 
 /// Start the engine on the built-in synthetic feed and run the TUI.
-fn run_demo(cli: &Cli) -> ExitCode {
-    let bpm = cli.demo_bpm.clamp(40.0, 220.0);
+fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
+    let bpm = resolved.demo_bpm.clamp(40.0, 220.0);
     let backend = SyntheticBackend {
         signal: cli.demo_signal.signal(bpm),
         pacing: Pacing::Realtime,
@@ -301,10 +367,11 @@ fn run_demo(cli: &Cli) -> ExitCode {
         source: String::new(),
         frames: cli.frames,
         debug: cli.debug,
-        overlay: cli.overlay,
-        scene: cli.scene.clone(),
+        overlay: resolved.overlay,
+        scene: resolved.scene.clone(),
         preset,
-        tier: Some(select_tier(cli)),
+        tier: Some(select_tier(resolved)),
+        keymap,
     };
 
     let outcome = run(
@@ -321,7 +388,7 @@ fn run_demo(cli: &Cli) -> ExitCode {
 
 /// Start live capture on the cpal backend and run the TUI or the headless
 /// status loop.
-fn run_live(cli: &Cli) -> ExitCode {
+fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     let selector = match &cli.device {
         Some(name) => DeviceSelector::Named(name.clone()),
         None => DeviceSelector::Default,
@@ -336,7 +403,7 @@ fn run_live(cli: &Cli) -> ExitCode {
 
     let config = EngineConfig {
         route_watch: !cli.no_route_watch,
-        perf_mode: cli.perf_mode,
+        perf_mode: resolved.perf_mode,
         ..EngineConfig::default()
     };
     let (engine, reader) = match Engine::start(Box::new(backend), config) {
@@ -412,10 +479,11 @@ fn run_live(cli: &Cli) -> ExitCode {
         source,
         frames: cli.frames,
         debug: cli.debug,
-        overlay: cli.overlay,
-        scene: cli.scene.clone(),
+        overlay: resolved.overlay,
+        scene: resolved.scene.clone(),
         preset,
-        tier: Some(select_tier(cli)),
+        tier: Some(select_tier(resolved)),
+        keymap,
     };
 
     let outcome = run(
