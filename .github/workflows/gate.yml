@@ -4,13 +4,13 @@
 # failure is visible per recipe. The privacy pass is a separate workflow
 # (privacy.yml); together gate.yml and privacy.yml cover exactly `just gate`.
 # A second job lints the pull-request title as a Conventional Commit.
+# Runs on pull requests only; the cross-platform master.yml matrix (which
+# includes Linux) is the post-merge truth on master.
 name: gate
 
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
-  push:
-    branches: [master]
 
 concurrency:
   group: gate-${{ github.workflow }}-${{ github.ref }}

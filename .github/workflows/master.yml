@@ -1,0 +1,50 @@
+# master — cross-platform truth on master.
+# The pull-request gate (gate.yml) proves Linux on every PR; this workflow adds
+# the expensive cross-platform pass — Linux, Windows and macOS — once a change
+# lands on master (and on demand via workflow_dispatch), never on a schedule.
+# The justfile wrappers are Linux-only bash (flock/ionice), so the matrix runs
+# plain cargo identically on every OS instead. When golden-file DSP tests exist
+# they will run here too, so cross-platform numerical drift is caught on master.
+name: master
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: master-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup toolchain install --profile minimal
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install test runner (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: build
+        run: cargo build --workspace
+
+      - name: test
+        run: cargo nextest run --workspace
