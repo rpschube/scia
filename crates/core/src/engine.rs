@@ -18,6 +18,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::backends::wasapi_route::RouteNotifier;
+use crate::beat::BeatDebug;
 use crate::bus::{FeatureReader, feature_bus};
 use crate::capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, SinkStats, StreamFormat,
@@ -315,6 +316,10 @@ pub struct Engine {
     /// no callback can flip the reopen flag after the watcher is joined.
     route_notifier: Option<RouteNotifier>,
     counters: Arc<DspCounters>,
+    /// Diagnostic side channel: the in-thread beat tracker's latest
+    /// [`BeatDebug`], refreshed by the DSP thread once per induction pass. Read
+    /// with [`Engine::beat_debug`]; never on the hop path.
+    beat_debug: Arc<Mutex<BeatDebug>>,
 }
 
 impl Engine {
@@ -342,6 +347,7 @@ impl Engine {
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(DspCounters::default());
         let swap = Arc::new(RingSwap::new());
+        let beat_debug = Arc::new(Mutex::new(BeatDebug::default()));
 
         let dsp = DspThread {
             consumer,
@@ -352,6 +358,7 @@ impl Engine {
             stats: Arc::clone(&stats),
             counters: Arc::clone(&counters),
             swap: Arc::clone(&swap),
+            beat_debug: Arc::clone(&beat_debug),
         };
 
         let dsp_join = thread::Builder::new()
@@ -440,6 +447,7 @@ impl Engine {
                 watch_join,
                 route_notifier,
                 counters,
+                beat_debug,
             },
             reader,
         ))
@@ -515,6 +523,21 @@ impl Engine {
     #[must_use]
     pub fn health(&self) -> StreamHealth {
         self.shared.health()
+    }
+
+    /// A read-only snapshot of the in-thread beat tracker's internal state (see
+    /// [`BeatDebug`]), refreshed by the DSP thread once per induction pass
+    /// (≈ every 1.2 s). Returns `None` until the first induction pass has run.
+    ///
+    /// Diagnostic-only: this is the *real* tracker the pipeline runs, exposed for
+    /// calibration probes so they need not maintain a separate mirror tracker. It
+    /// is never read back by the pipeline and has no effect on tracking or on the
+    /// published [`FeatureSnapshot`](crate::FeatureSnapshot). The DSP thread only
+    /// ever `try_lock`s this cell, so reading it can never stall the hop grid.
+    #[must_use]
+    pub fn beat_debug(&self) -> Option<BeatDebug> {
+        let dbg = *self.beat_debug.lock().unwrap_or_else(|e| e.into_inner());
+        if dbg.inductions == 0 { None } else { Some(dbg) }
     }
 
     /// Tear down the current capture stream and open a fresh one, then swap its
