@@ -37,7 +37,10 @@ pub mod synthetic;
 #[cfg(feature = "capture-cpal")]
 pub use backends::cpal::{CpalBackend, DeviceInfo, DeviceKind, DeviceSelector, list_devices};
 #[cfg(feature = "perf-mode")]
-pub use backends::wasapi_perf::{PerfModeConfig, PerfModeInfo, PerfModeStream};
+pub use backends::wasapi_perf::{
+    PerfModeAvailability, PerfModeConfig, PerfModeInfo, PerfModeStream,
+    availability as perf_mode_availability,
+};
 pub use bands::{BandConfig, BandSplitter};
 pub use bus::{FeatureReader, FeatureWriter, feature_bus};
 pub use capture::{
@@ -45,7 +48,7 @@ pub use capture::{
     SampleSink, SinkStats, StreamFormat, StreamHealth, sample_ring,
 };
 pub use dsp::{DspConfig, HopProcessor};
-pub use engine::{Engine, EngineConfig, EngineError, EngineStats};
+pub use engine::{Engine, EngineConfig, EngineError, EngineStats, PerfModeState};
 pub use features::{Activity, FEATURE_SCHEMA_VERSION, FeatureSnapshot, SPECTRUM_BINS};
 pub use latency::{
     ClickDetector, Detection, Emission, EmitLog, LatencyStats, Matched, Matcher, Percentiles,
