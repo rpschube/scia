@@ -221,6 +221,57 @@ fn symbol(buf: &Buffer, x: u16, y: u16) -> String {
 }
 
 #[test]
+fn build_scene_presenter_resolves_a_valid_preset() {
+    // The seam the CLI drives: a known preset builds at the requested tier, and
+    // the tier label is exactly what the debug line surfaces.
+    let presenter =
+        scia_tui::build_scene_presenter("spectra", Tier::Octant).expect("spectra builds");
+    assert_eq!(presenter.tier(), Tier::Octant);
+    assert_eq!(presenter.tier().label(), "octants");
+}
+
+#[test]
+fn build_scene_presenter_reports_an_unknown_name() {
+    let err = scia_tui::build_scene_presenter("nope", Tier::Half)
+        .map(|_| ())
+        .expect_err("unknown preset is an error, not a panic");
+    let msg = err.to_string();
+    assert!(msg.contains("nope"), "names the bad preset: {msg}");
+    assert!(msg.contains("spectra"), "lists available presets: {msg}");
+}
+
+#[test]
+fn debug_line_carries_the_active_scene_tier_label() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use scia_tui::{UiState, draw};
+
+    // A scene is active: its presenter's tier label is what the debug line must
+    // carry, wiring the probe-selected tier through to the debug overlay.
+    let presenter =
+        scia_tui::build_scene_presenter("spectra", Tier::Octant).expect("spectra builds");
+    let ui = UiState {
+        debug: true,
+        tier: Some(presenter.tier().label()),
+        ..UiState::default()
+    };
+    let snap = ramp_snapshot(64);
+
+    let width = 140;
+    let mut terminal = Terminal::new(TestBackend::new(width, 10)).expect("terminal");
+    terminal
+        .draw(|frame| draw(frame, &snap, &ui))
+        .expect("draw");
+    let buf = terminal.backend().buffer().clone();
+
+    let last = (0..width).map(|x| symbol(&buf, x, 9)).collect::<String>();
+    assert!(
+        last.contains("tier octants"),
+        "debug row missing scene tier label: {last:?}"
+    );
+}
+
+#[test]
 fn presenter_frame_does_not_allocate_when_warm() {
     let preset = builtin_preset("spectra").unwrap().unwrap();
     let mut presenter = ScenePresenter::from_preset(&preset, Tier::Octant);
