@@ -82,7 +82,9 @@ mod win_impl {
     use std::thread::{self, JoinHandle};
 
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-    use windows::Win32::Foundation::{CloseHandle, RPC_E_CHANGED_MODE, WAIT_OBJECT_0};
+    use windows::Win32::Foundation::{
+        CloseHandle, RPC_E_CHANGED_MODE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows::Win32::Media::Audio::{
         AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         DEVICE_STATE_ACTIVE, IAudioClient3, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
@@ -95,7 +97,10 @@ mod win_impl {
         CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
         CoUninitialize, STGM_READ,
     };
-    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+    /// How long the render thread waits for an engine wake before re-checking the stop flag.
+    const STOP_POLL_MS: u32 = 200;
     use windows::core::PCWSTR;
 
     use super::PerfModeInfo;
@@ -326,9 +331,14 @@ mod win_impl {
             // portion of the buffer and release it flagged silent — no real
             // audio, no allocation.
             loop {
-                let waited = WaitForSingleObject(event, INFINITE);
+                // Bounded wait: the engine normally signals every period, but a
+                // halted engine must not be able to hang shutdown.
+                let waited = WaitForSingleObject(event, STOP_POLL_MS);
                 if stop.load(Ordering::Acquire) {
                     break;
+                }
+                if waited == WAIT_TIMEOUT {
+                    continue;
                 }
                 if waited != WAIT_OBJECT_0 {
                     break;
