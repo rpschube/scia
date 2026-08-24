@@ -414,6 +414,56 @@ fn fade_blends_outgoing_and_incoming() {
     }
 }
 
+/// One presenter frame of `preset` under `snap`, flattened to its symbol grid.
+fn frame_grid(preset: &Preset, snap: &FeatureSnapshot, cols: u16, rows: u16) -> String {
+    let mut p = ScenePresenter::from_preset(preset, Tier::Half);
+    p.resize(cols, rows);
+    p.frame(snap, 0.016);
+    let buf = paint(&p, cols, rows);
+    let mut grid = String::new();
+    for y in 0..rows {
+        for x in 0..cols {
+            grid.push_str(&symbol(&buf, x, y));
+        }
+    }
+    grid
+}
+
+#[test]
+fn mapping_makes_the_presenter_feature_responsive() {
+    let (cols, rows) = (16u16, 8u16);
+    // The same scene, once with `gap` mapped to loudness and once without.
+    let mapped = parse_preset(
+        "[preset]\nname = \"m\"\nscene = \"spectra\"\n\
+         [map]\ngap = { feature = \"loud\", scale = 0.8 }\n",
+        None,
+    )
+    .expect("valid mapped preset");
+    let plain = parse_preset("[preset]\nname = \"p\"\nscene = \"spectra\"\n", None)
+        .expect("valid plain preset");
+
+    // Two snapshots with identical spectra but different loudness.
+    let quiet = flat_snapshot(8, 0.6);
+    let mut loud = flat_snapshot(8, 0.6);
+    loud.rms = 0.9;
+
+    // The mapped preset paints differently under the two loudness levels: the
+    // live `gap` mapping reaches the render on the same frame it is folded in.
+    assert_ne!(
+        frame_grid(&mapped, &quiet, cols, rows),
+        frame_grid(&mapped, &loud, cols, rows),
+        "a `[map]` on gap must let loudness change the painted frame"
+    );
+
+    // Spectra reads only the spectrum and onset, so the unmapped preset is
+    // invariant to loudness — confirming the difference above is the mapping.
+    assert_eq!(
+        frame_grid(&plain, &quiet, cols, rows),
+        frame_grid(&plain, &loud, cols, rows),
+        "with no mapping, loudness must not change the frame"
+    );
+}
+
 #[test]
 fn fade_completes_after_300ms() {
     let mut p = ScenePresenter::from_preset(&spectra_preset("gap = 0.0"), Tier::Half);

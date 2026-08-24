@@ -1,7 +1,9 @@
 //! The built-in `spectra` scene: geometry, the onset punch and continuity.
 
 use scia_core::FeatureSnapshot;
-use scia_scenes::{Canvas, Primitive, Scene, SceneCtx, create_builtin};
+use scia_scenes::{
+    Canvas, Curve, Feature, Mapping, MappingSet, Params, Primitive, Scene, SceneCtx, create_builtin,
+};
 
 /// Build a snapshot with the given display spectrum and onset flag.
 fn snap(values: &[f32], onset: bool) -> FeatureSnapshot {
@@ -140,6 +142,116 @@ fn spectra_state_round_trip() {
     assert_ne!(
         prims_a, prims_c,
         "a scene that skipped restore should not match (envelope was carried)"
+    );
+}
+
+/// Render one presenter-style frame: fold the mappings into `params`, re-apply
+/// them to the scene, update, then render — the exact order the host uses.
+fn mapped_frame(
+    scene: &mut dyn Scene,
+    set: &mut MappingSet,
+    params: &mut Params,
+    snap: &FeatureSnapshot,
+    dt: f32,
+) -> Vec<Primitive> {
+    set.apply(snap, dt, params);
+    scene.apply_params(params);
+    scene.update(snap, dt);
+    render_to_vec(scene)
+}
+
+#[test]
+fn mapped_param_reaches_the_same_frame_render() {
+    // `gap` mapped to loudness with an instant envelope. A louder frame must
+    // widen the gap — and so narrow the bars — in the very frame it arrives.
+    // Without the live re-apply, `gap` would stay at its init default and the
+    // two loudness levels would render identically.
+    let mapping = Mapping {
+        target: "gap".to_string(),
+        feature: Feature::Loud,
+        curve: Curve::Linear,
+        attack_ms: 0.0,
+        decay_ms: 0.0,
+        scale: 0.8,
+        offset: 0.0,
+    };
+    let values = [0.5f32; 8];
+
+    let bar_width_at = |rms: f32| -> f32 {
+        let mut s = spectra();
+        s.init(&SceneCtx::default());
+        let mut set = MappingSet::new(std::slice::from_ref(&mapping));
+        let mut params = Params::new();
+        set.seed(&mut params);
+        let mut sn = snap(&values, false);
+        sn.rms = rms;
+        let prims = mapped_frame(s.as_mut(), &mut set, &mut params, &sn, 0.016);
+        bar_xwh(&prims[0]).1
+    };
+
+    let quiet = bar_width_at(0.0);
+    let loud = bar_width_at(0.9);
+    assert!(
+        loud + 1e-4 < quiet,
+        "a louder frame must narrow the bars via the live `gap` mapping \
+         (quiet width {quiet}, loud width {loud})"
+    );
+}
+
+#[test]
+fn mapped_value_past_the_manifest_max_is_clamped() {
+    // `punch` has manifest max 2.0. A mapping whose offset alone is 5.0 writes
+    // 5.0 into the params every frame; the scene must clamp it to 2.0 on read.
+    // Rendered against an onset-charged envelope, the clamped mapping matches a
+    // static preset pinned at the max, and differs from one left at the default.
+    let values = [0.1f32; 16];
+
+    // A scene with a static `punch`, driven one onset frame.
+    let static_punch = |punch: f32| -> Vec<Primitive> {
+        let mut ctx = SceneCtx::default();
+        ctx.params.set("punch", punch);
+        let mut s = spectra();
+        s.init(&ctx);
+        s.update(&snap(&values, true), 0.05);
+        render_to_vec(s.as_mut())
+    };
+
+    // A scene with `punch` mapped to a constant `offset` (scale 0), driven the
+    // same onset frame through the live re-apply.
+    let mapped_punch = |offset: f32| -> Vec<Primitive> {
+        let mapping = Mapping {
+            target: "punch".to_string(),
+            feature: Feature::Onset,
+            curve: Curve::Linear,
+            attack_ms: 0.0,
+            decay_ms: 0.0,
+            scale: 0.0,
+            offset,
+        };
+        let mut set = MappingSet::new(std::slice::from_ref(&mapping));
+        let mut params = Params::new();
+        set.seed(&mut params);
+        let mut s = spectra();
+        s.init(&SceneCtx::default());
+        mapped_frame(
+            s.as_mut(),
+            &mut set,
+            &mut params,
+            &snap(&values, true),
+            0.05,
+        )
+    };
+
+    let clamped = mapped_punch(5.0);
+    assert_eq!(
+        clamped,
+        static_punch(2.0),
+        "a mapping writing 5.0 into `punch` is clamped to the manifest max 2.0"
+    );
+    assert_ne!(
+        clamped,
+        static_punch(0.35),
+        "the mapping did move `punch` off its default (the clamp is not vacuous)"
     );
 }
 
