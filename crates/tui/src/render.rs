@@ -11,6 +11,7 @@ use ratatui::style::{Modifier, Style};
 use scia_core::{Activity, EngineStats, FeatureSnapshot};
 use scia_scenes::{SceneInfo, builtin_scenes};
 
+use crate::keymap::{InputAction, Keymap};
 use crate::palette;
 
 /// Version string shown in the header, resolved from Cargo metadata.
@@ -72,6 +73,14 @@ pub struct UiState {
     /// canvas like the meter bridge when open, and consulted each frame by the
     /// loop to retarget the presenter's crossfade.
     pub scene_nav: SceneNav,
+    /// The active key bindings, so the help overlay lists the current keys and
+    /// the input handler resolves rebound actions. Defaults to the built-in set.
+    pub keymap: Keymap,
+    /// Whether the scene is frozen. When set, the header shows a paused marker;
+    /// the render loop feeds the presenter a frozen snapshot and `dt = 0`.
+    pub paused: bool,
+    /// Whether the in-app key help overlay is shown (toggled with `?`).
+    pub help: bool,
 }
 
 /// Compute the frame layout: the header row, the optional body area, and the
@@ -108,6 +117,8 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
         // The browser panel and cycle toast paint over the body, last, like the
         // meter bridge. Inert unless the browser is open or a toast is up.
         draw_scene_nav(buf, body, &ui.scene_nav);
+        // The help overlay is the topmost body layer; inert unless toggled on.
+        draw_help(buf, body, ui);
     }
     if let Some(debug) = debug {
         render_debug(buf, debug, snap, ui);
@@ -497,6 +508,130 @@ fn render_browser_panel(buf: &mut Buffer, body: Rect, nav: &SceneNav) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// In-app key help overlay
+// ---------------------------------------------------------------------------
+
+/// The chrome rows the help panel needs beyond its binding rows: a title row and
+/// a bottom hint row.
+const HELP_CHROME_ROWS: u16 = 2;
+/// The narrowest body that still hosts the full help panel; below it (or when
+/// the body is too short) the overlay degrades to a single line, the way the
+/// meter bridge falls back on a small pane.
+const HELP_MIN_WIDTH: u16 = 30;
+
+/// The active-key rows the help overlay lists: each rebindable action with its
+/// current binding, plus the structural keys. Built from `keymap` so a rebind is
+/// reflected immediately.
+fn help_rows(keymap: &Keymap) -> Vec<(String, &'static str)> {
+    let mut rows = Vec::new();
+    for action in InputAction::ALL {
+        let key = match keymap.get(action) {
+            Some(chord) => chord.display(),
+            None => "—".to_string(),
+        };
+        rows.push((key, action.label()));
+    }
+    // Structural keys the loop owns directly (not rebindable).
+    rows.push(("esc".to_string(), "back / quit"));
+    rows.push(("↑↓ jk".to_string(), "browse move"));
+    rows.push(("enter".to_string(), "browse keep"));
+    rows.push(("d".to_string(), "debug line"));
+    rows.push(("ctrl+c".to_string(), "force quit"));
+    rows.push(("?".to_string(), "toggle help"));
+    rows
+}
+
+/// Paint the in-app key help over the body, topmost, when `ui.help` is set.
+/// Draws the full panel when the body has room and a single summary line when it
+/// does not, mirroring the scene browser's small-pane fallback. Draws nothing
+/// when the overlay is off or the body is degenerate.
+pub fn draw_help(buf: &mut Buffer, body: Rect, ui: &UiState) {
+    if !ui.help || body.width == 0 || body.height == 0 {
+        return;
+    }
+    let rows = help_rows(&ui.keymap);
+    let needed = rows.len() as u16 + HELP_CHROME_ROWS;
+    if body.height < needed || body.width < HELP_MIN_WIDTH {
+        render_help_line(buf, body);
+    } else {
+        render_help_panel(buf, body, &rows);
+    }
+}
+
+/// The small-pane fallback: one line on the body's top row.
+fn render_help_line(buf: &mut Buffer, body: Rect) {
+    let style = Style::new()
+        .fg(palette::OVERLAY_FG)
+        .bg(palette::OVERLAY_BG)
+        .add_modifier(Modifier::BOLD);
+    buf.set_stringn(
+        body.x,
+        body.y,
+        " keys — ? closes ",
+        body.width as usize,
+        style,
+    );
+}
+
+/// The full help panel: a title, one row per active binding, and a hint. Framed
+/// and filled top-left like the scene browser.
+fn render_help_panel(buf: &mut Buffer, body: Rect, rows: &[(String, &'static str)]) {
+    let key_w = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_w = rows
+        .iter()
+        .map(|(_, l)| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    // key column + gap + label, plus a left and right pad.
+    let want = (key_w + label_w + 4) as u16;
+    let width = want.clamp(HELP_MIN_WIDTH, body.width);
+    let height = (rows.len() as u16 + HELP_CHROME_ROWS).min(body.height);
+    let panel = Rect::new(body.x, body.y, width, height);
+
+    let fill = Style::new().bg(palette::OVERLAY_BG).fg(palette::OVERLAY_FG);
+    for dy in 0..panel.height {
+        for dx in 0..panel.width {
+            if let Some(cell) = buf.cell_mut((panel.x + dx, panel.y + dy)) {
+                cell.set_char(' ').set_style(fill);
+            }
+        }
+    }
+
+    let inner_x = panel.x + 1;
+    let inner_w = panel.width.saturating_sub(2) as usize;
+    buf.set_stringn(
+        inner_x,
+        panel.y,
+        "keys",
+        inner_w,
+        fill.add_modifier(Modifier::BOLD),
+    );
+
+    for (i, (key, label)) in rows.iter().enumerate() {
+        let y = panel.y + 1 + i as u16;
+        // Keep the bottom row for the hint.
+        if y >= panel.y + panel.height - 1 {
+            break;
+        }
+        let text = format!("{key:<key_w$}  {label}");
+        buf.set_stringn(inner_x, y, &text, inner_w, fill);
+    }
+
+    let hint_y = panel.y + panel.height - 1;
+    buf.set_stringn(
+        inner_x,
+        hint_y,
+        "? closes",
+        inner_w,
+        fill.add_modifier(Modifier::DIM),
+    );
+}
+
 /// Paint only the header and debug-line chrome and return the body area, so a
 /// scene presenter can rasterize into the body itself. Returns `None` for a
 /// degenerate frame, or `Some(None)` when the chrome leaves no body row.
@@ -557,9 +692,16 @@ fn render_header(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiSt
     );
 
     // Right indicator reflects the engine's activity state, not the raw
-    // starved bit, so `quiet` and `idle` are distinguishable at a glance.
+    // starved bit, so `quiet` and `idle` are distinguishable at a glance. A
+    // `paused` marker leads it while the scene is frozen.
     let activity = ui.stats.activity;
-    let right = format!("{}  gen {}", activity_label(activity), snap.generation);
+    let paused = if ui.paused { "paused · " } else { "" };
+    let right = format!(
+        "{}{}  gen {}",
+        paused,
+        activity_label(activity),
+        snap.generation
+    );
     let rw = right.chars().count() as u16;
     let rx = rect.x + rect.width.saturating_sub(rw);
     buf.set_stringn(

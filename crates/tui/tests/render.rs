@@ -543,3 +543,60 @@ fn debug_line_shows_active_tier() {
         "debug row missing tier: {last:?}"
     );
 }
+
+#[test]
+fn help_overlay_lists_active_bindings_and_degrades() {
+    // A roomy body shows the full panel with the default keys and action labels.
+    let snap = snapshot_with(&[0.3; 16]);
+    let ui = UiState {
+        help: true,
+        ..UiState::default()
+    };
+    let buf = render(60, 24, &snap, &ui);
+    let text: String = (0..24)
+        .flat_map(|y| (0..60u16).map(move |x| (x, y)))
+        .map(|(x, y)| sym(&buf, x, y))
+        .collect();
+    assert!(text.contains("keys"), "help panel missing title: {text:?}");
+    assert!(
+        text.contains("pause"),
+        "help panel missing pause row: {text:?}"
+    );
+    assert!(
+        text.contains("quit"),
+        "help panel missing quit row: {text:?}"
+    );
+
+    // A tiny body must not panic and falls back to the single summary line.
+    let small = render(12, 4, &snap, &ui);
+    let top = row(&small, 1, 12);
+    assert!(
+        top.contains("keys"),
+        "small-pane help should show the fallback line: {top:?}"
+    );
+}
+
+#[test]
+fn help_overlay_reflects_a_rebind() {
+    use scia_tui::{InputAction, Keymap, parse_chord};
+
+    let snap = snapshot_with(&[0.3; 16]);
+    let mut keymap = Keymap::default();
+    keymap.rebind(InputAction::Quit, Some(parse_chord("x").unwrap()));
+    let ui = UiState {
+        help: true,
+        keymap,
+        ..UiState::default()
+    };
+    let buf = render(60, 24, &snap, &ui);
+    // The quit row should now show `x`, sitting just before the "quit" label.
+    let mut found = false;
+    for y in 0..24 {
+        let line = row(&buf, y, 60);
+        if line.contains("quit") && line.contains('x') {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "help overlay should show the rebound quit key");
+}

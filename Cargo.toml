@@ -35,6 +35,10 @@ scia-scenes = { path = "crates/scenes", version = "0.0.0" }
 scia-meta = { path = "crates/meta", version = "0.0.0" }
 scia-tui = { path = "crates/tui", version = "0.0.0" }
 clap = { version = "4", features = ["derive"] }
+# Config-file parsing (US-UX-1). Both crates are already in the workspace tree
+# (scia-scenes' preset format uses them), so this adds no new dependency.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 
 [profile.release]
 lto = "fat"
