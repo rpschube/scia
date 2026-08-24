@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::bus::{FeatureReader, feature_bus};
 use crate::capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, SinkStats, StreamFormat,
-    sample_ring,
+    StreamHealth, sample_ring,
 };
 use crate::dsp::{DspConfig, DspCounters, DspThread};
 
@@ -46,6 +46,14 @@ pub struct EngineStats {
     /// Latest display-spectrum AGC gain (1.0 with autosens off, or before the
     /// first hop).
     pub agc_gain: f32,
+    /// Number of non-empty capture-callback pushes so far.
+    pub pushes: u64,
+    /// Frames delivered by the most recent push.
+    pub last_push_frames: u32,
+    /// Largest frame count seen in a single push.
+    pub max_push_frames: u32,
+    /// Largest interval between two consecutive pushes, in milliseconds.
+    pub max_gap_ms: f32,
 }
 
 /// Why the engine could not start.
@@ -135,7 +143,20 @@ impl Engine {
             hops_processed: self.counters.hops_processed.load(Ordering::Relaxed),
             hops_synthesized: self.counters.hops_synthesized.load(Ordering::Relaxed),
             agc_gain: f32::from_bits(self.counters.agc_gain_bits.load(Ordering::Relaxed)),
+            pushes: self.stats.pushes.load(Ordering::Relaxed),
+            last_push_frames: self.stats.last_push_frames.load(Ordering::Relaxed),
+            max_push_frames: self.stats.max_push_frames.load(Ordering::Relaxed),
+            max_gap_ms: self.stats.max_gap_ns.load(Ordering::Relaxed) as f32 / 1.0e6,
         }
+    }
+
+    /// The capture stream's health: [`StreamHealth::Errored`] once the
+    /// backend's error callback has fired, otherwise [`StreamHealth::Ok`].
+    #[must_use]
+    pub fn health(&self) -> StreamHealth {
+        self.stream
+            .as_ref()
+            .map_or(StreamHealth::Ok, |s| s.health())
     }
 
     /// Stop the DSP thread, stop capture, and join everything.

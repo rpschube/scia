@@ -17,3 +17,7 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+
+# System packages the Linux release builds need (cpal → alsa-sys).
+[dist.dependencies.apt]
+libasound2-dev = "*"

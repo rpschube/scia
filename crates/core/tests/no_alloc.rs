@@ -6,6 +6,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use scia_core::backends::convert::{Downmix, f32_id, i16_to_f32};
 use scia_core::spectrum::{SpectrumAnalyzer, SpectrumConfig};
 use scia_core::{HopProcessor, StreamFormat, sample_ring};
 
@@ -154,6 +155,43 @@ fn spectrum_analyzer_hot_path_does_not_allocate() {
         after,
         before,
         "spectrum analyzer allocated {} time(s)",
+        after - before
+    );
+}
+
+#[test]
+fn converter_downmix_does_not_allocate() {
+    // The capture callback converts and folds device samples into the ring with
+    // a preallocated output buffer; that path must not allocate. Drive the
+    // 6-channel fold (the branch with the most work) and, separately, the i16
+    // scalar converter through `mix_frames` with a fixed `out` buffer.
+    let frames = 512usize;
+    let dm6 = Downmix::new(6);
+    let input6 = vec![0.25f32; frames * 6];
+    let mut out = vec![0.0f32; frames * 2];
+
+    let dm2 = Downmix::new(2);
+    let input_i16 = vec![12_345i16; frames * 2];
+
+    // Warm up (nothing to warm here, but mirror the other cases).
+    for _ in 0..5 {
+        dm6.mix_frames(&input6, f32_id, &mut out);
+        dm2.mix_frames(&input_i16, i16_to_f32, &mut out);
+    }
+
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..200 {
+        let n6 = dm6.mix_frames(&input6, f32_id, &mut out);
+        assert_eq!(n6, frames * 2);
+        let n2 = dm2.mix_frames(&input_i16, i16_to_f32, &mut out);
+        assert_eq!(n2, frames * 2);
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+
+    assert_eq!(
+        after,
+        before,
+        "converter/downmix allocated {} time(s)",
         after - before
     );
 }

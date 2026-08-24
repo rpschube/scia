@@ -7,8 +7,24 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["capture-cpal"]
+# The cpal-based capture backend (Windows WASAPI loopback, Linux ALSA/PipeWire,
+# macOS Core Audio input). On by default.
+capture-cpal = ["dep:cpal"]
+# Enable cpal's native PipeWire host so Linux can capture the system output mix
+# (a sink monitor). OFF by default: it links libpipewire development libraries
+# that are not present on every build host, so it must not ride in an
+# all-features build. A real build with this feature needs the PipeWire dev
+# headers installed.
+capture-pipewire = ["cpal/pipewire"]
+
 [dependencies]
 realfft = "3"
 rtrb = "0.4"
 thiserror = "2"
 triple_buffer = "9"
+
+[dependencies.cpal]
+version = "0.18"
+optional = true
