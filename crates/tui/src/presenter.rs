@@ -15,11 +15,29 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
 use scia_scenes::{
-    Canvas, LayerInstance, Palette, Params, Preset, Rgb, builtin_preset, builtin_presets,
+    Blend, Canvas, LayerInstance, Palette, Params, Preset, Rgb, builtin_preset, builtin_presets,
 };
 
-use crate::mosaic::{CellGrid, FrameBuffer, Tier};
+use crate::mosaic::{CellGrid, FrameBuffer, TextRun, Tier};
+use crate::pixel::{PIXEL_BUDGET, PixelBuffer, image_dims};
 use scia_core::FeatureSnapshot;
+
+/// Which presenter drives the scene body: the cell mosaic on a [`Tier`], or the
+/// kitty graphics pixel image.
+///
+/// The kitty variant carries the terminal's cell size in pixels `(height,
+/// width)`, used to size the transmitted image; the mosaic variant carries the
+/// subpixel ladder rung.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresenterMode {
+    /// The cell-mosaic rasterizer at the given ladder rung.
+    Mosaic(Tier),
+    /// The kitty graphics pixel presenter, sized from the reported cell size.
+    Kitty {
+        /// Terminal cell size in pixels `(height, width)`.
+        cell_px: (u16, u16),
+    },
+}
 
 /// Renders a preset's scene layers into terminal cells on a mosaic [`Tier`].
 ///
@@ -56,9 +74,21 @@ struct PaletteFade {
 }
 
 pub struct ScenePresenter {
-    tier: Tier,
+    mode: PresenterMode,
     fb: FrameBuffer,
     grid: CellGrid,
+    /// The pixel image, in kitty mode. Empty (zero-sized) in mosaic mode.
+    px: PixelBuffer,
+    /// The outgoing pixel image during a cross-fade, in kitty mode.
+    px_out: PixelBuffer,
+    /// Set once the first swap has allocated [`px_out`](Self::px_out).
+    px_out_ready: bool,
+    /// The flattened RGB8 image the kitty encoder consumes, refreshed by
+    /// [`frame`](Self::frame). Empty in mosaic mode.
+    rgb8: Vec<u8>,
+    /// The current image size in pixels `(width, height)`, in kitty mode.
+    img_w: u16,
+    img_h: u16,
     canvas: Canvas,
     layers: Vec<LayerInstance>,
     /// One parameter bag per layer, driven by that layer's feature mappings.
@@ -90,6 +120,15 @@ impl ScenePresenter {
     /// canvas without re-initializing them.
     #[must_use]
     pub fn from_preset(preset: &Preset, tier: Tier) -> Self {
+        Self::with_mode(preset, PresenterMode::Mosaic(tier))
+    }
+
+    /// Build a presenter for `preset` in `mode` (cell mosaic or kitty graphics).
+    /// The mosaic constructor [`from_preset`](Self::from_preset) is the common
+    /// case; this is the general form the CLI drives once a presenter mode has
+    /// been selected.
+    #[must_use]
+    pub fn with_mode(preset: &Preset, mode: PresenterMode) -> Self {
         let layers = preset.instantiate(1.0);
         let mut params = Vec::with_capacity(layers.len());
         for layer in &layers {
@@ -98,9 +137,15 @@ impl ScenePresenter {
             params.push(p);
         }
         Self {
-            tier,
+            mode,
             fb: FrameBuffer::new(),
             grid: CellGrid::new(),
+            px: PixelBuffer::new(),
+            px_out: PixelBuffer::new(),
+            px_out_ready: false,
+            rgb8: Vec::new(),
+            img_w: 0,
+            img_h: 0,
             canvas: Canvas::new(1.0),
             layers,
             params,
@@ -131,15 +176,55 @@ impl ScenePresenter {
         }
     }
 
-    /// The active tier.
+    /// The active tier. In kitty mode there is no ladder rung, so the default
+    /// tier is reported; use [`mode`](Self::mode) to tell the modes apart.
     #[must_use]
     pub fn tier(&self) -> Tier {
-        self.tier
+        match self.mode {
+            PresenterMode::Mosaic(tier) => tier,
+            PresenterMode::Kitty { .. } => Tier::default(),
+        }
     }
 
-    /// Switch tiers; the next [`resize`](Self::resize) reshapes the pixel grid.
+    /// The presenter mode: cell mosaic on a tier, or kitty graphics.
+    #[must_use]
+    pub fn mode(&self) -> PresenterMode {
+        self.mode
+    }
+
+    /// The label shown on the debug line: the ladder rung in mosaic mode, or
+    /// `"kitty"` for the graphics presenter.
+    #[must_use]
+    pub fn mode_label(&self) -> &'static str {
+        match self.mode {
+            PresenterMode::Mosaic(tier) => tier.label(),
+            PresenterMode::Kitty { .. } => "kitty",
+        }
+    }
+
+    /// Switch to a mosaic tier; the next [`resize`](Self::resize) reshapes the
+    /// grid. Leaves kitty mode if it was active.
     pub fn set_tier(&mut self, tier: Tier) {
-        self.tier = tier;
+        self.mode = PresenterMode::Mosaic(tier);
+    }
+
+    /// The kitty image bytes (row-major RGB8) refreshed by the last
+    /// [`frame`](Self::frame). Empty in mosaic mode.
+    #[must_use]
+    pub fn image_rgb8(&self) -> &[u8] {
+        &self.rgb8
+    }
+
+    /// The kitty image size in pixels `(width, height)`.
+    #[must_use]
+    pub fn image_px(&self) -> (u16, u16) {
+        (self.img_w, self.img_h)
+    }
+
+    /// The kitty on-screen placement in terminal cells `(cols, rows)`.
+    #[must_use]
+    pub fn image_cells(&self) -> (u16, u16) {
+        (self.cols, self.rows)
     }
 
     /// Resize the pixel grid to a `cols × rows` cell area at the current tier
@@ -148,18 +233,46 @@ impl ScenePresenter {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
-        self.fb.resize(cols, rows, self.tier);
-        self.grid.resize(cols, rows);
-        // Keep the outgoing buffer in step once a swap has allocated it, so a
-        // fade that spans a resize mixes matching grids.
-        if self.fb_out_ready {
-            self.fb_out.resize(cols, rows, self.tier);
+        match self.mode {
+            PresenterMode::Mosaic(tier) => {
+                self.fb.resize(cols, rows, tier);
+                self.grid.resize(cols, rows);
+                // Keep the outgoing buffer in step once a swap has allocated it,
+                // so a fade that spans a resize mixes matching grids.
+                if self.fb_out_ready {
+                    self.fb_out.resize(cols, rows, tier);
+                }
+                let (sx, sy) = tier.subcells();
+                let pw = f32::from(cols) * f32::from(sx);
+                let ph = f32::from(rows) * f32::from(sy);
+                let aspect = if ph > 0.0 { pw / ph } else { 1.0 };
+                self.canvas.set_aspect(aspect);
+            }
+            PresenterMode::Kitty { cell_px } => {
+                let (w, h) = image_dims(cols, rows, cell_px, PIXEL_BUDGET);
+                self.img_w = w;
+                self.img_h = h;
+                self.px.resize(w, h);
+                self.px.set_cells(cols, rows);
+                if self.px_out_ready {
+                    self.px_out.resize(w, h);
+                    self.px_out.set_cells(cols, rows);
+                }
+                // Pre-grow the RGB8 scratch so a warm frame's flatten allocates
+                // nothing.
+                let need = w as usize * h as usize * 3;
+                if self.rgb8.capacity() < need {
+                    let add = need - self.rgb8.len();
+                    self.rgb8.reserve(add);
+                }
+                let aspect = if h > 0 {
+                    f32::from(w) / f32::from(h)
+                } else {
+                    1.0
+                };
+                self.canvas.set_aspect(aspect);
+            }
         }
-        let (sx, sy) = self.tier.subcells();
-        let pw = f32::from(cols) * f32::from(sx);
-        let ph = f32::from(rows) * f32::from(sy);
-        let aspect = if ph > 0.0 { pw / ph } else { 1.0 };
-        self.canvas.set_aspect(aspect);
     }
 
     /// Whether a preset cross-fade is currently in progress.
@@ -232,9 +345,19 @@ impl ScenePresenter {
         self.outgoing_palette = self.palette;
         self.palette = preset.palette();
 
-        // Allocate (or reuse) the outgoing buffer at the current geometry.
-        self.fb_out.resize(self.cols, self.rows, self.tier);
-        self.fb_out_ready = true;
+        // Allocate (or reuse) the outgoing buffer at the current geometry for the
+        // active mode.
+        match self.mode {
+            PresenterMode::Mosaic(tier) => {
+                self.fb_out.resize(self.cols, self.rows, tier);
+                self.fb_out_ready = true;
+            }
+            PresenterMode::Kitty { .. } => {
+                self.px_out.resize(self.img_w, self.img_h);
+                self.px_out.set_cells(self.cols, self.rows);
+                self.px_out_ready = true;
+            }
+        }
         self.fade = Some(Fade { elapsed: 0.0 });
         // A preset swap sets its own palette; abandon any in-flight palette fade
         // rather than let it fight the new scene's colours.
@@ -264,8 +387,15 @@ impl ScenePresenter {
             }
         }
 
-        // The incoming (or, without a fade, the only) layers rasterize into the
-        // primary buffer.
+        match self.mode {
+            PresenterMode::Mosaic(_) => self.frame_mosaic(snap, dt),
+            PresenterMode::Kitty { .. } => self.frame_kitty(snap, dt),
+        }
+    }
+
+    /// The mosaic frame path: rasterize into the cell frame buffer (mixing an
+    /// active cross-fade), then encode to the cell grid.
+    fn frame_mosaic(&mut self, snap: &FeatureSnapshot, dt: f32) {
         Self::rasterize_layers(
             &mut self.layers,
             &mut self.params,
@@ -280,8 +410,6 @@ impl ScenePresenter {
             fade.elapsed += dt.max(0.0);
             let elapsed = fade.elapsed;
             let t = (elapsed / FADE_SECS).clamp(0.0, 1.0);
-            // The outgoing layers rasterize into the second buffer, then mix
-            // under the incoming ones: `out * (1 - t) + in * t`.
             Self::rasterize_layers(
                 &mut self.outgoing,
                 &mut self.outgoing_params,
@@ -293,7 +421,6 @@ impl ScenePresenter {
             );
             self.fb.mix_from(&self.fb_out, t);
             if elapsed >= FADE_SECS {
-                // Fade complete: drop the outgoing layers, keeping capacity.
                 self.fade = None;
                 self.outgoing.clear();
                 self.outgoing_params.clear();
@@ -303,23 +430,61 @@ impl ScenePresenter {
         self.fb.encode(&mut self.grid);
     }
 
-    /// Advance, render and rasterize a layer stack into `fb`. Per layer: fold the
+    /// The kitty frame path: rasterize into the pixel image (mixing an active
+    /// cross-fade), then flatten it to the RGB8 buffer the encoder consumes.
+    fn frame_kitty(&mut self, snap: &FeatureSnapshot, dt: f32) {
+        Self::rasterize_layers(
+            &mut self.layers,
+            &mut self.params,
+            &self.palette,
+            &mut self.canvas,
+            &mut self.px,
+            snap,
+            dt,
+        );
+
+        if let Some(fade) = self.fade.as_mut() {
+            fade.elapsed += dt.max(0.0);
+            let elapsed = fade.elapsed;
+            let t = (elapsed / FADE_SECS).clamp(0.0, 1.0);
+            Self::rasterize_layers(
+                &mut self.outgoing,
+                &mut self.outgoing_params,
+                &self.outgoing_palette,
+                &mut self.canvas,
+                &mut self.px_out,
+                snap,
+                dt,
+            );
+            self.px.mix_from(&self.px_out, t);
+            if elapsed >= FADE_SECS {
+                self.fade = None;
+                self.outgoing.clear();
+                self.outgoing_params.clear();
+            }
+        }
+
+        self.px.write_rgb8(&mut self.rgb8);
+    }
+
+    /// Advance, render and rasterize a layer stack into `buf`. Per layer: fold the
     /// feature mappings into `params`, re-apply `params` to the scene (so a value
     /// a mapping just rewrote is honored on this frame), update the scene, render
     /// it onto the shared `canvas`, and rasterize with the layer's blend and
-    /// intensity. Free-standing (not `&mut self`) so a fade can drive the incoming
-    /// and outgoing stacks with disjoint borrows of the presenter's fields.
+    /// intensity. Generic over the raster target so the same drive feeds the cell
+    /// mosaic and the pixel image; free-standing (not `&mut self`) so a fade can
+    /// drive the incoming and outgoing stacks with disjoint borrows.
     #[allow(clippy::too_many_arguments)]
-    fn rasterize_layers(
+    fn rasterize_layers<R: LayerRaster>(
         layers: &mut [LayerInstance],
         params: &mut [Params],
         palette: &Palette,
         canvas: &mut Canvas,
-        fb: &mut FrameBuffer,
+        buf: &mut R,
         snap: &FeatureSnapshot,
         dt: f32,
     ) {
-        fb.clear();
+        buf.clear();
         let aspect = canvas.aspect();
         for (layer, p) in layers.iter_mut().zip(params.iter_mut()) {
             layer.mappings.apply(snap, dt, p);
@@ -328,31 +493,56 @@ impl ScenePresenter {
             canvas.clear();
             canvas.set_aspect(aspect);
             layer.scene.render(canvas);
-            fb.rasterize(canvas, palette, layer.blend, layer.intensity);
+            buf.rasterize(canvas, palette, layer.blend, layer.intensity);
         }
     }
 
     /// Paint the encoded cells into `buf` over `area`, then the collected text
     /// runs on top as real terminal text.
+    ///
+    /// In mosaic mode the encoded cells are painted first, then the text runs on
+    /// top. In kitty mode the image is *not* painted here — it is written to the
+    /// terminal as a graphics-protocol frame by the caller, and sits below the
+    /// text layer — so only the text runs are drawn, leaving the body cells clear
+    /// for the image to show through.
     pub fn draw(&self, buf: &mut Buffer, area: Rect) {
-        for cy in 0..self.grid.rows().min(area.height) {
-            for cx in 0..self.grid.cols().min(area.width) {
-                let Some(cell) = self.grid.cell(cx, cy) else {
-                    continue;
-                };
-                let Some(dst) = buf.cell_mut((area.x + cx, area.y + cy)) else {
-                    continue;
-                };
-                dst.set_char(cell.ch)
-                    .set_style(Style::new().fg(to_color(cell.fg)).bg(to_color(cell.bg)));
+        match self.mode {
+            PresenterMode::Mosaic(_) => {
+                for cy in 0..self.grid.rows().min(area.height) {
+                    for cx in 0..self.grid.cols().min(area.width) {
+                        let Some(cell) = self.grid.cell(cx, cy) else {
+                            continue;
+                        };
+                        let Some(dst) = buf.cell_mut((area.x + cx, area.y + cy)) else {
+                            continue;
+                        };
+                        dst.set_char(cell.ch)
+                            .set_style(Style::new().fg(to_color(cell.fg)).bg(to_color(cell.bg)));
+                    }
+                }
+                self.draw_text(buf, area, self.fb.text_runs(), |r| self.fb.run_text(r));
+            }
+            PresenterMode::Kitty { .. } => {
+                self.draw_text(buf, area, self.px.text_runs(), |r| self.px.run_text(r));
             }
         }
+    }
 
-        for run in self.fb.text_runs() {
+    /// Paint the collected text runs into `buf` over `area` as real terminal
+    /// text. Shared by both modes; `run_text` resolves a run against the active
+    /// buffer's arena.
+    fn draw_text<'a>(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        runs: &'a [TextRun],
+        run_text: impl Fn(&'a TextRun) -> &'a str,
+    ) {
+        for run in runs {
             if run.cell_x >= area.width || run.cell_y >= area.height {
                 continue;
             }
-            let text = self.fb.run_text(run);
+            let text = run_text(run);
             if text.is_empty() {
                 continue;
             }
@@ -372,6 +562,32 @@ impl ScenePresenter {
                 Style::new().fg(fg),
             );
         }
+    }
+}
+
+/// A raster target for [`ScenePresenter::rasterize_layers`]: the cell mosaic
+/// [`FrameBuffer`] or the [`PixelBuffer`]. Both clear, rasterize a canvas and
+/// cross-fade identically, so the layer-drive is written once against this trait.
+trait LayerRaster {
+    fn clear(&mut self);
+    fn rasterize(&mut self, canvas: &Canvas, palette: &Palette, blend: Blend, intensity: f32);
+}
+
+impl LayerRaster for FrameBuffer {
+    fn clear(&mut self) {
+        FrameBuffer::clear(self);
+    }
+    fn rasterize(&mut self, canvas: &Canvas, palette: &Palette, blend: Blend, intensity: f32) {
+        FrameBuffer::rasterize(self, canvas, palette, blend, intensity);
+    }
+}
+
+impl LayerRaster for PixelBuffer {
+    fn clear(&mut self) {
+        PixelBuffer::clear(self);
+    }
+    fn rasterize(&mut self, canvas: &Canvas, palette: &Palette, blend: Blend, intensity: f32) {
+        PixelBuffer::rasterize(self, canvas, palette, blend, intensity);
     }
 }
 
@@ -419,8 +635,21 @@ impl std::error::Error for SceneError {}
 /// [`SceneError`] when `name` is not a built-in preset, or when it is one but
 /// fails to parse/validate.
 pub fn build_scene_presenter(name: &str, tier: Tier) -> Result<ScenePresenter, SceneError> {
+    build_scene_presenter_mode(name, PresenterMode::Mosaic(tier))
+}
+
+/// Build a scene presenter for a built-in preset `name` in `mode` (cell mosaic or
+/// kitty graphics). The general form of [`build_scene_presenter`].
+///
+/// # Errors
+/// [`SceneError`] when `name` is not a built-in preset, or when it is one but
+/// fails to parse/validate.
+pub fn build_scene_presenter_mode(
+    name: &str,
+    mode: PresenterMode,
+) -> Result<ScenePresenter, SceneError> {
     match builtin_preset(name) {
-        Some(Ok(preset)) => Ok(ScenePresenter::from_preset(&preset, tier)),
+        Some(Ok(preset)) => Ok(ScenePresenter::with_mode(&preset, mode)),
         Some(Err(err)) => Err(SceneError {
             message: format!("invalid scene preset '{name}': {err}"),
         }),

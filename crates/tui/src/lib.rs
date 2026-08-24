@@ -17,21 +17,23 @@
 
 mod chrome;
 mod keymap;
+mod kitty;
 mod mosaic;
 mod nowplaying;
 mod pacing;
 mod palette;
+mod pixel;
 mod presenter;
 mod probe;
 mod render;
 mod stats;
 
 use std::fmt;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write as _};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::{Hide, Show};
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -40,18 +42,23 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 
 use scia_core::{Activity, EngineStats, FeatureReader, FeatureSnapshot, StreamHealth};
 use scia_scenes::{Palette, Preset, ReloadEvent, builtin_preset, builtin_scenes};
 
 pub use chrome::{ChromeMode, ChromeState, Fade};
 pub use keymap::{ChordParseError, InputAction, KeyChord, Keymap, parse_chord};
+pub use kitty::{CLEANUP as KITTY_CLEANUP, KittyEncoder};
 pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
 pub use nowplaying::{
     ArtResult, DecodeJob, MetaRuntime, NowPlayingState, TrackArt, art_palette_to_scene,
     draw_now_playing, extrapolated_position,
 };
-pub use presenter::{SceneError, ScenePresenter, build_scene_presenter};
+pub use pixel::{FALLBACK_CELL_PX, PIXEL_BUDGET, PixelBuffer, image_dims};
+pub use presenter::{
+    PresenterMode, SceneError, ScenePresenter, build_scene_presenter, build_scene_presenter_mode,
+};
 pub use probe::{
     CapabilityReport, Da1, SyncSupport, TermFamily, classify_family, default_tier, parse_cell_size,
     parse_da1, parse_decrqm_2026, probe, truecolor_from,
@@ -91,10 +98,13 @@ pub struct TuiOptions {
     /// [`scene`](Self::scene); live reloads then arrive on `run`'s `reload`
     /// receiver.
     pub preset: Option<Preset>,
-    /// The mosaic tier to render a scene at. `None` means the caller did not
-    /// force one; [`run`] then falls back to [`Tier::default`]. Ignored when
-    /// neither [`scene`](Self::scene) nor [`preset`](Self::preset) is set.
-    pub tier: Option<Tier>,
+    /// How to render the scene body: the cell mosaic on a [`Tier`], or the kitty
+    /// graphics pixel presenter. Ignored when neither [`scene`](Self::scene) nor
+    /// [`preset`](Self::preset) is set. Defaults to mosaic at [`Tier::default`].
+    pub presenter_mode: PresenterMode,
+    /// A one-shot status notice shown briefly at startup — e.g. a fallback note
+    /// when a forced kitty presenter is unsupported. `None` for no notice.
+    pub initial_notice: Option<String>,
     /// The active key bindings, built at startup from the built-in defaults plus
     /// any config overrides. The default is the built-in binding set.
     pub keymap: Keymap,
@@ -114,7 +124,8 @@ impl Default for TuiOptions {
             overlay: false,
             scene: None,
             preset: None,
-            tier: None,
+            presenter_mode: PresenterMode::Mosaic(Tier::default()),
+            initial_notice: None,
             keymap: Keymap::default(),
             chrome: ChromeMode::Invisible,
         }
@@ -174,11 +185,8 @@ pub fn run(
     // still in its normal state. A disk preset (`--scene-file`) is already
     // validated by the caller and takes precedence over a built-in name.
     let presenter = match (&opts.preset, &opts.scene) {
-        (Some(preset), _) => Some(ScenePresenter::from_preset(
-            preset,
-            opts.tier.unwrap_or_default(),
-        )),
-        (None, Some(name)) => Some(build_scene_presenter(name, opts.tier.unwrap_or_default())?),
+        (Some(preset), _) => Some(ScenePresenter::with_mode(preset, opts.presenter_mode)),
+        (None, Some(name)) => Some(build_scene_presenter_mode(name, opts.presenter_mode)?),
         (None, None) => None,
     };
     let mut guard = TerminalGuard::enter()?;
@@ -256,6 +264,11 @@ impl Drop for TerminalGuard {
 /// the panic hook, and idempotent enough that running it twice is harmless.
 fn restore_terminal() -> io::Result<()> {
     let mut stdout = io::stdout();
+    // Delete any placed kitty graphics before leaving the alternate screen. A
+    // no-op on terminals that never displayed one (and ignored by terminals that
+    // do not speak the protocol), so it is safe on every exit path, panic hook
+    // included.
+    let _ = stdout.write_all(kitty::CLEANUP);
     execute!(stdout, LeaveAlternateScreen, Show)?;
     disable_raw_mode()?;
     Ok(())
@@ -305,9 +318,10 @@ fn run_loop(
         debug: opts.debug,
         overlay: opts.overlay,
         fps_measured: opts.fps as f32,
-        // A scene presenter surfaces its ladder rung on the debug line; the
-        // direct-bars renderer leaves it unset.
-        tier: presenter.as_ref().map(|p| p.tier().label()),
+        // A scene presenter surfaces its mode (ladder rung, or "kitty") on the
+        // debug line; the direct-bars renderer leaves it unset.
+        tier: presenter.as_ref().map(|p| p.mode_label()),
+        notice: opts.initial_notice.clone(),
         scene_mode,
         scene_nav: SceneNav::new(initial_scene),
         keymap: opts.keymap,
@@ -342,8 +356,19 @@ fn run_loop(
     // The reload status notice auto-clears this long after the last event.
     const NOTICE_TTL: Duration = Duration::from_secs(3);
     // Deadline at which the current notice is cleared, tracked in-loop (no
-    // background timer).
+    // background timer). A startup notice (e.g. a kitty fallback) starts its TTL
+    // now.
     let mut notice_deadline: Option<Instant> = None;
+    if ui.notice.is_some() {
+        notice_deadline = Some(Instant::now() + NOTICE_TTL);
+    }
+
+    // Kitty graphics state: the frame encoder, its reusable output buffer, and
+    // the scene-body rect captured inside the draw closure so the image can be
+    // placed at its origin. Inert unless a kitty presenter is active.
+    let kitty_mode = matches!(opts.presenter_mode, PresenterMode::Kitty { .. });
+    let mut kitty_encoder = KittyEncoder::new();
+    let mut kitty_out: Vec<u8> = Vec::new();
 
     loop {
         let frame_start = Instant::now();
@@ -514,10 +539,17 @@ fn run_loop(
             // Scene path: draw the header/debug chrome, then rasterize the scene
             // into the body area the chrome left free.
             Some(p) => {
+                // The scene-body rect, captured inside the draw closure so the
+                // kitty image can be placed at its origin after the draw.
+                let mut kitty_body: Option<Rect> = None;
                 terminal.draw(|frame| {
                     if let Some(body) = render::draw_chrome(frame, &snap, &ui) {
                         p.resize(body.width, body.height);
                         p.frame(&snap, scene_dt);
+                        // In kitty mode `draw` paints only the text runs; the
+                        // image is written below as a graphics-protocol frame,
+                        // placed at the body origin captured here.
+                        kitty_body = Some(body);
                         p.draw(frame.buffer_mut(), body);
                         // The chrome personality paints over the scene, before
                         // the debug and help overlays layered above it.
@@ -547,6 +579,27 @@ fn run_loop(
                     let area = frame.area();
                     render::draw_notice(frame.buffer_mut(), area, &ui);
                 })?;
+                // Kitty mode: after ratatui has painted the cells (text + chrome
+                // above the image), write the image as a graphics-protocol frame
+                // at the body origin — still inside the synchronized-update
+                // bracket so a supporting terminal shows image and text together.
+                if kitty_mode {
+                    if let Some(body) = kitty_body {
+                        let (iw, ih) = p.image_px();
+                        if iw > 0 && ih > 0 {
+                            kitty_encoder.encode(
+                                p.image_rgb8(),
+                                p.image_px(),
+                                p.image_cells(),
+                                &mut kitty_out,
+                            );
+                            let mut out = io::stdout();
+                            let _ = execute!(out, MoveTo(body.x, body.y));
+                            let _ = out.write_all(&kitty_out);
+                            let _ = out.flush();
+                        }
+                    }
+                }
             }
             // Direct-bars path: byte-identical to before, plus the notice.
             None => {

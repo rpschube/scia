@@ -187,6 +187,32 @@ pub struct TextRun {
     span: core::ops::Range<u32>,
 }
 
+impl TextRun {
+    /// Construct a run for the given anchor cell, style and arena span. Shared
+    /// by the mosaic [`FrameBuffer`] and the pixel [`crate::pixel::PixelBuffer`],
+    /// which both collect text runs into their own arena.
+    pub(crate) fn new(
+        cell_x: u16,
+        cell_y: u16,
+        slot: Slot,
+        intensity: f32,
+        span: core::ops::Range<u32>,
+    ) -> Self {
+        Self {
+            cell_x,
+            cell_y,
+            slot,
+            intensity,
+            span,
+        }
+    }
+
+    /// The run's byte range in its owning arena.
+    pub(crate) fn span(&self) -> core::ops::Range<u32> {
+        self.span.clone()
+    }
+}
+
 /// A preallocated RGB pixel grid plus the text runs collected from the last
 /// rasterization pass.
 ///
@@ -316,7 +342,7 @@ impl FrameBuffer {
         for prim in canvas.primitives() {
             match *prim {
                 Primitive::Bar { x, y, w, h, style } => {
-                    let color = self.slot_color(palette, style, layer);
+                    let color = slot_color(palette, style, layer);
                     let (x0, x1) = span_px(x, w, self.px_w);
                     let (y0, y1) = span_px(y, h, self.px_h);
                     self.fill_rect(x0, y0, x1, y1, color, blend);
@@ -329,11 +355,11 @@ impl FrameBuffer {
                     width,
                     style,
                 } => {
-                    let color = self.slot_color(palette, style, layer);
+                    let color = slot_color(palette, style, layer);
                     self.draw_line(x0, y0, x1, y1, width, color, blend);
                 }
                 Primitive::Point { x, y, size, style } => {
-                    let color = self.slot_color(palette, style, layer);
+                    let color = slot_color(palette, style, layer);
                     self.draw_point(x, y, size, color, blend);
                 }
                 Primitive::Field {
@@ -350,18 +376,6 @@ impl FrameBuffer {
                 }
             }
         }
-    }
-
-    /// The linear-scaled RGB colour for a styled primitive: the palette slot
-    /// colour times the style intensity times the layer intensity.
-    fn slot_color(&self, palette: &Palette, style: Style, layer: f32) -> [f32; 3] {
-        let Rgb(r, g, b) = palette.color(style.slot);
-        let s = clamp01(style.intensity) * layer;
-        [
-            f32::from(r) / 255.0 * s,
-            f32::from(g) / 255.0 * s,
-            f32::from(b) / 255.0 * s,
-        ]
     }
 
     /// Blend `color` into the pixel at `(px, py)`.
@@ -649,9 +663,24 @@ impl FrameBuffer {
     }
 }
 
+/// The linear-scaled RGB colour for a styled primitive: the palette slot colour
+/// times the style intensity times the layer intensity. Shared by the mosaic
+/// [`FrameBuffer`] and the pixel [`crate::pixel::PixelBuffer`] so both resolve a
+/// [`Slot`] to colour identically.
+#[inline]
+pub(crate) fn slot_color(palette: &Palette, style: Style, layer: f32) -> [f32; 3] {
+    let Rgb(r, g, b) = palette.color(style.slot);
+    let s = clamp01(style.intensity) * layer;
+    [
+        f32::from(r) / 255.0 * s,
+        f32::from(g) / 255.0 * s,
+        f32::from(b) / 255.0 * s,
+    ]
+}
+
 /// Clamp to `0.0..=1.0`, mapping `NaN` to `0.0`.
 #[inline]
-fn clamp01(v: f32) -> f32 {
+pub(crate) fn clamp01(v: f32) -> f32 {
     if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) }
 }
 
@@ -676,7 +705,7 @@ fn dist2(a: [f32; 3], b: [f32; 3]) -> f32 {
 
 /// Convert a `0.0..=1.0` RGB triple to `u8` components.
 #[inline]
-fn to_u8(c: [f32; 3]) -> (u8, u8, u8) {
+pub(crate) fn to_u8(c: [f32; 3]) -> (u8, u8, u8) {
     let q = |v: f32| (clamp01(v) * 255.0).round() as u8;
     (q(c[0]), q(c[1]), q(c[2]))
 }
@@ -684,7 +713,7 @@ fn to_u8(c: [f32; 3]) -> (u8, u8, u8) {
 /// Map a normalized coordinate to a pixel index (rounded), clamped to
 /// `0..dim`.
 #[inline]
-fn to_px(v: f32, dim: u16) -> i32 {
+pub(crate) fn to_px(v: f32, dim: u16) -> i32 {
     let p = (clamp01(v) * dim as f32).round() as i32;
     p.clamp(0, dim as i32 - 1)
 }
@@ -692,7 +721,7 @@ fn to_px(v: f32, dim: u16) -> i32 {
 /// The half-open pixel span `[start, end)` for a normalized `[a, a+len]`
 /// interval over `dim` pixels, rounded to the nearest pixel edge.
 #[inline]
-fn span_px(a: f32, len: f32, dim: u16) -> (u16, u16) {
+pub(crate) fn span_px(a: f32, len: f32, dim: u16) -> (u16, u16) {
     let lo = (clamp01(a) * dim as f32).round() as i32;
     let hi = (clamp01(a + len) * dim as f32).round() as i32;
     let lo = lo.clamp(0, dim as i32) as u16;
@@ -702,7 +731,7 @@ fn span_px(a: f32, len: f32, dim: u16) -> (u16, u16) {
 
 /// The pixel edge for grid line `i` of `n` over `dim` pixels.
 #[inline]
-fn frac_px(i: u16, n: u16, dim: u16) -> u16 {
+pub(crate) fn frac_px(i: u16, n: u16, dim: u16) -> u16 {
     ((i as u32 * dim as u32) / n as u32) as u16
 }
 
