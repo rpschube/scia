@@ -269,6 +269,27 @@ impl FrameBuffer {
         self.text_arena.clear();
     }
 
+    /// Cross-fade `other` into this buffer: each pixel becomes
+    /// `other * (1 - t) + self * t`, with `t` clamped to `0.0..=1.0`. `self` is
+    /// the incoming frame and `other` the outgoing one, so `t = 0` shows only
+    /// `other` and `t = 1` only `self`.
+    ///
+    /// A no-op when the two grids differ in pixel size. Allocation-free: it
+    /// reads and writes the existing pixel stores in place. Text runs are not
+    /// mixed — the incoming buffer's runs are kept as-is.
+    pub fn mix_from(&mut self, other: &FrameBuffer, t: f32) {
+        if self.px_w != other.px_w || self.px_h != other.px_h {
+            return;
+        }
+        let t = clamp01(t);
+        let inv = 1.0 - t;
+        for (dst, src) in self.pixels.iter_mut().zip(other.pixels.iter()) {
+            dst[0] = src[0] * inv + dst[0] * t;
+            dst[1] = src[1] * inv + dst[1] * t;
+            dst[2] = src[2] * inv + dst[2] * t;
+        }
+    }
+
     /// The text runs collected by the last [`rasterize`](Self::rasterize) pass.
     #[must_use]
     pub fn text_runs(&self) -> &[TextRun] {

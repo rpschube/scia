@@ -11,6 +11,10 @@ rust-version.workspace = true
 scia-core = { path = "../core", version = "0.0.0" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+# Filesystem watcher for live preset hot-reload (US-CFG-2). The recommended
+# watcher observes the preset file's parent directory so an editor's
+# rename-replace save is caught.
+notify = "8"
 
 # The scenes crate now carries serde + toml for the preset format. The mlua and
 # criterion dev-dependencies below remain probe-only (P5): they exist solely for

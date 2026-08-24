@@ -56,6 +56,11 @@ pub struct UiState {
     /// when a scene presenter is driving the body. `None` for the direct-bars
     /// renderer, which leaves the debug line unchanged.
     pub tier: Option<&'static str>,
+    /// A transient status notice — a live-reload confirmation (`reloaded 38ms`)
+    /// or a preset error's first line — shown dim and right-aligned on the
+    /// bottom row, even when the debug line is off. `None` when there is nothing
+    /// to report.
+    pub notice: Option<String>,
 }
 
 /// Compute the frame layout: the header row, the optional body area, and the
@@ -93,6 +98,32 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
     if let Some(debug) = debug {
         render_debug(buf, debug, snap, ui);
     }
+    draw_notice(buf, area, ui);
+}
+
+/// Paint the transient reload notice, if any: dim, right-aligned, on the bottom
+/// row of `area`, truncated to the terminal width. It overlays whatever is on
+/// that row (the debug line when shown, otherwise the last body row), so the
+/// caller draws it last.
+pub fn draw_notice(buf: &mut Buffer, area: Rect, ui: &UiState) {
+    let Some(notice) = &ui.notice else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let text: String = notice.chars().take(width).collect();
+    let w = text.chars().count() as u16;
+    let x = area.x + area.width - w;
+    let y = area.y + area.height - 1;
+    buf.set_stringn(
+        x,
+        y,
+        &text,
+        width,
+        Style::new().fg(palette::DEBUG).add_modifier(Modifier::DIM),
+    );
 }
 
 /// Paint only the header and debug-line chrome and return the body area, so a

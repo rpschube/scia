@@ -8,7 +8,9 @@
 //! usage / unsupported, `3` no capture device.
 
 use std::io::{self, IsTerminal};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc::Receiver;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -19,6 +21,7 @@ use scia_core::{
     EngineError, FeatureReader, Pacing, PerfModeState, Signal, StreamHealth, SyntheticBackend,
     list_devices,
 };
+use scia_scenes::{Preset, PresetWatcher, ReloadEvent, load_preset};
 use scia_tui::{RunError, Tier, TuiOptions, run};
 
 /// Per-query timeout for capability probing; the four queries stay well under
@@ -101,6 +104,13 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     scene: Option<String>,
 
+    /// Render a preset loaded from a TOML file on disk, live-reloading it on
+    /// save (a validated edit cross-fades in under 500 ms; a broken edit keeps
+    /// the running scene and shows the error). Mutually exclusive with --scene;
+    /// not valid with --headless. A failed initial load exits 2.
+    #[arg(long, value_name = "PATH", conflicts_with = "scene")]
+    scene_file: Option<PathBuf>,
+
     /// Force the mosaic tier and skip capability probing (for testing). Without
     /// it the tier is chosen by probing the terminal.
     #[arg(long, value_enum, value_name = "TIER")]
@@ -172,8 +182,8 @@ fn main() -> ExitCode {
 
     // A scene needs the TUI body; there is nothing to render in the headless
     // status loop.
-    if cli.headless && cli.scene.is_some() {
-        eprintln!("--scene cannot be combined with --headless");
+    if cli.headless && (cli.scene.is_some() || cli.scene_file.is_some()) {
+        eprintln!("--scene/--scene-file cannot be combined with --headless");
         return ExitCode::from(2);
     }
 
@@ -257,6 +267,16 @@ fn run_demo(cli: &Cli) -> ExitCode {
         }
     };
 
+    // A `--scene-file` preset is loaded and its watcher started before the TUI
+    // takes the terminal; `_watcher` must outlive `run` to keep the watch alive.
+    let (preset, reload, _watcher) = match scene_file_setup(cli) {
+        Ok(parts) => parts,
+        Err(code) => {
+            engine.stop();
+            return code;
+        }
+    };
+
     let opts = TuiOptions {
         fps: cli.fps,
         label: Some("DEMO — synthetic feed".to_string()),
@@ -265,6 +285,7 @@ fn run_demo(cli: &Cli) -> ExitCode {
         debug: cli.debug,
         overlay: cli.overlay,
         scene: cli.scene.clone(),
+        preset,
         tier: Some(select_tier(cli)),
     };
 
@@ -273,6 +294,7 @@ fn run_demo(cli: &Cli) -> ExitCode {
         || engine.stats(),
         || engine.health(),
         || engine.now_ns(),
+        reload,
         opts,
     );
     engine.stop();
@@ -350,6 +372,16 @@ fn run_live(cli: &Cli) -> ExitCode {
         return run_headless(engine, reader, cli.seconds);
     }
 
+    // A `--scene-file` preset is loaded and its watcher started before the TUI
+    // takes the terminal; `_watcher` must outlive `run` to keep the watch alive.
+    let (preset, reload, _watcher) = match scene_file_setup(cli) {
+        Ok(parts) => parts,
+        Err(code) => {
+            engine.stop();
+            return code;
+        }
+    };
+
     // The source line gets a ` · perf` marker only when perf mode is actually
     // active.
     let mut source = format!("{} Hz {} ch", format.sample_rate, format.channels);
@@ -364,6 +396,7 @@ fn run_live(cli: &Cli) -> ExitCode {
         debug: cli.debug,
         overlay: cli.overlay,
         scene: cli.scene.clone(),
+        preset,
         tier: Some(select_tier(cli)),
     };
 
@@ -372,10 +405,49 @@ fn run_live(cli: &Cli) -> ExitCode {
         || engine.stats(),
         || engine.health(),
         || engine.now_ns(),
+        reload,
         opts,
     );
     engine.stop();
     report_tui_outcome(outcome)
+}
+
+/// Load a `--scene-file` preset and start its live-reload watcher.
+///
+/// Returns `(None, None, None)` when `--scene-file` is not set. Otherwise the
+/// preset is validated up front — a failed load reports the validator's
+/// `file:line:col` message and yields exit 2 — and a [`PresetWatcher`] is
+/// started on it; the returned watcher must be kept alive for as long as the
+/// TUI runs. A watcher that cannot start is a runtime error (exit 1).
+#[allow(clippy::type_complexity)]
+fn scene_file_setup(
+    cli: &Cli,
+) -> Result<
+    (
+        Option<Preset>,
+        Option<Receiver<ReloadEvent>>,
+        Option<PresetWatcher>,
+    ),
+    ExitCode,
+> {
+    let Some(path) = &cli.scene_file else {
+        return Ok((None, None, None));
+    };
+    let path: &Path = path.as_ref();
+    let preset = match load_preset(path) {
+        Ok(preset) => preset,
+        Err(err) => {
+            eprintln!("{err}");
+            return Err(ExitCode::from(2));
+        }
+    };
+    match PresetWatcher::start(path) {
+        Ok((watcher, reload)) => Ok((Some(preset), Some(reload), Some(watcher))),
+        Err(err) => {
+            eprintln!("failed to watch {}: {err}", path.display());
+            Err(ExitCode::from(1))
+        }
+    }
 }
 
 /// Report a completed TUI run: the timing summary on success, the stream error

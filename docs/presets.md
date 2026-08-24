@@ -204,11 +204,36 @@ example per class, as printed for a document read from `x.toml`:
 | syntax                 | `x.toml:2:1: <the TOML parser's message>`                                                    |
 | IO                     | `preset.toml: <the OS error>` (no line/col)                                                  |
 
+## Live editing
+
+Run a preset straight from a file and edit it while it plays:
+
+```sh
+scia --demo --scene-file presets/spectra.toml
+```
+
+`--scene-file PATH` loads and validates the preset, renders it, and watches the
+file. On every save the file is re-read and re-validated off the render thread,
+and a good edit cross-fades in — the old scene fades out over 300 ms while the
+new one fades in — so the change appears in well under half a second without
+restarting or interrupting audio capture. Scene continuity carries across the
+swap: a scene that snapshots state (spectra carries its onset envelope) resumes
+rather than resetting.
+
+A broken edit never blanks the screen. A syntax or validation error keeps the
+last good scene running and surfaces the error's first line, dim, on the status
+row; fix the file and the next save reloads cleanly. A successful reload briefly
+notes its read-and-validate time on the same row.
+
+`--scene-file` is mutually exclusive with `--scene` (which names a built-in
+preset) and, like `--scene`, is not valid with `--headless`. A preset that fails
+to load at startup exits with a usage error and the `file:line:col` message.
+
 ## What is not yet wired
 
-- **Selecting and cycling presets** — `scia --preset name` and runtime cycling
-  land with the presenter / scene-browser cards. The TUI does not render scenes
-  yet; this rung ships the library, the files and the docs.
+- **Cycling presets** — a `--scene-file` preset hot-reloads on save (see
+  [Live editing](#live-editing)), but runtime cycling between presets lands with
+  the scene-browser card.
 - **Expressions** — string `[map]` values (a small expression language) arrive
   with the expression VM. Until then a mapping must be a table.
 - **Album-art palettes** — `source = "album-art"` is accepted and validated but

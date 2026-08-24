@@ -31,6 +31,16 @@ use scia_core::FeatureSnapshot;
 /// [`resize`]: ScenePresenter::resize
 /// [`frame`]: ScenePresenter::frame
 /// [`draw`]: ScenePresenter::draw
+/// The cross-fade duration when a preset is hot-swapped, in seconds (300 ms).
+const FADE_SECS: f32 = 0.3;
+
+/// A cross-fade in progress: how far into [`FADE_SECS`] it has advanced.
+#[derive(Clone, Copy, Debug)]
+struct Fade {
+    /// Seconds elapsed since the swap began.
+    elapsed: f32,
+}
+
 pub struct ScenePresenter {
     tier: Tier,
     fb: FrameBuffer,
@@ -42,6 +52,20 @@ pub struct ScenePresenter {
     palette: Palette,
     cols: u16,
     rows: u16,
+    /// The outgoing layers during a cross-fade; empty when no fade is active.
+    outgoing: Vec<LayerInstance>,
+    /// One parameter bag per outgoing layer.
+    outgoing_params: Vec<Params>,
+    /// The outgoing palette during a cross-fade.
+    outgoing_palette: Palette,
+    /// Second frame buffer, holding the outgoing layers' pixels while fading.
+    /// Allocated on the first swap and reused thereafter.
+    fb_out: FrameBuffer,
+    /// Set once the first swap has allocated [`fb_out`](Self::fb_out), so
+    /// [`resize`](Self::resize) keeps it in step with the primary buffer.
+    fb_out_ready: bool,
+    /// The active cross-fade, if any.
+    fade: Option<Fade>,
 }
 
 impl ScenePresenter {
@@ -67,6 +91,12 @@ impl ScenePresenter {
             palette: preset.palette(),
             cols: 0,
             rows: 0,
+            outgoing: Vec::new(),
+            outgoing_params: Vec::new(),
+            outgoing_palette: preset.palette(),
+            fb_out: FrameBuffer::new(),
+            fb_out_ready: false,
+            fade: None,
         }
     }
 
@@ -89,11 +119,67 @@ impl ScenePresenter {
         self.rows = rows;
         self.fb.resize(cols, rows, self.tier);
         self.grid.resize(cols, rows);
+        // Keep the outgoing buffer in step once a swap has allocated it, so a
+        // fade that spans a resize mixes matching grids.
+        if self.fb_out_ready {
+            self.fb_out.resize(cols, rows, self.tier);
+        }
         let (sx, sy) = self.tier.subcells();
         let pw = f32::from(cols) * f32::from(sx);
         let ph = f32::from(rows) * f32::from(sy);
         let aspect = if ph > 0.0 { pw / ph } else { 1.0 };
         self.canvas.set_aspect(aspect);
+    }
+
+    /// Whether a preset cross-fade is currently in progress.
+    #[must_use]
+    pub fn is_fading(&self) -> bool {
+        self.fade.is_some()
+    }
+
+    /// Swap in a new preset, carrying scene continuity and starting a 300 ms
+    /// cross-fade from the old layers to the new.
+    ///
+    /// The incoming layers are instantiated at the current drawing aspect. For
+    /// each incoming layer whose scene id matches the outgoing layer in the same
+    /// position, the outgoing scene's [`state`](scia_scenes::Scene::state) is
+    /// carried into the incoming scene via
+    /// [`restore`](scia_scenes::Scene::restore), so animation does not visibly
+    /// reset. The current layers move to the outgoing slot and both sets render
+    /// each frame until the fade completes, after which the outgoing layers are
+    /// dropped.
+    pub fn swap_preset(&mut self, preset: &Preset) {
+        let aspect = self.canvas.aspect();
+        let mut incoming = preset.instantiate(aspect);
+
+        // Carry scene continuity pairwise by position when the scene ids match.
+        for (i, layer) in incoming.iter_mut().enumerate() {
+            if let Some(old) = self.layers.get(i) {
+                if old.scene.id() == layer.scene.id() {
+                    layer.scene.restore(old.scene.state());
+                }
+            }
+        }
+
+        // One seeded parameter bag per incoming layer.
+        let mut incoming_params = Vec::with_capacity(incoming.len());
+        for layer in &incoming {
+            let mut p = Params::new();
+            layer.mappings.seed(&mut p);
+            incoming_params.push(p);
+        }
+
+        // Move the current layers to the outgoing slot; the incoming ones become
+        // current.
+        self.outgoing = std::mem::replace(&mut self.layers, incoming);
+        self.outgoing_params = std::mem::replace(&mut self.params, incoming_params);
+        self.outgoing_palette = self.palette;
+        self.palette = preset.palette();
+
+        // Allocate (or reuse) the outgoing buffer at the current geometry.
+        self.fb_out.resize(self.cols, self.rows, self.tier);
+        self.fb_out_ready = true;
+        self.fade = Some(Fade { elapsed: 0.0 });
     }
 
     /// Advance and rasterize one frame from the newest features.
@@ -103,18 +189,70 @@ impl ScenePresenter {
     /// the frame buffer with the layer's blend and intensity. The layers paint
     /// in order into one buffer; the encoded [`CellGrid`] is produced last.
     pub fn frame(&mut self, snap: &FeatureSnapshot, dt: f32) {
-        self.fb.clear();
-        let aspect = self.canvas.aspect();
-        for (layer, params) in self.layers.iter_mut().zip(self.params.iter_mut()) {
-            layer.mappings.apply(snap, dt, params);
-            layer.scene.update(snap, dt);
-            self.canvas.clear();
-            self.canvas.set_aspect(aspect);
-            layer.scene.render(&mut self.canvas);
-            self.fb
-                .rasterize(&self.canvas, &self.palette, layer.blend, layer.intensity);
+        // The incoming (or, without a fade, the only) layers rasterize into the
+        // primary buffer.
+        Self::rasterize_layers(
+            &mut self.layers,
+            &mut self.params,
+            &self.palette,
+            &mut self.canvas,
+            &mut self.fb,
+            snap,
+            dt,
+        );
+
+        if let Some(fade) = self.fade.as_mut() {
+            fade.elapsed += dt.max(0.0);
+            let elapsed = fade.elapsed;
+            let t = (elapsed / FADE_SECS).clamp(0.0, 1.0);
+            // The outgoing layers rasterize into the second buffer, then mix
+            // under the incoming ones: `out * (1 - t) + in * t`.
+            Self::rasterize_layers(
+                &mut self.outgoing,
+                &mut self.outgoing_params,
+                &self.outgoing_palette,
+                &mut self.canvas,
+                &mut self.fb_out,
+                snap,
+                dt,
+            );
+            self.fb.mix_from(&self.fb_out, t);
+            if elapsed >= FADE_SECS {
+                // Fade complete: drop the outgoing layers, keeping capacity.
+                self.fade = None;
+                self.outgoing.clear();
+                self.outgoing_params.clear();
+            }
         }
+
         self.fb.encode(&mut self.grid);
+    }
+
+    /// Advance, render and rasterize a layer stack into `fb`. Per layer: fold the
+    /// feature mappings into `params`, update the scene, render it onto the
+    /// shared `canvas`, and rasterize with the layer's blend and intensity.
+    /// Free-standing (not `&mut self`) so a fade can drive the incoming and
+    /// outgoing stacks with disjoint borrows of the presenter's fields.
+    #[allow(clippy::too_many_arguments)]
+    fn rasterize_layers(
+        layers: &mut [LayerInstance],
+        params: &mut [Params],
+        palette: &Palette,
+        canvas: &mut Canvas,
+        fb: &mut FrameBuffer,
+        snap: &FeatureSnapshot,
+        dt: f32,
+    ) {
+        fb.clear();
+        let aspect = canvas.aspect();
+        for (layer, p) in layers.iter_mut().zip(params.iter_mut()) {
+            layer.mappings.apply(snap, dt, p);
+            layer.scene.update(snap, dt);
+            canvas.clear();
+            canvas.set_aspect(aspect);
+            layer.scene.render(canvas);
+            fb.rasterize(canvas, palette, layer.blend, layer.intensity);
+        }
     }
 
     /// Paint the encoded cells into `buf` over `area`, then the collected text

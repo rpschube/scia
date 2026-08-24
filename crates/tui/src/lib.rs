@@ -25,6 +25,7 @@ mod stats;
 
 use std::fmt;
 use std::io::{self, Stdout};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, Show};
@@ -38,6 +39,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use scia_core::{Activity, EngineStats, FeatureReader, StreamHealth};
+use scia_scenes::{Preset, ReloadEvent};
 
 pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
 pub use presenter::{SceneError, ScenePresenter, build_scene_presenter};
@@ -45,7 +47,7 @@ pub use probe::{
     CapabilityReport, Da1, SyncSupport, TermFamily, classify_family, default_tier, parse_cell_size,
     parse_da1, parse_decrqm_2026, probe, truecolor_from,
 };
-pub use render::{UiState, VERSION, draw};
+pub use render::{UiState, VERSION, draw, draw_notice};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
@@ -73,10 +75,16 @@ pub struct TuiOptions {
     /// Built-in scene preset to render, by name. `None` runs the direct
     /// spectrum-bar renderer (the byte-identical legacy path); `Some(name)`
     /// drives the [`ScenePresenter`] on the selected [`tier`](Self::tier).
+    /// Ignored when [`preset`](Self::preset) is set.
     pub scene: Option<String>,
+    /// A preset already loaded from disk (the `--scene-file` path). When
+    /// `Some`, [`run`] drives the [`ScenePresenter`] from it directly, ahead of
+    /// [`scene`](Self::scene); live reloads then arrive on `run`'s `reload`
+    /// receiver.
+    pub preset: Option<Preset>,
     /// The mosaic tier to render a scene at. `None` means the caller did not
     /// force one; [`run`] then falls back to [`Tier::default`]. Ignored when
-    /// [`scene`](Self::scene) is `None`.
+    /// neither [`scene`](Self::scene) nor [`preset`](Self::preset) is set.
     pub tier: Option<Tier>,
 }
 
@@ -90,6 +98,7 @@ impl Default for TuiOptions {
             debug: false,
             overlay: false,
             scene: None,
+            preset: None,
             tier: None,
         }
     }
@@ -140,14 +149,20 @@ pub fn run(
     stats: impl FnMut() -> EngineStats,
     health: impl FnMut() -> StreamHealth,
     clock: impl FnMut() -> u64,
+    reload: Option<Receiver<ReloadEvent>>,
     opts: TuiOptions,
 ) -> Result<RunSummary, RunError> {
     install_panic_hook();
     // Build the scene presenter first: a bad preset must fail with the terminal
-    // still in its normal state.
-    let presenter = match &opts.scene {
-        Some(name) => Some(build_scene_presenter(name, opts.tier.unwrap_or_default())?),
-        None => None,
+    // still in its normal state. A disk preset (`--scene-file`) is already
+    // validated by the caller and takes precedence over a built-in name.
+    let presenter = match (&opts.preset, &opts.scene) {
+        (Some(preset), _) => Some(ScenePresenter::from_preset(
+            preset,
+            opts.tier.unwrap_or_default(),
+        )),
+        (None, Some(name)) => Some(build_scene_presenter(name, opts.tier.unwrap_or_default())?),
+        (None, None) => None,
     };
     let mut guard = TerminalGuard::enter()?;
     // The guard restores the terminal on every exit path, including `?`.
@@ -157,6 +172,7 @@ pub fn run(
         stats,
         health,
         clock,
+        reload,
         &opts,
         presenter,
     )?)
@@ -239,12 +255,18 @@ fn install_panic_hook() {
 }
 
 /// The render loop: pace, read, draw, handle input, repeat.
+///
+/// The parameter list mirrors the seams `run` exposes (engine closures, the
+/// reload channel, options, presenter) — grouping them into a struct would
+/// only relocate the same eight names, so the lint is waived here.
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut reader: FeatureReader,
     mut stats: impl FnMut() -> EngineStats,
     mut health: impl FnMut() -> StreamHealth,
     mut clock: impl FnMut() -> u64,
+    reload: Option<Receiver<ReloadEvent>>,
     opts: &TuiOptions,
     mut presenter: Option<ScenePresenter>,
 ) -> io::Result<RunSummary> {
@@ -269,6 +291,11 @@ fn run_loop(
     // Start of the previous frame, for the measured-fps EMA.
     let mut prev_frame_start: Option<Instant> = None;
     let mut fps_ema = opts.fps as f32;
+    // The reload status notice auto-clears this long after the last event.
+    const NOTICE_TTL: Duration = Duration::from_secs(3);
+    // Deadline at which the current notice is cleared, tracked in-loop (no
+    // background timer).
+    let mut notice_deadline: Option<Instant> = None;
 
     loop {
         let frame_start = Instant::now();
@@ -290,6 +317,37 @@ fn run_loop(
         ui.fps_measured = fps_ema;
         // Feature age against the engine's snapshot clock, for the overlay.
         ui.feature_age_ms = render::feature_age_ms(clock(), snap.timestamp_ns);
+
+        // Apply at most one live-reload event per frame. Audio capture is never
+        // touched here — only the presenter's scene layers. When no presenter is
+        // active (direct-bars path), events are simply drained and ignored.
+        if let Some(rx) = reload.as_ref() {
+            if let Ok(event) = rx.try_recv() {
+                if let Some(p) = presenter.as_mut() {
+                    match event.result {
+                        Ok(preset) => {
+                            p.swap_preset(&preset);
+                            ui.notice = Some(format!("reloaded {:.0}ms", event.elapsed_ms));
+                        }
+                        // A broken edit keeps the running scene; the error's
+                        // first line surfaces on the status row.
+                        Err(err) => {
+                            let msg = err.to_string();
+                            let first = msg.lines().next().unwrap_or_default();
+                            ui.notice = Some(first.to_string());
+                        }
+                    }
+                    notice_deadline = Some(frame_start + NOTICE_TTL);
+                }
+            }
+        }
+        // Auto-clear the notice once its deadline passes.
+        if let Some(deadline) = notice_deadline {
+            if frame_start >= deadline {
+                ui.notice = None;
+                notice_deadline = None;
+            }
+        }
 
         // Abort cleanly if the capture stream faulted. The guard restores the
         // terminal on return; the caller reports the message.
@@ -344,9 +402,13 @@ fn run_loop(
                             render::render_overlay(frame.buffer_mut(), body, &snap, &ui);
                         }
                     }
+                    // The reload notice lands on top of the scene body, so it
+                    // draws after the presenter rather than inside the chrome.
+                    let area = frame.area();
+                    render::draw_notice(frame.buffer_mut(), area, &ui);
                 })?;
             }
-            // Direct-bars path: byte-identical to before.
+            // Direct-bars path: byte-identical to before, plus the notice.
             None => {
                 terminal.draw(|frame| draw(frame, &snap, &ui))?;
             }
