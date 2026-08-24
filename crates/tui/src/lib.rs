@@ -931,7 +931,9 @@ mod tests {
     #[test]
     fn arrows_cycle_scenes_in_registry_order_and_wrap() {
         let mut ui = scene_ui();
-        for expected in ["lattice", "aurora", "starfall", "tide", "verso", "spectra"] {
+        for expected in [
+            "lattice", "aurora", "starfall", "tide", "verso", "phosphor", "sonar", "spectra",
+        ] {
             assert!(matches!(
                 handle_event(press(KeyCode::Right), &mut ui),
                 Action::Redraw
@@ -943,7 +945,7 @@ mod tests {
             handle_event(press(KeyCode::Left), &mut ui),
             Action::Redraw
         ));
-        assert_eq!(ui.scene_nav.take_pending(), Some("verso"));
+        assert_eq!(ui.scene_nav.take_pending(), Some("sonar"));
     }
 
     #[test]
