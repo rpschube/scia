@@ -16,6 +16,28 @@ pub const FEATURE_SCHEMA_VERSION: u32 = 1;
 /// fills up to this many and sets [`FeatureSnapshot::spectrum_len`].
 pub const SPECTRUM_BINS: usize = 256;
 
+/// Coarse activity state of the pipeline, driven by the silence state machine in
+/// the DSP thread. It is `#[repr(u8)]` so it rides in the `#[repr(C)]`
+/// [`FeatureSnapshot`] without disturbing the layout.
+///
+/// The states form a monotone ladder as silence persists (`Active` → `Quiet` →
+/// `Idle`) and collapse straight back to `Active` the moment signal returns.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Activity {
+    /// Signal is present: the DSP thread processes at full hop rate.
+    #[default]
+    Active = 0,
+    /// The signal has been below the quiet threshold (or the capture has been
+    /// starved) long enough to count as quiet, but processing continues at full
+    /// hop rate so the spectrum, bands and flux decay smoothly with their
+    /// release constants.
+    Quiet = 1,
+    /// Quiet long enough that the DSP thread has downshifted to a low wake rate,
+    /// producing decayed snapshots on the cheap idle path. CPU is near zero here.
+    Idle = 2,
+}
+
 /// A single hop's worth of analysis, published on the feature bus.
 ///
 /// All timestamps are monotonic nanoseconds since the engine epoch. Fields
@@ -37,6 +59,14 @@ pub struct FeatureSnapshot {
     /// `true` when this hop was synthesized because capture delivered no
     /// samples (silence fill during starvation).
     pub starved: bool,
+    /// Coarse activity state at this hop. `Active` while signal is present,
+    /// `Quiet`/`Idle` as silence persists. New in the still-open schema 1
+    /// (unreleased until v0.1); default snapshots read `Active`.
+    pub activity: Activity,
+    /// Milliseconds since the last non-quiet hop; `0.0` while `Active`. Grows
+    /// while `Quiet`/`Idle` and resets the moment signal returns. New in the
+    /// still-open schema 1 (unreleased until v0.1).
+    pub quiet_ms: f32,
     /// Cumulative frames dropped to ring overflow, as of this hop.
     pub dropped_frames: u64,
     /// Root-mean-square level of the hop over the mono mix. Range `0.0..=1.0`
@@ -94,6 +124,8 @@ impl Default for FeatureSnapshot {
             sample_rate: 0,
             channels: 0,
             starved: false,
+            activity: Activity::Active,
+            quiet_ms: 0.0,
             dropped_frames: 0,
             rms: 0.0,
             peak: 0.0,

@@ -166,6 +166,18 @@ impl BandSplitter {
         }
     }
 
+    /// Cheap idle update for a silent hop: drop the instantaneous levels to zero
+    /// (a silent spectrum carries no band energy), leave the long-term averages
+    /// frozen (exactly as the silence gate in
+    /// [`process_hop`](Self::process_hop) would), and write the resulting
+    /// zero ratios into `out`. Skips the energy sums entirely. Allocation-free.
+    pub fn relax(&mut self, out: &mut [f32; 3]) {
+        self.levels = [0.0; 3];
+        // Averages stay put; ratio = 0 / avg = 0, matching the full path on a
+        // silent hop.
+        *out = [0.0; 3];
+    }
+
     /// Instantaneous linear band energies (bass, mid, treble) from the last hop.
     #[must_use]
     pub fn levels(&self) -> [f32; 3] {

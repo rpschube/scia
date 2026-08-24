@@ -4,13 +4,13 @@
 //! render side always has a fresh, real-time snapshot.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::bands::{BandConfig, BandSplitter};
 use crate::bus::FeatureWriter;
 use crate::capture::{SampleConsumer, SinkStats, StreamFormat};
-use crate::features::{FEATURE_SCHEMA_VERSION, FeatureSnapshot};
+use crate::features::{Activity, FEATURE_SCHEMA_VERSION, FeatureSnapshot};
 use crate::onset::{OnsetConfig, OnsetDetector};
 use crate::spectrum::{SpectrumAnalyzer, SpectrumConfig};
 
@@ -24,9 +24,23 @@ pub struct DspConfig {
     /// How long with no delivery before the hop grid switches to synthesizing
     /// silence.
     pub gap_timeout: Duration,
-    /// How long to sleep between ring checks while starved. Longer than
-    /// `poll_interval`; the idle-downshift card extends this hook further.
+    /// How long to sleep between ring checks while starved but not yet idle
+    /// (the `Active`/`Quiet` starvation window). Longer than `poll_interval`.
     pub starved_poll_interval: Duration,
+    /// RMS level (dBFS) a hop must reach to count as signal. Below it (or when
+    /// starved) a hop is quiet and feeds the silence state machine. −60 dBFS by
+    /// default, matching the display-spectrum and band silence gates.
+    pub quiet_threshold_dbfs: f32,
+    /// How long the signal must stay quiet before the pipeline reports `Quiet`.
+    /// Processing continues at full rate through this window so features decay
+    /// smoothly.
+    pub quiet_after: Duration,
+    /// How long the signal must stay quiet before the pipeline downshifts to
+    /// `Idle`. Kept under the 5 s "near-zero idle" budget.
+    pub idle_after: Duration,
+    /// How long the DSP thread sleeps between wakes once `Idle`. Kept short
+    /// enough that resume latency stays within ~100 ms.
+    pub idle_poll_interval: Duration,
     /// Display-spectrum tuning (bars, FFT sizes, AGC, smoothing).
     pub spectrum: SpectrumConfig,
     /// Crossover band-split tuning (bass/mid crossovers, averaging).
@@ -42,6 +56,10 @@ impl Default for DspConfig {
             poll_interval: Duration::from_millis(1),
             gap_timeout: Duration::from_millis(100),
             starved_poll_interval: Duration::from_millis(50),
+            quiet_threshold_dbfs: -60.0,
+            quiet_after: Duration::from_millis(500),
+            idle_after: Duration::from_secs(4),
+            idle_poll_interval: Duration::from_millis(50),
             spectrum: SpectrumConfig::default(),
             bands: BandConfig::default(),
             onset: OnsetConfig::default(),
@@ -59,6 +77,13 @@ pub(crate) struct DspCounters {
     /// Latest display-spectrum AGC gain, stored as the bit pattern of an `f32`
     /// (the snapshot schema is frozen, so the gain rides here instead).
     pub agc_gain_bits: AtomicU32,
+    /// Count of DSP-loop iterations (every iteration that did work or slept).
+    /// While `Active` this climbs at the polling rate; once `Idle` it climbs at
+    /// the idle poll rate, which is how the downshift is observed without a CPU
+    /// meter.
+    pub dsp_wakes: AtomicU64,
+    /// Latest activity state, stored as [`Activity`]'s `u8` discriminant.
+    pub activity: AtomicU8,
 }
 
 /// Owns the preallocated scratch buffers and the hop counter, and turns one
@@ -200,6 +225,20 @@ impl HopProcessor {
             return None;
         }
 
+        let (rms, peak) = self.deinterleave_rms_peak();
+
+        self.analyzer
+            .process_hop(&self.mono, self.dt_seconds, &mut self.spectrum_out);
+        self.run_bands_and_onset();
+
+        self.generation += 1;
+        Some(self.snapshot(format, timestamp_ns, dropped_frames, false, rms, peak))
+    }
+
+    /// Deinterleave `self.interleaved` into the mono/left/right scratch buffers
+    /// and return the hop's `(rms, peak)`. Cheap: one pass, no FFT. Shared by
+    /// the full and idle paths. Allocation-free.
+    fn deinterleave_rms_peak(&mut self) -> (f32, f32) {
         let mut sum_sq = 0.0f64;
         let mut peak = 0.0f32;
         for frame in 0..self.hop_frames {
@@ -224,13 +263,7 @@ impl HopProcessor {
             sum_sq += f64::from(mono) * f64::from(mono);
         }
         let rms = (sum_sq / self.hop_frames as f64).sqrt() as f32;
-
-        self.analyzer
-            .process_hop(&self.mono, self.dt_seconds, &mut self.spectrum_out);
-        self.run_bands_and_onset();
-
-        self.generation += 1;
-        Some(self.snapshot(format, timestamp_ns, dropped_frames, false, rms, peak))
+        (rms, peak)
     }
 
     /// Feed the freshest spectra into the band splitter and onset detector and
@@ -266,6 +299,73 @@ impl HopProcessor {
         // their averages relax and the onset-age clock keeps advancing while
         // capture is stalled.
         self.run_bands_and_onset();
+        self.generation += 1;
+        self.snapshot(format, timestamp_ns, dropped_frames, true, 0.0, 0.0)
+    }
+
+    /// Advance every cached feature by one hop of silence on the **cheap** path:
+    /// decay the spectrum bars and onset peak with their release constants, drop
+    /// the band levels to zero, and grow the onset-age clock — all without
+    /// running either FFT. Produces the same decayed features
+    /// [`synthesize_silence`](Self::synthesize_silence) would, for a few
+    /// arithmetic operations instead of two FFTs. Allocation-free.
+    fn relax_features(&mut self) {
+        self.analyzer.relax(self.dt_seconds, &mut self.spectrum_out);
+        self.band_splitter.relax(&mut self.bands_out);
+        let (flux, onset) = self.onset_detector.relax(self.dt_seconds);
+        self.flux = flux;
+        self.onset = onset;
+        self.onset_age_ms = self.onset_detector.onset_age_ms();
+    }
+
+    /// Idle-path counterpart to [`try_process`](Self::try_process): pop one
+    /// buffered hop and turn it into a snapshot the cheap way. Its rms/peak are
+    /// still measured, but as long as the hop stays below `resume_rms` both FFTs
+    /// are skipped and the features decay via [`relax_features`]. The one hop
+    /// that crosses `resume_rms` — playback resuming — is run through the full
+    /// path so the display reanimates immediately; the caller detects the resume
+    /// by the returned snapshot's `rms >= resume_rms`. Returns `None` (consuming
+    /// nothing) when the ring holds less than one hop. Allocation-free.
+    ///
+    /// [`relax_features`]: Self::relax_features
+    pub fn process_idle(
+        &mut self,
+        consumer: &mut SampleConsumer,
+        format: StreamFormat,
+        timestamp_ns: u64,
+        dropped_frames: u64,
+        resume_rms: f32,
+    ) -> Option<FeatureSnapshot> {
+        let needed = self.hop_frames * self.channels;
+        if !consumer.read_hop(needed, &mut self.interleaved) {
+            return None;
+        }
+
+        let (rms, peak) = self.deinterleave_rms_peak();
+        self.generation += 1;
+        if rms >= resume_rms {
+            // Resume: the cheap path cannot reconstruct a live spectrum, so run
+            // the full analysis on this one hop.
+            self.analyzer
+                .process_hop(&self.mono, self.dt_seconds, &mut self.spectrum_out);
+            self.run_bands_and_onset();
+        } else {
+            self.relax_features();
+        }
+        Some(self.snapshot(format, timestamp_ns, dropped_frames, false, rms, peak))
+    }
+
+    /// Idle-path counterpart to
+    /// [`synthesize_silence`](Self::synthesize_silence): emit a starved silent
+    /// hop the cheap way (decayed features, no FFT), incrementing the generation
+    /// so the grid keeps advancing while capture is stalled. Allocation-free.
+    pub fn synthesize_idle(
+        &mut self,
+        format: StreamFormat,
+        timestamp_ns: u64,
+        dropped_frames: u64,
+    ) -> FeatureSnapshot {
+        self.relax_features();
         self.generation += 1;
         self.snapshot(format, timestamp_ns, dropped_frames, true, 0.0, 0.0)
     }
@@ -318,8 +418,34 @@ pub(crate) struct DspThread {
 /// cannot produce an unbounded catch-up burst.
 const MAX_SILENT_BURST: usize = 512;
 
-/// The DSP loop. Runs on the named `scia-dsp` thread until the stop flag is
-/// set. Steps 1–2 (real hop / silence fill) are allocation-free.
+/// Classify the current activity from how long the signal has been quiet.
+fn classify(quiet: Duration, quiet_after: Duration, idle_after: Duration) -> Activity {
+    if quiet >= idle_after {
+        Activity::Idle
+    } else if quiet >= quiet_after {
+        Activity::Quiet
+    } else {
+        Activity::Active
+    }
+}
+
+/// Stamp the silence-state fields on a snapshot the DSP loop is about to publish.
+fn stamp(snapshot: &mut FeatureSnapshot, activity: Activity, quiet_ms: f32) {
+    snapshot.activity = activity;
+    snapshot.quiet_ms = quiet_ms;
+}
+
+/// The DSP loop. Runs on the named `scia-dsp` thread until the stop flag is set.
+///
+/// It carries a three-state silence machine ([`Activity`]). While `Active` or
+/// `Quiet` it processes at the full hop rate (real hops, or — when starved —
+/// real-time silence fill) so features decay smoothly through their release
+/// constants. Once the signal has been quiet for `idle_after` it downshifts to
+/// `Idle`: it wakes only every `idle_poll_interval`, drains all buffered hops on
+/// the cheap FFT-free path, and synthesizes starved hops the cheap way — a few
+/// wakes per second doing trivial arithmetic, so idle CPU is near zero. The
+/// first hop whose RMS crosses the quiet threshold snaps it straight back to
+/// `Active` and reanimates the display. Every publish path is allocation-free.
 pub(crate) fn run(mut thread: DspThread) {
     // TODO(priority): raise the scheduling priority of the scia-dsp thread once
     // the priority-tuning card lands so capture jitter cannot starve DSP.
@@ -329,6 +455,10 @@ pub(crate) fn run(mut thread: DspThread) {
     let hop_period = Duration::from_secs_f64(
         thread.config.hop_frames as f64 / f64::from(thread.format.sample_rate.max(1)),
     );
+    let quiet_after = thread.config.quiet_after;
+    let idle_after = thread.config.idle_after;
+    // Linear-RMS form of the quiet threshold; a hop at or above it is signal.
+    let resume_rms = 10f32.powf(thread.config.quiet_threshold_dbfs / 20.0);
 
     let mut processor = HopProcessor::with_configs(
         thread.config.hop_frames,
@@ -339,20 +469,48 @@ pub(crate) fn run(mut thread: DspThread) {
         thread.config.onset,
     );
     let mut silent_deadline: Option<Instant> = None;
+    // The instant of the last hop that carried signal. Everything since is quiet;
+    // its age drives the state machine and `quiet_ms`. Seeded to "now" so a
+    // pipeline that never sees audio idles after `idle_after`.
+    let mut last_non_quiet = Instant::now();
 
     loop {
         if thread.stop.load(Ordering::Acquire) {
             break;
         }
+        // Every iteration is a wake, whether it processed hops or only slept.
+        thread.counters.dsp_wakes.fetch_add(1, Ordering::Relaxed);
 
-        // Step 1: a full hop is available — drain exactly one and publish.
-        if thread.consumer.buffered_samples() >= needed {
-            let dropped = thread.stats.dropped_frames.load(Ordering::Relaxed);
-            let timestamp = thread.stats.now_ns();
-            if let Some(snapshot) =
-                processor.try_process(&mut thread.consumer, thread.format, timestamp, dropped)
-            {
-                thread.writer.publish(snapshot);
+        let mode = classify(last_non_quiet.elapsed(), quiet_after, idle_after);
+
+        if mode == Activity::Idle {
+            // ---- Idle downshift: drain everything cheaply, then sleep long. ----
+            let mut resumed = false;
+            while thread.consumer.buffered_samples() >= needed {
+                let dropped = thread.stats.dropped_frames.load(Ordering::Relaxed);
+                let timestamp = thread.stats.now_ns();
+                let Some(mut snapshot) = processor.process_idle(
+                    &mut thread.consumer,
+                    thread.format,
+                    timestamp,
+                    dropped,
+                    resume_rms,
+                ) else {
+                    break;
+                };
+                if snapshot.rms >= resume_rms && !snapshot.starved {
+                    // Playback resumed: this hop went through the full path.
+                    last_non_quiet = Instant::now();
+                    stamp(&mut snapshot, Activity::Active, 0.0);
+                    resumed = true;
+                } else {
+                    let quiet = last_non_quiet.elapsed();
+                    stamp(
+                        &mut snapshot,
+                        classify(quiet, quiet_after, idle_after),
+                        quiet.as_secs_f32() * 1000.0,
+                    );
+                }
                 thread
                     .counters
                     .hops_processed
@@ -361,33 +519,117 @@ pub(crate) fn run(mut thread: DspThread) {
                     .counters
                     .agc_gain_bits
                     .store(processor.spectrum_gain().to_bits(), Ordering::Relaxed);
+                thread
+                    .counters
+                    .activity
+                    .store(snapshot.activity as u8, Ordering::Relaxed);
+                thread.writer.publish(snapshot);
+                if resumed {
+                    break;
+                }
+            }
+            if resumed {
+                // Back to full-rate handling on the next iteration, immediately.
+                silent_deadline = None;
+                continue;
+            }
+
+            // Nothing delivered? Keep the grid alive cheaply if starved.
+            if is_starving(&thread.stats, gap_ns) {
+                let now = Instant::now();
+                let mut deadline = silent_deadline.unwrap_or(now);
+                let mut burst = 0;
+                while now >= deadline && burst < MAX_SILENT_BURST {
+                    let dropped = thread.stats.dropped_frames.load(Ordering::Relaxed);
+                    let timestamp = thread.stats.now_ns();
+                    let mut snapshot = processor.synthesize_idle(thread.format, timestamp, dropped);
+                    let quiet = last_non_quiet.elapsed();
+                    stamp(&mut snapshot, Activity::Idle, quiet.as_secs_f32() * 1000.0);
+                    thread
+                        .counters
+                        .hops_synthesized
+                        .fetch_add(1, Ordering::Relaxed);
+                    thread
+                        .counters
+                        .activity
+                        .store(Activity::Idle as u8, Ordering::Relaxed);
+                    thread.writer.publish(snapshot);
+                    deadline += hop_period;
+                    burst += 1;
+                }
+                if deadline <= now {
+                    deadline = now + hop_period;
+                }
+                silent_deadline = Some(deadline);
+            } else {
+                thread
+                    .counters
+                    .activity
+                    .store(Activity::Idle as u8, Ordering::Relaxed);
+            }
+            std::thread::sleep(thread.config.idle_poll_interval);
+            continue;
+        }
+
+        // ---- Active / Quiet: full-rate processing. ----
+        // Step 1: a full hop is available — drain exactly one and publish.
+        if thread.consumer.buffered_samples() >= needed {
+            let dropped = thread.stats.dropped_frames.load(Ordering::Relaxed);
+            let timestamp = thread.stats.now_ns();
+            if let Some(mut snapshot) =
+                processor.try_process(&mut thread.consumer, thread.format, timestamp, dropped)
+            {
+                let loud = snapshot.rms >= resume_rms && !snapshot.starved;
+                if loud {
+                    last_non_quiet = Instant::now();
+                }
+                let quiet = last_non_quiet.elapsed();
+                let (activity, quiet_ms) = if loud {
+                    (Activity::Active, 0.0)
+                } else {
+                    (
+                        classify(quiet, quiet_after, idle_after),
+                        quiet.as_secs_f32() * 1000.0,
+                    )
+                };
+                stamp(&mut snapshot, activity, quiet_ms);
+                thread
+                    .counters
+                    .hops_processed
+                    .fetch_add(1, Ordering::Relaxed);
+                thread
+                    .counters
+                    .agc_gain_bits
+                    .store(processor.spectrum_gain().to_bits(), Ordering::Relaxed);
+                thread
+                    .counters
+                    .activity
+                    .store(activity as u8, Ordering::Relaxed);
+                thread.writer.publish(snapshot);
             }
             silent_deadline = None;
             continue;
         }
 
         // Not enough for a hop: decide between starvation fill and waiting.
-        let pushed = thread.stats.pushed_frames.load(Ordering::Relaxed);
-        let now_ns = thread.stats.now_ns();
-        let last_push = thread.stats.last_push_ns.load(Ordering::Acquire);
-        let starving = if pushed == 0 {
-            now_ns >= gap_ns
-        } else {
-            now_ns.saturating_sub(last_push) > gap_ns
-        };
-
-        if starving {
+        if is_starving(&thread.stats, gap_ns) {
             // Step 2: keep the hop grid alive at real-time pace. Emit whatever
             // silent hops are due since the last wake (a bounded catch-up
-            // burst), then poll at the slower starved cadence.
+            // burst), then poll at the slower starved cadence. Full FFT path so
+            // the spectrum decays smoothly through the Active/Quiet window.
             let now = Instant::now();
             let mut deadline = silent_deadline.unwrap_or(now);
             let mut burst = 0;
             while now >= deadline && burst < MAX_SILENT_BURST {
                 let dropped = thread.stats.dropped_frames.load(Ordering::Relaxed);
                 let timestamp = thread.stats.now_ns();
-                let snapshot = processor.synthesize_silence(thread.format, timestamp, dropped);
-                thread.writer.publish(snapshot);
+                let mut snapshot = processor.synthesize_silence(thread.format, timestamp, dropped);
+                let quiet = last_non_quiet.elapsed();
+                stamp(
+                    &mut snapshot,
+                    classify(quiet, quiet_after, idle_after),
+                    quiet.as_secs_f32() * 1000.0,
+                );
                 thread
                     .counters
                     .hops_synthesized
@@ -396,6 +638,11 @@ pub(crate) fn run(mut thread: DspThread) {
                     .counters
                     .agc_gain_bits
                     .store(processor.spectrum_gain().to_bits(), Ordering::Relaxed);
+                thread
+                    .counters
+                    .activity
+                    .store(snapshot.activity as u8, Ordering::Relaxed);
+                thread.writer.publish(snapshot);
                 deadline += hop_period;
                 burst += 1;
             }
@@ -411,5 +658,19 @@ pub(crate) fn run(mut thread: DspThread) {
             // wait a little and retry.
             std::thread::sleep(thread.config.poll_interval);
         }
+    }
+}
+
+/// Whether capture has gone quiet past the gap timeout: either nothing has ever
+/// been pushed and the timeout has elapsed since the epoch, or the last push is
+/// older than the timeout.
+fn is_starving(stats: &SinkStats, gap_ns: u64) -> bool {
+    let pushed = stats.pushed_frames.load(Ordering::Relaxed);
+    let now_ns = stats.now_ns();
+    let last_push = stats.last_push_ns.load(Ordering::Acquire);
+    if pushed == 0 {
+        now_ns >= gap_ns
+    } else {
+        now_ns.saturating_sub(last_push) > gap_ns
     }
 }
