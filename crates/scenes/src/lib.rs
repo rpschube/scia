@@ -25,9 +25,9 @@ pub mod scene;
 pub use canvas::{Canvas, PALETTE_SLOTS, Primitive, Slot, Style};
 pub use palette::{Palette, Rgb};
 pub use preset::{
-    Blend, Curve, Feature, Layer, LayerInstance, Mapping, MappingSet, PaletteSource, Preset,
-    PresetError, PresetErrorKind, PresetWatcher, ReloadEvent, builtin_preset, builtin_presets,
-    load_preset, parse_preset,
+    Blend, Curve, ExprMapping, Feature, Layer, LayerInstance, MapEntry, Mapping, MappingSet,
+    PaletteSource, Preset, PresetError, PresetErrorKind, PresetWatcher, ReloadEvent,
+    builtin_preset, builtin_presets, load_preset, parse_preset,
 };
 pub use registry::{SceneInfo, builtin_scenes, create_builtin, scene_info};
 pub use scene::{ParamSpec, Params, Scene, SceneCtx, SceneState};

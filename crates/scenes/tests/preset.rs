@@ -9,8 +9,8 @@ use std::path::Path;
 
 use scia_core::FeatureSnapshot;
 use scia_scenes::{
-    Blend, Curve, Feature, Mapping, MappingSet, Params, Preset, PresetError, builtin_preset,
-    builtin_presets, builtin_scenes, parse_preset,
+    Blend, Curve, Feature, MapEntry, Mapping, MappingSet, Params, Preset, PresetError,
+    builtin_preset, builtin_presets, builtin_scenes, parse_preset,
 };
 
 /// Parse an inline document as if it came from `x.toml`.
@@ -119,13 +119,24 @@ fn unknown_feature() {
 }
 
 #[test]
-fn expression_string_in_map() {
-    let msg = err("[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\npunch = \"onset * 0.9\"\n");
+fn expression_syntax_error_reports_file_line_col() {
+    // A trailing operator with no right-hand operand is a parse error.
+    let msg = err("[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\npunch = \"loud *\"\n");
+    // The string value is on line 5, column 9.
+    assert_prefix(&msg, 5, 9);
+    assert!(msg.contains("punch"), "names the key: {msg}");
+    assert!(msg.contains("invalid expression"), "{msg}");
+}
+
+#[test]
+fn expression_unknown_variable_reports_file_line_col() {
+    // `wobble` is not part of the expression vocabulary; it fails at load.
+    let msg = err("[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\npunch = \"wobble * 2\"\n");
     // The string value is on line 5, column 9.
     assert_prefix(&msg, 5, 9);
     assert!(
-        msg.contains("expressions arrive with the expression VM"),
-        "{msg}"
+        msg.contains("unknown variable `wobble`"),
+        "names the offending variable: {msg}"
     );
 }
 
@@ -272,6 +283,112 @@ fn scale_and_offset_applied() {
     // offset + scale * curve(clamp(0.8)) = 0.2 + 0.5 * 0.8 = 0.6.
     let v = params.get("punch").unwrap();
     assert!((v - 0.6).abs() < 1e-6, "offset + scale*y = 0.6, got {v}");
+}
+
+// ---------------------------------------------------------------------------
+// Expression mappings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expression_mapping_drives_param_per_frame() {
+    // `gap` driven by an expression of loudness; it must track the loudness of
+    // whichever frame is current, not a value fixed at load.
+    let preset =
+        parse("[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\ngap = \"loud * 0.5\"\n")
+            .expect("preset validates");
+    assert!(
+        matches!(preset.mappings.as_slice(), [MapEntry::Expr(_)]),
+        "the string map compiled to an expression entry"
+    );
+
+    let mut layers = preset.instantiate(1.0);
+    let layer = &mut layers[0];
+    let mut params = Params::new();
+    layer.mappings.seed(&mut params);
+
+    let mut f = FeatureSnapshot {
+        rms: 0.8,
+        ..FeatureSnapshot::default()
+    };
+    layer.mappings.apply(&f, 0.016, &mut params);
+    let v = params.get("gap").expect("gap is set");
+    assert!((v - 0.4).abs() < 1e-6, "loud * 0.5 = 0.4, got {v}");
+
+    // A quieter frame moves the mapped value the same frame.
+    f.rms = 0.2;
+    layer.mappings.apply(&f, 0.016, &mut params);
+    let v = params.get("gap").unwrap();
+    assert!((v - 0.1).abs() < 1e-6, "loud * 0.5 = 0.1, got {v}");
+}
+
+#[test]
+fn expression_onset_variable_is_an_envelope() {
+    // The `onset` variable is a decaying envelope, not a one-frame spike: it is
+    // full on the onset hop and still clearly positive one frame later.
+    let preset = parse("[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\npunch = \"onset\"\n")
+        .expect("preset validates");
+    let mut layers = preset.instantiate(1.0);
+    let layer = &mut layers[0];
+    let mut params = Params::new();
+    layer.mappings.seed(&mut params);
+
+    layer.mappings.apply(&snap(true), 0.016, &mut params);
+    let on = params.get("punch").unwrap();
+    assert!(
+        (on - 1.0).abs() < 1e-6,
+        "onset hop drives the envelope to 1.0"
+    );
+
+    // One 16 ms frame later, with no onset: e^{-0.016/0.25} ≈ 0.938.
+    layer.mappings.apply(&snap(false), 0.016, &mut params);
+    let decayed = params.get("punch").unwrap();
+    assert!(
+        decayed > 0.9 && decayed < 1.0,
+        "the envelope decays smoothly, not to zero: got {decayed}"
+    );
+}
+
+#[test]
+fn mixed_table_and_expression_preset() {
+    // One table entry and one expression entry in the same [map] block.
+    let preset = parse(
+        "[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\n\
+         punch = { feature = \"onset\", attack_ms = 0, decay_ms = 0, scale = 1.0 }\n\
+         gap = \"loud * 0.5\"\n",
+    )
+    .expect("preset validates");
+    assert_eq!(preset.mappings.len(), 2, "both entries retained");
+    assert!(
+        preset
+            .mappings
+            .iter()
+            .any(|e| matches!(e, MapEntry::Table(_))),
+        "one table entry"
+    );
+    assert!(
+        preset
+            .mappings
+            .iter()
+            .any(|e| matches!(e, MapEntry::Expr(_))),
+        "one expression entry"
+    );
+
+    let mut layers = preset.instantiate(1.0);
+    let layer = &mut layers[0];
+    let mut params = Params::new();
+    layer.mappings.seed(&mut params);
+
+    let mut f = snap(true);
+    f.rms = 0.6;
+    layer.mappings.apply(&f, 0.016, &mut params);
+    assert!(
+        (params.get("punch").unwrap() - 1.0).abs() < 1e-6,
+        "the table entry drives punch to 1.0 on the onset"
+    );
+    assert!(
+        (params.get("gap").unwrap() - 0.3).abs() < 1e-6,
+        "the expression entry drives gap to loud * 0.5 = 0.3"
+    );
 }
 
 // ---------------------------------------------------------------------------

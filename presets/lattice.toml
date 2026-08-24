@@ -46,16 +46,25 @@ glow = 0.35
 # glow = 0.5
 
 # Feature -> parameter mappings. Each key is a parameter of the mapped scene;
-# each value is a table naming a feature and a response. A string value here is
-# reserved for the expression VM (a later card) and is rejected today.
+# each value is EITHER a response table (feature + curve + envelope) OR a string
+# expression over the feature vocabulary, compiled at load and evaluated per
+# frame.
 #
 # feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
 # curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
 # attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+#
+# expression variables (all 0..1; width is raw stereo_correlation, 0 for now):
+#   bass mid treb loud peak onset flux beat beat_conf width
+# `onset` is an envelope: 1.0 on an onset hop, then a ~250 ms exponential decay.
+# operators + - * / % ^ with parentheses, plus fasteval's builtin math functions.
 [map]
 # Ride the base glow on overall loudness: a gentle attack, a slow release, so
 # the whole lattice breathes with the track's dynamics.
 glow = { feature = "loud", curve = "linear", attack_ms = 30, decay_ms = 200, scale = 0.6, offset = 0.15 }
+# Flash the rings on every onset via a one-line expression: the onset envelope
+# scaled to 0.9.
+flash = "onset * 0.9"
 
 [palette]
 # static | album-art. `album-art` is accepted and validated but resolves to the

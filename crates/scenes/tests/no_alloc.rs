@@ -10,6 +10,7 @@ mod support {
 use scia_core::FeatureSnapshot;
 use scia_scenes::{
     Canvas, Curve, Feature, Mapping, MappingSet, Params, SceneCtx, Style, create_builtin,
+    parse_preset,
 };
 use support::alloc_watch::{CountingAllocator, watch};
 
@@ -127,6 +128,53 @@ fn mapping_apply_does_not_allocate() {
     assert!(
         stray_count == 0,
         "MappingSet::apply allocated {} time(s) across 1000 calls:\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
+
+/// A `[map]` **expression** entry must also be allocation-free per frame once
+/// its target key is seeded: the program is compiled at load and the per-frame
+/// namespace is a stack-local `Copy` record. Driven through the real preset
+/// instantiate path so it exercises exactly what the host runs.
+#[test]
+fn expression_mapping_apply_does_not_allocate() {
+    let preset = parse_preset(
+        "[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\npunch = \"onset * 0.9 + loud * 0.1\"\n",
+        None,
+    )
+    .expect("preset validates");
+    let mut mappings = preset
+        .instantiate(1.0)
+        .into_iter()
+        .next()
+        .expect("one layer")
+        .mappings;
+    let mut params = Params::new();
+    mappings.seed(&mut params);
+
+    let mut f = FeatureSnapshot {
+        rms: 0.5,
+        onset: false,
+        ..FeatureSnapshot::default()
+    };
+
+    // Warm up: run both onset branches so any lazy state is realized.
+    for i in 0..8 {
+        f.onset = i % 2 == 0;
+        mappings.apply(&f, 0.016, &mut params);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for i in 0..1000 {
+            f.onset = i % 2 == 0;
+            mappings.apply(&f, 0.016, &mut params);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "expression MappingSet::apply allocated {} time(s) across 1000 calls:\n{}",
         stray_count,
         strays.join("\n---\n")
     );

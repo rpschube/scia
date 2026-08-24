@@ -113,7 +113,12 @@ When layers are present, `[map]` targets the **first** layer's scene.
 
 Feature → parameter mappings. Each key is a parameter of the mapped scene (the
 preset's scene, or the first layer's scene when there are layers). Each value is
-a **table** describing how a feature drives that parameter:
+**either** a response **table** or a string **expression**.
+
+#### Table form
+
+A table describes how one feature drives the parameter through a curve and an
+envelope:
 
 ```toml
 [map]
@@ -132,8 +137,42 @@ release = { feature = "bass",  curve = "pow", exponent = 2.0, attack_ms = 10, de
 | `scale`     | number | no                          | `1.0`   | Output scale.                            |
 | `offset`    | number | no                          | `0.0`   | Output offset.                           |
 
-A `[map]` value that is a **string** is reserved for rung-1 expression syntax and
-is rejected today with a dedicated error (see the error table).
+#### Expression form
+
+A string value is an algebraic expression, compiled once when the preset loads
+and evaluated every frame:
+
+```toml
+[map]
+flash = "onset * 0.9"
+drift = "bass ^ 2"
+band  = "0.1 + loud * 0.4"
+```
+
+The expression reads the storyboard variables below, all in `0..1` (except
+`width`, which is the raw stereo field). Operators are `+ - * / % ^` with
+parentheses, alongside `fasteval`'s builtin math functions (`sin`, `cos`, `abs`,
+`min`, `max`, `log`, …). A syntax error or a reference to any name outside this
+vocabulary fails at **load** time, at that entry's `file:line:col` (see the error
+table).
+
+| variable    | source                                | notes                                                        |
+| ----------- | ------------------------------------- | ------------------------------------------------------------ |
+| `bass`      | `bands[0]` clamped to `0..1`          | bass band level                                              |
+| `mid`       | `bands[1]` clamped to `0..1`          | mid band level                                               |
+| `treb`      | `bands[2]` clamped to `0..1`          | treble band level                                            |
+| `loud`      | `rms`                                 | loudness                                                     |
+| `peak`      | `peak`                                | peak sample of the hop                                       |
+| `onset`     | onset **envelope**                    | `1.0` on an onset hop, then an exponential decay (τ ≈ 250 ms) so the expression sees a usable envelope, not a one-frame spike |
+| `flux`      | `flux`                                | spectral flux                                                |
+| `beat`      | `beat_phase`                          | position within the beat period, `0..1`                      |
+| `beat_conf` | `beat_confidence`                     | beat-tracker confidence                                      |
+| `width`     | `stereo_correlation` (raw)            | stereo width; `0.0` until the stereo card lands              |
+
+A non-finite result (e.g. a division by zero) is sanitized to `0.0`. As with the
+table form, the scene clamps the stored value to the parameter's `[min, max]` on
+read, so an expression that overshoots is capped rather than rejected. Per-frame
+evaluation is allocation-free.
 
 ### `[palette]` (optional)
 
@@ -226,7 +265,8 @@ example per class, as printed for a document read from `x.toml`:
 | out of range           | `x.toml:5:7: `gap` = 5 is out of range [0, 0.9]`                                             |
 | unknown scene          | `x.toml:3:9: unknown scene `nope` (known: `spectra`)`                                        |
 | unknown feature        | `x.toml:5:9: unknown feature `nope``                                                         |
-| expression string      | `x.toml:5:9: `punch`: expressions arrive with the expression VM; use a mapping table here`   |
+| bad expression syntax  | `x.toml:5:9: `punch`: invalid expression: <the parser's message>`                            |
+| unknown expr variable  | `x.toml:5:9: `punch`: unknown variable `nope` in expression (known: `bass`, `mid`, …)`       |
 | palette shape          | `x.toml:6:10: palette must have exactly 8 slots, found 7`                                    |
 | invalid name           | `x.toml:2:8: invalid preset name `Bad Name`; must match ^[a-z0-9][a-z0-9-]*$`                |
 | syntax                 | `x.toml:2:1: <the TOML parser's message>`                                                    |
@@ -262,9 +302,9 @@ to load at startup exits with a usage error and the `file:line:col` message.
 - **Cycling presets** — a `--scene-file` preset hot-reloads on save (see
   [Live editing](#live-editing)), but runtime cycling between presets lands with
   the scene-browser card.
-- **Expressions** — string `[map]` values (a small expression language) arrive
-  with the expression VM. Until then a mapping must be a table.
 - **Album-art palettes** — `source = "album-art"` is accepted and validated but
   resolves to the host default palette until the album-art card lands.
-- **`beat`** — reads `beat_confidence`, which is `0.0` until the beat-tracker
-  card lands.
+- **`beat` / `beat_conf`** — the beat variables read `beat_phase` and
+  `beat_confidence`; both come alive with the beat-tracker card.
+- **`width`** — the expression `width` variable reads `stereo_correlation`, which
+  is `0.0` until the stereo card lands.

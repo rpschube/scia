@@ -9,14 +9,17 @@
 //!
 //! Validation is strict and every error names the file and line: unknown keys,
 //! type mismatches, out-of-range values, unknown scenes and features, malformed
-//! palettes and rung-1 expression syntax used too early all surface as a
+//! palettes and invalid `[map]` expressions all surface as a
 //! [`PresetError`] whose [`Display`](std::fmt::Display) begins with
 //! `file:line:col:`.
 //!
-//! This is rung 0 of the scene engine: the library, the files and the docs.
-//! Selecting a preset at launch, cycling it at runtime, the expression VM and
-//! album-art palettes arrive with later cards; see `docs/presets.md` for what is
-//! not yet wired.
+//! A `[map]` value may be either a response **table** or a string
+//! **expression** (rung 1): the expression is compiled once at load over the
+//! storyboard feature vocabulary and evaluated per frame, allocation-free. See
+//! [`expr`] and `docs/presets.md`.
+//!
+//! Selecting a preset at launch, cycling it at runtime and album-art palettes
+//! arrive with later cards; see `docs/presets.md` for what is not yet wired.
 
 // `PresetError` is intentionally rich — a source path, a line/column and a
 // structured kind — so every failure names the file and position (criterion 2).
@@ -28,6 +31,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use toml::Spanned;
@@ -38,7 +42,10 @@ use crate::palette::{Palette, Rgb};
 use crate::registry::{create_builtin, scene_info};
 use crate::scene::{ParamSpec, Params, Scene, SceneCtx};
 
+mod expr;
 mod watch;
+
+use expr::{CompiledExpr, EXPR_VARS, ExprCompileError, ExprEnv, ONSET_TAU};
 pub use watch::{PresetWatcher, ReloadEvent};
 
 // ---------------------------------------------------------------------------
@@ -144,6 +151,45 @@ pub struct Mapping {
     pub offset: f32,
 }
 
+/// A validated string `[map]` expression: the target parameter plus a compiled
+/// program over the storyboard vocabulary, shared cheaply behind an [`Arc`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExprMapping {
+    /// The parameter the expression drives.
+    pub target: String,
+    /// The compiled expression.
+    expr: Arc<CompiledExpr>,
+}
+
+impl ExprMapping {
+    /// The original expression source text.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        self.expr.source()
+    }
+}
+
+/// One validated `[map]` entry: either a response **table** or a compiled string
+/// **expression**. Both forms drive one target parameter of the mapped scene.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MapEntry {
+    /// A feature → parameter response table with a curve and envelope.
+    Table(Mapping),
+    /// A per-frame expression over the feature vocabulary.
+    Expr(ExprMapping),
+}
+
+impl MapEntry {
+    /// The target parameter this entry drives.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        match self {
+            Self::Table(m) => &m.target,
+            Self::Expr(e) => &e.target,
+        }
+    }
+}
+
 /// A fully validated preset: a plain value ready to [`instantiate`].
 ///
 /// [`instantiate`]: Preset::instantiate
@@ -162,8 +208,8 @@ pub struct Preset {
     pub params: Params,
     /// The explicit layer stack (empty for a single-layer preset).
     pub layers: Vec<Layer>,
-    /// The feature → parameter mappings.
-    pub mappings: Vec<Mapping>,
+    /// The feature → parameter mappings (table or expression entries).
+    pub mappings: Vec<MapEntry>,
     /// Where the palette comes from.
     pub palette_source: PaletteSource,
     /// The `[params]` overlay alone, retained for per-layer merging.
@@ -200,9 +246,29 @@ impl fmt::Debug for LayerInstance {
 // Mapping runtime
 // ---------------------------------------------------------------------------
 
-/// Per-mapping runtime state: the spec plus the envelope-follower value.
+/// Per-mapping runtime state: either a table response (with its own
+/// envelope-follower value) or a compiled expression.
 #[derive(Clone, Debug)]
-struct MappingState {
+enum MappingState {
+    /// A response table: the spec plus the envelope-follower value.
+    Table(TableState),
+    /// A compiled expression, evaluated per frame against the shared namespace.
+    Expr(ExprState),
+}
+
+impl MappingState {
+    /// The target parameter key this state writes.
+    fn target(&self) -> &str {
+        match self {
+            Self::Table(t) => &t.target,
+            Self::Expr(e) => &e.target,
+        }
+    }
+}
+
+/// Runtime state for a table mapping: its spec plus the envelope-follower value.
+#[derive(Clone, Debug)]
+struct TableState {
     target: Box<str>,
     feature: Feature,
     curve: Curve,
@@ -213,36 +279,76 @@ struct MappingState {
     env: f32,
 }
 
+impl TableState {
+    fn new(m: &Mapping) -> Self {
+        Self {
+            target: Box::from(m.target.as_str()),
+            feature: m.feature,
+            curve: m.curve,
+            attack_tau: m.attack_ms / 1000.0,
+            decay_tau: m.decay_ms / 1000.0,
+            scale: m.scale,
+            offset: m.offset,
+            env: 0.0,
+        }
+    }
+}
+
+/// Runtime state for an expression mapping: its target and compiled program.
+#[derive(Clone, Debug)]
+struct ExprState {
+    target: Box<str>,
+    expr: Arc<CompiledExpr>,
+}
+
 /// The runtime bundle of a layer's mappings.
 ///
 /// [`MappingSet::apply`] folds the newest features into every mapping and writes
 /// the results into a [`Params`] bag. It allocates nothing after construction as
 /// long as the target keys are already present in the bag; [`MappingSet::seed`]
-/// pre-seeds them.
+/// pre-seeds them. Expression entries are compiled once (at preset load) and
+/// evaluated per frame with no per-frame allocation.
 #[derive(Clone, Debug, Default)]
 pub struct MappingSet {
     entries: Vec<MappingState>,
+    /// The maintained onset envelope read by the `onset` expression variable:
+    /// `1.0` on an onset hop, an exponential decay (tau [`ONSET_TAU`]) otherwise.
+    onset_env: f32,
 }
 
 impl MappingSet {
-    /// Build a mapping set from validated mapping specs. Envelope state starts
-    /// at zero.
+    /// Build a mapping set from validated table mapping specs. Envelope state
+    /// starts at zero. (Expression entries are built via [`from_entries`].)
+    ///
+    /// [`from_entries`]: MappingSet::from_entries
     #[must_use]
     pub fn new(mappings: &[Mapping]) -> Self {
         let entries = mappings
             .iter()
-            .map(|m| MappingState {
-                target: Box::from(m.target.as_str()),
-                feature: m.feature,
-                curve: m.curve,
-                attack_tau: m.attack_ms / 1000.0,
-                decay_tau: m.decay_ms / 1000.0,
-                scale: m.scale,
-                offset: m.offset,
-                env: 0.0,
+            .map(|m| MappingState::Table(TableState::new(m)))
+            .collect();
+        Self {
+            entries,
+            onset_env: 0.0,
+        }
+    }
+
+    /// Build a mapping set from validated `[map]` entries (table or expression).
+    fn from_entries(entries: &[MapEntry]) -> Self {
+        let entries = entries
+            .iter()
+            .map(|e| match e {
+                MapEntry::Table(m) => MappingState::Table(TableState::new(m)),
+                MapEntry::Expr(x) => MappingState::Expr(ExprState {
+                    target: Box::from(x.target.as_str()),
+                    expr: Arc::clone(&x.expr),
+                }),
             })
             .collect();
-        Self { entries }
+        Self {
+            entries,
+            onset_env: 0.0,
+        }
     }
 
     /// The number of mappings.
@@ -264,8 +370,9 @@ impl MappingSet {
     /// [`apply`]: MappingSet::apply
     pub fn seed(&self, params: &mut Params) {
         for st in &self.entries {
-            if params.get(&st.target).is_none() {
-                params.set(&st.target, 0.0);
+            let target = st.target();
+            if params.get(target).is_none() {
+                params.set(target, 0.0);
             }
         }
     }
@@ -273,33 +380,60 @@ impl MappingSet {
     /// Advance every mapping by `dt` seconds against the newest features and
     /// write each result into `params`.
     ///
-    /// Per mapping: read the feature, clamp to `0.0..=1.0`, apply the curve,
-    /// run a first-order envelope follower toward that target (instant when the
-    /// relevant time constant is zero; otherwise
+    /// For a **table** entry: read the feature, clamp to `0.0..=1.0`, apply the
+    /// curve, run a first-order envelope follower toward that target (instant
+    /// when the relevant time constant is zero; otherwise
     /// `y += (x - y) * (1 - exp(-dt / tau))`, using the attack constant while
     /// rising and the decay constant while falling), then store
     /// `offset + scale * y`.
+    ///
+    /// For an **expression** entry: evaluate the compiled program against the
+    /// namespace built from `f` and the maintained onset envelope, and store the
+    /// result (non-finite results are sanitized to `0.0`). Either way the scene
+    /// clamps the stored value to the parameter's manifest range on read.
     ///
     /// Allocation-free once the target keys are present (see [`seed`]).
     ///
     /// [`seed`]: MappingSet::seed
     pub fn apply(&mut self, f: &FeatureSnapshot, dt: f32, params: &mut Params) {
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+
+        // Maintain the shared onset envelope: full on an onset hop, otherwise an
+        // exponential decay so the `onset` variable is a usable envelope rather
+        // than a single-frame spike.
+        if f.onset {
+            self.onset_env = 1.0;
+        } else if ONSET_TAU > 0.0 {
+            self.onset_env *= (-dt / ONSET_TAU).exp();
+        }
+        let onset_env = self.onset_env;
+
+        // Built lazily on the stack the first time an expression entry needs it;
+        // pure-table sets never touch it. `ExprEnv` is `Copy` — no allocation.
+        let mut env: Option<ExprEnv> = None;
+
         for st in &mut self.entries {
-            let x = feature_value(st.feature, f).clamp(0.0, 1.0);
-            let target = curve_apply(st.curve, x);
-            let tau = if target > st.env {
-                st.attack_tau
-            } else {
-                st.decay_tau
-            };
-            if tau <= 0.0 {
-                st.env = target;
-            } else {
-                st.env += (target - st.env) * (1.0 - (-dt / tau).exp());
+            match st {
+                MappingState::Table(t) => {
+                    let x = feature_value(t.feature, f).clamp(0.0, 1.0);
+                    let target = curve_apply(t.curve, x);
+                    let tau = if target > t.env {
+                        t.attack_tau
+                    } else {
+                        t.decay_tau
+                    };
+                    if tau <= 0.0 {
+                        t.env = target;
+                    } else {
+                        t.env += (target - t.env) * (1.0 - (-dt / tau).exp());
+                    }
+                    params.set(&t.target, t.offset + t.scale * t.env);
+                }
+                MappingState::Expr(e) => {
+                    let ns = env.get_or_insert_with(|| ExprEnv::from_snapshot(f, onset_env));
+                    params.set(&e.target, e.expr.eval(ns));
+                }
             }
-            let v = st.offset + st.scale * st.env;
-            params.set(&st.target, v);
         }
     }
 }
@@ -410,10 +544,13 @@ pub enum PresetErrorKind {
         /// The offending name.
         name: String,
     },
-    /// A `[map]` value was a string — rung-1 expression syntax used too early.
-    ExpressionNotSupported {
+    /// A string `[map]` expression failed to compile: an invalid syntax or a
+    /// reference to a name outside the expression vocabulary.
+    ExpressionInvalid {
         /// The mapping key.
         key: String,
+        /// What was wrong with the expression.
+        message: String,
     },
     /// The palette was malformed (wrong slot count or a bad `#rrggbb` entry).
     PaletteShape {
@@ -469,10 +606,7 @@ impl fmt::Display for PresetErrorKind {
                 write!(f, "unknown scene `{id}` (known: {})", join_known(known))
             }
             Self::UnknownFeature { name } => write!(f, "unknown feature `{name}`"),
-            Self::ExpressionNotSupported { key } => write!(
-                f,
-                "`{key}`: expressions arrive with the expression VM; use a mapping table here"
-            ),
+            Self::ExpressionInvalid { key, message } => write!(f, "`{key}`: {message}"),
             Self::PaletteShape { message } => write!(f, "{message}"),
             Self::InvalidName { name } => write!(
                 f,
@@ -743,7 +877,7 @@ fn validate_mappings(
     manifest: &[ParamSpec],
     src: &str,
     file: Option<&Path>,
-) -> Result<Vec<Mapping>, PresetError> {
+) -> Result<Vec<MapEntry>, PresetError> {
     let mut out = Vec::with_capacity(raw.len());
     for (key, spanned) in raw {
         let span = spanned.span();
@@ -761,13 +895,15 @@ fn validate_mappings(
             ));
         }
         match spanned.get_ref() {
-            toml::Value::String(_) => {
-                return Err(err_at(
-                    file,
-                    src,
-                    span,
-                    PresetErrorKind::ExpressionNotSupported { key: key.clone() },
-                ));
+            // A string value is an expression: compile it now so a syntax error
+            // or an unknown variable fails here, at load, at this entry's span.
+            toml::Value::String(source) => {
+                let expr = CompiledExpr::compile(source)
+                    .map_err(|e| expr_compile_err(&e, key, span.clone(), src, file))?;
+                out.push(MapEntry::Expr(ExprMapping {
+                    target: key.clone(),
+                    expr,
+                }));
             }
             toml::Value::Table(_) => {
                 let entry: RawMapEntry = spanned
@@ -775,7 +911,9 @@ fn validate_mappings(
                     .clone()
                     .try_into()
                     .map_err(|e| map_entry_err(&e, key, span.clone(), src, file))?;
-                out.push(build_mapping(key, &entry, span, src, file)?);
+                out.push(MapEntry::Table(build_mapping(
+                    key, &entry, span, src, file,
+                )?));
             }
             other => {
                 return Err(err_at(
@@ -784,7 +922,7 @@ fn validate_mappings(
                     span,
                     PresetErrorKind::TypeMismatch {
                         key: key.clone(),
-                        expected: "mapping table".to_string(),
+                        expected: "mapping table or expression string".to_string(),
                         found: value_type(other).to_string(),
                     },
                 ));
@@ -792,6 +930,38 @@ fn validate_mappings(
         }
     }
     Ok(out)
+}
+
+/// Turn an [`ExprCompileError`] into a positioned [`PresetError`] at the map
+/// entry's span, matching the message conventions of the other error classes.
+fn expr_compile_err(
+    err: &ExprCompileError,
+    key: &str,
+    span: Range<usize>,
+    src: &str,
+    file: Option<&Path>,
+) -> PresetError {
+    let message = match err {
+        ExprCompileError::Syntax(msg) => format!("invalid expression: {msg}"),
+        ExprCompileError::UnknownVar(name) => format!(
+            "unknown variable `{name}` in expression (known: {})",
+            join_known(
+                &EXPR_VARS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>()
+            )
+        ),
+    };
+    err_at(
+        file,
+        src,
+        span,
+        PresetErrorKind::ExpressionInvalid {
+            key: key.to_string(),
+            message,
+        },
+    )
 }
 
 fn build_mapping(
@@ -1035,7 +1205,7 @@ impl Preset {
                     info.map_or(&[], |i| i.params),
                     &[&self.params_overlay, &layer.params],
                 );
-                let mappings: &[Mapping] = if i == 0 { &self.mappings } else { &[] };
+                let mappings: &[MapEntry] = if i == 0 { &self.mappings } else { &[] };
                 self.make_layer(
                     &layer.scene,
                     layer.blend,
@@ -1054,7 +1224,7 @@ impl Preset {
         blend: Blend,
         intensity: f32,
         params: Params,
-        mappings: &[Mapping],
+        mappings: &[MapEntry],
         aspect: f32,
     ) -> LayerInstance {
         let mut scene = create_builtin(scene_id)
@@ -1065,7 +1235,7 @@ impl Preset {
             scene,
             blend,
             intensity,
-            mappings: MappingSet::new(mappings),
+            mappings: MappingSet::from_entries(mappings),
         }
     }
 }
