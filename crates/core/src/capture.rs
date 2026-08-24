@@ -126,8 +126,12 @@ impl SinkStats {
         }
     }
 
-    /// Record the negotiated channel count (engine-internal).
-    pub(crate) fn set_channels(&self, channels: u16) {
+    /// Record the negotiated channel count. The engine calls this once a backend
+    /// reports its format; a probe assembling a capture ring outside the engine
+    /// (the P7 raw-ring tap) calls it too, so [`SampleSink::push`]'s frame
+    /// accounting matches a non-stereo stream instead of falling back to the
+    /// ring's stereo design width.
+    pub fn set_channels(&self, channels: u16) {
         self.channels.store(channels, Ordering::Relaxed);
     }
 
@@ -251,6 +255,30 @@ impl SampleConsumer {
         &self.stats
     }
 
+    /// Drain every interleaved sample currently buffered into `out`, replacing
+    /// its contents, and return how many were written. Used by the P7 raw-ring
+    /// probe, which polls the ring off-thread instead of running the DSP hop
+    /// grid; it clears `out` first, so pre-sizing `out` to the ring capacity
+    /// keeps the drain allocation-free.
+    pub fn drain_all(&mut self, out: &mut Vec<f32>) -> usize {
+        out.clear();
+        let n = self.consumer.slots();
+        if n == 0 {
+            return 0;
+        }
+        match self.consumer.read_chunk(n) {
+            Ok(chunk) => {
+                let (first, second) = chunk.as_slices();
+                out.extend_from_slice(first);
+                out.extend_from_slice(second);
+                let written = first.len() + second.len();
+                chunk.commit_all();
+                written
+            }
+            Err(_) => 0,
+        }
+    }
+
     /// Pop exactly `samples` interleaved values into `out`, returning `false`
     /// (and consuming nothing) when fewer than `samples` are buffered.
     /// Allocation-free; `out` must be at least `samples` long.
@@ -364,4 +392,341 @@ pub trait CaptureBackend: Send {
     /// cpal backend stores the selector so its next resolution binds it.
     #[cfg(feature = "capture-cpal")]
     fn set_device(&mut self, _selector: crate::backends::cpal::DeviceSelector) {}
+}
+
+// ---------------------------------------------------------------------------
+// Raw-ring analysis (P7 raw-ring latency probe)
+// ---------------------------------------------------------------------------
+//
+// These pure helpers let the latency probe measure capture transport with no
+// hop quantization: it drains the ring off-thread (see
+// [`SampleConsumer::drain_all`]), records each drain's clock reading in a
+// [`DrainTimeline`] so any sample's capture time is reconstructable on the ring
+// epoch, and finds a known click's leading edge in the drained stream with
+// [`rect_xcorr_peak`]. They carry no audio dependency and are exercised directly
+// by unit tests and the synthetic raw-ring regression.
+
+/// Reconstructs the capture-time of every sample drained from a
+/// [`SampleConsumer`] outside the engine (the P7 raw-ring probe's tap).
+///
+/// The probe drains the ring on a fixed poll: each poll pops whatever whole
+/// stream of interleaved samples is buffered and hands this timeline the poll's
+/// clock reading (`drain_ns`, on the ring epoch — the same clock
+/// [`SinkStats::now_ns`] and `FeatureSnapshot::timestamp_ns` share) together
+/// with the number of *frames* popped (interleaved samples ÷ channels).
+///
+/// Bookkeeping, stated exactly so the probe's cross-correlation lands on the
+/// right clock: the frames a poll pops are the most-recently captured frames
+/// still in the ring, so the newest of them was captured about one frame-period
+/// before the poll's clock read and the oldest about `frames` frame-periods
+/// before it. We therefore place the oldest frame of a drain at
+/// `base = drain_ns − frames × ns_per_frame` and step forward one frame-period
+/// per frame, so for global frame index `g` (drains are contiguous, so global
+/// indices accumulate across polls)
+/// `sample_time_ns(g) = base + (g − start_frame) × ns_per_frame`. The per-frame
+/// quantum is `1e9 / sample_rate` ns — ~20.8 µs at 48 kHz, far below the
+/// millisecond effects being measured — and the only real error is up to one
+/// poll interval of jitter on `drain_ns`.
+pub struct DrainTimeline {
+    ns_per_frame: f64,
+    total_frames: u64,
+    segments: Vec<DrainSegment>,
+}
+
+/// One recorded drain: a contiguous run of frames and the capture-time of its
+/// oldest frame.
+#[derive(Clone, Copy, Debug)]
+struct DrainSegment {
+    start_frame: u64,
+    frames: u64,
+    base_ns: u64,
+}
+
+impl DrainTimeline {
+    /// A timeline for a stream captured at `sample_rate` Hz. A zero rate
+    /// degenerates to a one-nanosecond frame period so the arithmetic never
+    /// divides by zero.
+    #[must_use]
+    pub fn new(sample_rate: u32) -> Self {
+        let ns_per_frame = if sample_rate == 0 {
+            1.0
+        } else {
+            1.0e9 / f64::from(sample_rate)
+        };
+        Self {
+            ns_per_frame,
+            total_frames: 0,
+            segments: Vec::new(),
+        }
+    }
+
+    /// Reserve room for `polls` drain records up front (off the hot path), so a
+    /// long run does not reallocate the segment list mid-drain.
+    pub fn reserve(&mut self, polls: usize) {
+        self.segments.reserve(polls);
+    }
+
+    /// Total frames recorded so far — the global index the next drained frame
+    /// will get.
+    #[must_use]
+    pub fn total_frames(&self) -> u64 {
+        self.total_frames
+    }
+
+    /// Record one drain of `frames` frames read at `drain_ns` (ns on the ring
+    /// epoch). A zero-frame drain is ignored.
+    pub fn record_drain(&mut self, drain_ns: u64, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        let span_ns = (frames as f64 * self.ns_per_frame).round() as u64;
+        let base_ns = drain_ns.saturating_sub(span_ns);
+        self.segments.push(DrainSegment {
+            start_frame: self.total_frames,
+            frames,
+            base_ns,
+        });
+        self.total_frames += frames;
+    }
+
+    /// Capture-time (ns on the ring epoch) of global frame `frame`, or `None`
+    /// when it was never recorded.
+    #[must_use]
+    pub fn sample_time_ns(&self, frame: u64) -> Option<u64> {
+        // Segments are contiguous and sorted by start_frame, so the first whose
+        // end is past `frame` is the one that contains it.
+        let idx = self
+            .segments
+            .partition_point(|s| s.start_frame + s.frames <= frame);
+        let seg = self.segments.get(idx)?;
+        if frame < seg.start_frame {
+            return None;
+        }
+        let offset = frame - seg.start_frame;
+        Some(seg.base_ns + (offset as f64 * self.ns_per_frame).round() as u64)
+    }
+
+    /// The first global frame whose capture-time is at or after `t_ns`, clamped
+    /// to `0..=total_frames`. Turns a time-based search window into a frame
+    /// offset range for [`rect_xcorr_peak`].
+    #[must_use]
+    pub fn frame_at_or_after(&self, t_ns: u64) -> u64 {
+        for seg in &self.segments {
+            let seg_end_ns = seg.base_ns + (seg.frames as f64 * self.ns_per_frame).round() as u64;
+            if t_ns < seg_end_ns {
+                if t_ns <= seg.base_ns {
+                    return seg.start_frame;
+                }
+                let into = ((t_ns - seg.base_ns) as f64 / self.ns_per_frame).ceil() as u64;
+                return seg.start_frame + into.min(seg.frames);
+            }
+        }
+        self.total_frames
+    }
+}
+
+/// Acceptance floor a click's cross-correlation peak must clear for the raw-ring
+/// probe to treat it as found. Kept low on purpose: a synthetic click is a
+/// single-frame impulse, whose normalized correlation against a rectangular
+/// template of `L` frames plateaus at `1/√L` (≈0.14 for a 1 ms / 48 kHz
+/// template), while a real full-width click and a matching-width burst score
+/// near 1.0 and silence / a never-arrived click score ≈ 0.
+pub const RAW_CORR_ACCEPT: f32 = 0.1;
+
+/// Peak normalized cross-correlation of a rectangular (all-ones) template of
+/// `template_len` samples against `signal`, scanned over correlation offsets
+/// `search_start..search_end`. Offset `o` correlates the template with
+/// `signal[o .. o + template_len]`; the return is `(offset of the greatest NCC,
+/// that NCC)`.
+///
+/// This is the matched filter the P7 raw-ring probe uses to place a click's
+/// leading edge in the captured stream. An emitted click is a rectangular burst
+/// of known width, so the template is all-ones of that width and the NCC peaks
+/// where the burst begins. Using NCC rather than a raw dot product makes the
+/// score amplitude-independent — 1.0 for a perfectly matching positive burst,
+/// near 0 for silence or zero-mean noise — so one acceptance floor
+/// ([`RAW_CORR_ACCEPT`]) separates "click found" from "click never arrived".
+///
+/// Ties are resolved to the *latest* offset. For a rectangular-matched burst
+/// that is its unique strict peak, so the choice never bites there; for a pulse
+/// narrower than the template (a synthetic single-frame impulse), the tie runs
+/// over the plateau of offsets whose window still contains the pulse, and the
+/// latest of them is the offset whose template *start* aligns with the pulse —
+/// i.e. the leading-edge frame in both cases.
+///
+/// Returns `None` when `template_len` is zero, longer than `signal`, or the
+/// clamped search range is empty.
+#[must_use]
+pub fn rect_xcorr_peak(
+    signal: &[f32],
+    template_len: usize,
+    search_start: usize,
+    search_end: usize,
+) -> Option<(usize, f32)> {
+    if template_len == 0 || template_len > signal.len() {
+        return None;
+    }
+    // Highest offset whose window still fits, plus one (an exclusive bound).
+    let offset_bound = signal.len() - template_len + 1;
+    let start = search_start.min(offset_bound);
+    let end = search_end.min(offset_bound);
+    if start >= end {
+        return None;
+    }
+
+    // Template energy is L (all ones), so ‖template‖ = √L; NCC(o) =
+    // Σ window / (√(Σ window²) · √L). Maintain the window's running sum and
+    // sum-of-squares so each offset costs O(1).
+    let norm = (template_len as f64).sqrt();
+    let mut sum = 0.0f64;
+    let mut sq = 0.0f64;
+    for &v in &signal[start..start + template_len] {
+        let v = f64::from(v);
+        sum += v;
+        sq += v * v;
+    }
+
+    let mut best: Option<(usize, f32)> = None;
+    for o in start..end {
+        let ncc = if sq > 0.0 {
+            (sum / (sq.sqrt() * norm)) as f32
+        } else {
+            0.0
+        };
+        // `>=` keeps the latest max (see the tie-break note above).
+        match best {
+            Some((_, b)) if ncc < b => {}
+            _ => best = Some((o, ncc)),
+        }
+        // Slide the window one sample right for the next offset.
+        if o + 1 < end {
+            let leaving = f64::from(signal[o]);
+            let entering = f64::from(signal[o + template_len]);
+            sum += entering - leaving;
+            sq += entering * entering - leaving * leaving;
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-noise in roughly `-1.0..=1.0` from a splitmix64
+    /// finalizer, so the correlation tests are stable across runs.
+    fn noise(index: u64) -> f32 {
+        let mut z = index.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        ((z >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+    }
+
+    #[test]
+    fn xcorr_finds_a_rectangular_burst_within_one_sample() {
+        // A 64-sample burst at amp 0.8 starting at frame 1500, low noise
+        // everywhere.
+        let n = 4096;
+        let l = 64;
+        let p = 1500;
+        let mut sig = vec![0.0f32; n];
+        for (i, s) in sig.iter_mut().enumerate() {
+            *s = 0.02 * noise(i as u64);
+        }
+        for s in &mut sig[p..p + l] {
+            *s += 0.8;
+        }
+        let (offset, peak) = rect_xcorr_peak(&sig, l, 0, n - l + 1).expect("a peak");
+        assert!(
+            (offset as i64 - p as i64).abs() <= 1,
+            "peak offset {offset} is not within 1 of the burst start {p}"
+        );
+        assert!(peak > 0.9, "matching-burst NCC {peak} should be near 1.0");
+    }
+
+    #[test]
+    fn xcorr_rejects_a_no_click_window() {
+        // Pure noise, no burst: with a wide template and a modest window the
+        // peak NCC stays far below both a matching burst (~1.0) and the probe's
+        // acceptance floor for a real full-width click.
+        let n = 2560;
+        let l = 2048;
+        let sig: Vec<f32> = (0..n).map(|i| 0.05 * noise(i as u64 + 777)).collect();
+        let (_, peak) = rect_xcorr_peak(&sig, l, 0, n - l + 1).expect("a peak");
+        assert!(
+            peak < 0.3,
+            "no-click NCC {peak} should stay well below a matching burst"
+        );
+    }
+
+    #[test]
+    fn xcorr_edge_cases_return_none() {
+        let sig = vec![0.0f32; 16];
+        // Zero-length template.
+        assert!(rect_xcorr_peak(&sig, 0, 0, 4).is_none());
+        // Template longer than the signal.
+        assert!(rect_xcorr_peak(&sig, 32, 0, 1).is_none());
+        // Empty search range.
+        assert!(rect_xcorr_peak(&sig, 4, 5, 5).is_none());
+        // Search range clamped past the last valid offset yields the last offset.
+        let mut s = vec![0.0f32; 16];
+        s[12] = 1.0; // impulse; template 4 => plateau [9..=12], latest = 12
+        let (offset, _) = rect_xcorr_peak(&s, 4, 0, 999).expect("a peak");
+        assert_eq!(
+            offset, 12,
+            "tie should resolve to the impulse's leading edge"
+        );
+    }
+
+    #[test]
+    fn drain_timeline_reconstructs_per_sample_times() {
+        // Rate 1000 Hz => exactly 1_000_000 ns per frame, so the arithmetic is
+        // integer-clean and the reconstruction is exact.
+        let mut tl = DrainTimeline::new(1000);
+        // Drain 1: read at 10 ms, 5 frames => oldest at 10ms-5ms = 5ms.
+        tl.record_drain(10_000_000, 5);
+        // Drain 2: read at 15 ms, 3 frames => oldest at 15ms-3ms = 12ms.
+        tl.record_drain(15_000_000, 3);
+        assert_eq!(tl.total_frames(), 8);
+
+        // Segment 1 frames 0..=4 at 5,6,7,8,9 ms.
+        assert_eq!(tl.sample_time_ns(0), Some(5_000_000));
+        assert_eq!(tl.sample_time_ns(4), Some(9_000_000));
+        // Segment 2 frames 5..=7 at 12,13,14 ms.
+        assert_eq!(tl.sample_time_ns(5), Some(12_000_000));
+        assert_eq!(tl.sample_time_ns(7), Some(14_000_000));
+        // Past the end: no time.
+        assert_eq!(tl.sample_time_ns(8), None);
+
+        // frame_at_or_after maps a time back to the first frame at/after it.
+        assert_eq!(tl.frame_at_or_after(0), 0);
+        assert_eq!(tl.frame_at_or_after(5_000_000), 0);
+        assert_eq!(tl.frame_at_or_after(9_000_001), 5); // just past seg-1's last frame -> seg 2
+        assert_eq!(tl.frame_at_or_after(13_000_000), 6);
+        assert_eq!(tl.frame_at_or_after(99_000_000), 8); // past the end
+    }
+
+    #[test]
+    fn drain_timeline_zero_frame_drain_is_ignored() {
+        let mut tl = DrainTimeline::new(48_000);
+        tl.record_drain(1_000_000, 0);
+        assert_eq!(tl.total_frames(), 0);
+        assert_eq!(tl.sample_time_ns(0), None);
+    }
+
+    #[test]
+    fn drain_all_pops_everything_buffered() {
+        use std::time::Instant;
+        let (mut sink, mut consumer) = sample_ring(Instant::now());
+        sink.stats().set_channels(2);
+        sink.push(&[0.1, 0.2, 0.3, 0.4]);
+        let mut out = Vec::with_capacity(RING_FRAMES * 2);
+        let n = consumer.drain_all(&mut out);
+        assert_eq!(n, 4);
+        assert_eq!(out, vec![0.1, 0.2, 0.3, 0.4]);
+        // A second drain with nothing buffered yields nothing.
+        assert_eq!(consumer.drain_all(&mut out), 0);
+        assert!(out.is_empty());
+    }
 }
