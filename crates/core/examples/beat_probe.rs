@@ -302,7 +302,15 @@ fn print_induction(t: f32, dbg: &BeatDebug) {
     if cands.is_empty() {
         cands.push_str("(no candidates)");
     }
-    println!("  induct#{:<4} t={t:>5.1}s  top: {cands}", dbg.inductions);
+    let mem = if dbg.remembered_bpm > 0.0 {
+        format!("  mem={:.0}", dbg.remembered_bpm)
+    } else {
+        String::new()
+    };
+    println!(
+        "  induct#{:<4} t={t:>5.1}s  top: {cands}{mem}",
+        dbg.inductions
+    );
 }
 
 /// The closing summary block: distribution of kurtosis and confidence, the

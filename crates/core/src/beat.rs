@@ -40,7 +40,27 @@
 //! - **Coasting → Unlocked**: the coast window (`COAST_SECONDS`) expires, or the
 //!   fast silence gate observes true silence (`odf_level < SILENCE_LEVEL`) for
 //!   `SILENCE_COAST_SECONDS` — a much shorter cut, so a track *ending* unlocks
-//!   in about a second instead of ghost-publishing the full coast window.
+//!   in about a second instead of ghost-publishing the full coast window. On
+//!   this transition the just-held period is *remembered* for `MEMORY_SECONDS`
+//!   (see below), unless true silence wipes the memory first.
+//! - **Unlocked → Locked (warm re-lock)**: while unlocked with a live tempo
+//!   memory, an induction pass whose winning candidate period sits within
+//!   `MEMORY_RELOCK_REL` of the remembered period and whose smoothed confidence
+//!   has reached only `LOCK_OFF` (not the full `LOCK_ON` a cold lock needs)
+//!   re-locks immediately at the candidate period. Real music holds a long
+//!   breakdown's tempo steady while the kurtosis gate pins confidence between
+//!   `LOCK_OFF` and `LOCK_ON`; the memory lets that consistent evidence re-lock
+//!   cheaply. Unlike the coast resume, the phase is aligned **hard**: seconds of
+//!   no publishing have elapsed since the coast ended, so the free-run phase is
+//!   stale and must be snapped to the current ODF grid rather than carried. A
+//!   fresh lock — cold or warm — clears the memory; it is re-armed only by the
+//!   next coast expiry.
+//!
+//! The tempo memory is armed when a coast expires on its window and cleared when
+//! it expires (`MEMORY_SECONDS`), when a fresh lock is taken, or the instant the
+//! fast silence gate sees true silence — a new track must never inherit the
+//! previous one's tempo. A candidate that stays outside `MEMORY_RELOCK_REL` of
+//! the remembered period neither re-locks nor extends the memory window.
 //!
 //! Because `confidence` is always published honestly — decaying through a coast
 //! — a scene gating on `beat_confidence` still sees the evidence weaken and can
@@ -128,6 +148,20 @@ const COAST_SECONDS: f32 = 6.0;
 /// [`BeatTracker::new`].
 const SILENCE_COAST_SECONDS: f32 = 1.0;
 
+/// How long the tempo is *remembered* after a coast expires, seconds. Real music
+/// (e.g. a long house breakdown) can hold the winning candidate steady while the
+/// kurtosis gate keeps confidence below [`LOCK_ON`] for many seconds after the
+/// coast window has run out. Remembering the coasted period for this window lets
+/// consistent evidence re-lock cheaply (see [`MEMORY_RELOCK_REL`]) instead of
+/// waiting for a full cold lock. Converted to a hop count in [`BeatTracker::new`].
+const MEMORY_SECONDS: f32 = 30.0;
+
+/// Relative tolerance a winning candidate period must fall within, against the
+/// remembered period, to trigger a warm re-lock. A candidate outside this band
+/// does not re-lock off the memory (it must earn a fresh cold lock at its own
+/// period), so a genuine tempo change is never dragged back to the old tempo.
+const MEMORY_RELOCK_REL: f32 = 0.03;
+
 /// Variance floor of the ODF window below which an induction pass reports no
 /// confidence (the window is effectively flat / silent).
 const VAR_FLOOR: f32 = 1e-9;
@@ -203,6 +237,10 @@ pub struct BeatDebug {
     pub coasting: bool,
     /// Published tempo in BPM, `0.0` while unlocked; held while coasting (live).
     pub tempo_bpm: f32,
+    /// Remembered tempo in BPM held after a coast expiry, `0.0` when no memory is
+    /// live (live). A within-tolerance candidate can warm-re-lock onto it while
+    /// the tracker is unlocked; see the state-machine docs.
+    pub remembered_bpm: f32,
     /// The three highest-scoring comb candidates on the last pass, best first.
     /// Zeroed entries pad a pass that found fewer (or a flat window).
     pub top: [BeatCandidate; 3],
@@ -257,6 +295,15 @@ pub struct BeatTracker {
     coast_max: usize,
     /// Silence-cut coast length in hops (`SILENCE_COAST_SECONDS`).
     silence_coast_max: usize,
+    /// Remembered beat period in hops after a coast expiry, or `0.0` when no
+    /// memory is live. Armed by [`end_coast`](Self::end_coast) on a window
+    /// expiry; drives the warm re-lock while the tracker is unlocked.
+    remembered_period: f32,
+    /// Hops elapsed in the current tempo-memory window; the memory clears at
+    /// `memory_max`.
+    memory_hops: usize,
+    /// Tempo-memory window length in hops (`MEMORY_SECONDS`).
+    memory_max: usize,
     period_hops: f32,
     phase: f32,
     confidence: f32,
@@ -310,6 +357,7 @@ impl BeatTracker {
         let min_fill = (3 * max_lag).min(ring_len);
         let coast_max = ((COAST_SECONDS / dt).round() as usize).max(1);
         let silence_coast_max = ((SILENCE_COAST_SECONDS / dt).round() as usize).max(1);
+        let memory_max = ((MEMORY_SECONDS / dt).round() as usize).max(1);
 
         Self {
             dt,
@@ -331,6 +379,9 @@ impl BeatTracker {
             silent_hops: 0,
             coast_max,
             silence_coast_max,
+            remembered_period: 0.0,
+            memory_hops: 0,
+            memory_max,
             period_hops: 0.0,
             phase: 0.0,
             confidence: 0.0,
@@ -381,8 +432,28 @@ impl BeatTracker {
         }
 
         // Advance the lock / coast / unlock state machine from the current
-        // confidence and silence run.
+        // confidence and silence run. A coast that expires on its window arms the
+        // tempo memory from inside here.
         self.update_lock_state();
+
+        // True silence wipes the tempo memory the instant it is seen — a new track
+        // must never inherit the previous one's tempo. This runs *after*
+        // `update_lock_state` so it dominates the memory a silence-cut coast just
+        // armed: the silence-cut path funnels through `end_coast` like a window
+        // expiry, then this clears what it armed, leaving no memory behind.
+        if self.odf_level < SILENCE_LEVEL {
+            self.clear_memory();
+        }
+
+        // Age the tempo memory and expire it after its window. Memory only ever
+        // lives while unlocked (a fresh lock clears it), so this simply counts
+        // down the remembering window.
+        if self.remembered_period > 0.0 {
+            self.memory_hops += 1;
+            if self.memory_hops >= self.memory_max {
+                self.clear_memory();
+            }
+        }
 
         // Advance the beat phase (free-running between induction passes) whenever
         // a tempo is being published — locked or coasting.
@@ -454,13 +525,29 @@ impl BeatTracker {
         }
     }
 
-    /// Fully unlock at the end of a coast: no tempo, phase reset.
+    /// Fully unlock at the end of a coast: no tempo, phase reset. Arms the tempo
+    /// memory from the just-held period so consistent later evidence can warm-
+    /// re-lock cheaply. Both coast-end paths (window expiry and silence cut) reach
+    /// here; the silence-cut path's memory is wiped immediately afterward by the
+    /// true-silence gate in [`process_hop`](Self::process_hop), so only a
+    /// window-expiry coast actually leaves a live memory.
     fn end_coast(&mut self) {
         self.coasting = false;
         self.locked = false;
         self.coast_hops = 0;
+        if self.period_hops > 0.0 {
+            self.remembered_period = self.period_hops;
+            self.memory_hops = 0;
+        }
         self.tempo_bpm = 0.0;
         self.phase = 0.0;
+    }
+
+    /// Clear the tempo memory (no remembered period). Called on a fresh lock, on
+    /// memory-window expiry, on true silence, and on [`reset`](Self::reset).
+    fn clear_memory(&mut self) {
+        self.remembered_period = 0.0;
+        self.memory_hops = 0;
     }
 
     /// Reset all runtime state (ring, lock, phase). Called on a format change.
@@ -475,6 +562,8 @@ impl BeatTracker {
         self.coasting = false;
         self.coast_hops = 0;
         self.silent_hops = 0;
+        self.remembered_period = 0.0;
+        self.memory_hops = 0;
         self.period_hops = 0.0;
         self.phase = 0.0;
         self.confidence = 0.0;
@@ -632,6 +721,33 @@ impl BeatTracker {
                 self.align_phase_hard(refined);
             }
             self.tempo_bpm = 60.0 / (self.period_hops * self.dt);
+            // A fresh lock supersedes any tempo memory; it is re-armed only by the
+            // next coast expiry.
+            self.clear_memory();
+        } else if self.remembered_period > 0.0
+            && !self.locked
+            && !self.coasting
+            && self.confidence >= LOCK_OFF
+        {
+            // Warm re-lock: unlocked with a live tempo memory. A cold lock would
+            // need LOCK_ON, but real music can hold a candidate steady while the
+            // kurtosis gate pins confidence between LOCK_OFF and LOCK_ON. If the
+            // winning candidate matches the remembered period, re-lock at the
+            // reduced threshold. The phase is aligned *hard*, not soft like a
+            // coast resume: seconds of no publishing have elapsed since the coast
+            // ended, so the free-run phase is stale and must snap to the current
+            // ODF grid rather than carry across. A candidate outside the band
+            // does not re-lock and does not extend the memory window.
+            let rel = (refined - self.remembered_period).abs() / self.remembered_period;
+            if rel <= MEMORY_RELOCK_REL {
+                self.locked = true;
+                self.coasting = false;
+                self.coast_hops = 0;
+                self.period_hops = refined;
+                self.align_phase_hard(refined);
+                self.tempo_bpm = 60.0 / (self.period_hops * self.dt);
+                self.clear_memory();
+            }
         }
         // Weakening below LOCK_OFF and the coast/unlock decision are handled by
         // [`update_lock_state`](Self::update_lock_state) after this pass returns.
@@ -749,6 +865,11 @@ impl BeatTracker {
             locked: self.locked,
             coasting: self.coasting,
             tempo_bpm: self.tempo_bpm(),
+            remembered_bpm: if self.remembered_period > 0.0 {
+                60.0 / (self.remembered_period * self.dt)
+            } else {
+                0.0
+            },
             ..self.debug
         }
     }
@@ -838,12 +959,13 @@ mod tests {
     }
 
     /// One per-hop record from a coast run: the published estimate plus the live
-    /// debug flags.
+    /// debug flags and the live tempo-memory state.
     #[derive(Clone, Copy)]
     struct Rec {
         est: BeatEstimate,
         locked: bool,
         coasting: bool,
+        remembered_bpm: f32,
     }
 
     /// Drive a pulse train at `bpm` that, over the hop range `gap`, is replaced by
@@ -882,9 +1004,390 @@ mod tests {
                 est,
                 locked: bt.is_locked(),
                 coasting: bt.is_coasting(),
+                remembered_bpm: bt.debug_stats().remembered_bpm,
             });
         }
         out
+    }
+
+    /// Parameters for [`run_memory_scenario`], a three-phase memory scenario.
+    struct MemScenario {
+        /// Tempo of the initial lock phase and the gap grid, BPM.
+        bpm: f32,
+        /// Seconds of clean unit pulses at `bpm` (the initial lock).
+        lock_s: f32,
+        /// Seconds of gap replacing the pulses.
+        gap_s: f32,
+        /// Gap floor: `0.0` → true silence, else a noise floor around this level.
+        gap_level: f32,
+        /// Seconds of resumed pulses after the gap.
+        resume_s: f32,
+        /// Tempo of the resumed pulses, BPM (may differ from `bpm`).
+        resume_bpm: f32,
+        /// Amplitude of each resumed pulse.
+        resume_amp: f32,
+        /// Steady noise floor under the resumed pulses (tunes kurtosis/confidence).
+        resume_floor: f32,
+        /// Phase offset of the resumed beat grid, in fractions of the resume
+        /// period, so the resumed grid can be shifted off the pre-gap phase.
+        resume_shift: f32,
+    }
+
+    /// One [`Rec`] per hop for a [`MemScenario`], plus `(resume_start_hop,
+    /// resume_period_hops)`. The lock/gap grid runs at `bpm`; the resume grid runs
+    /// at `resume_bpm`, offset by `resume_shift` of its period, on a `resume_floor`
+    /// noise bed — so kurtosis and comb energy (hence confidence) in the resume
+    /// window can be tuned to sit below `LOCK_ON` the way real music does.
+    fn run_memory_scenario(s: &MemScenario) -> (Vec<Rec>, usize, f32) {
+        let mut bt = BeatTracker::new(SR, HOP);
+        let period_hops = 60.0 / (s.bpm * dt());
+        let resume_period = 60.0 / (s.resume_bpm * dt());
+        let lock = hops(s.lock_s);
+        let gap = hops(s.gap_s);
+        let resume = hops(s.resume_s);
+        let total = lock + gap + resume;
+        let resume_start = lock + gap;
+        let mut acc = 0.0f32;
+        // Resume grid accumulator, seeded so the first resumed beat lands
+        // `resume_shift` of a period off the grid start.
+        let mut racc = s.resume_shift.rem_euclid(1.0) * resume_period;
+        let mut out = Vec::with_capacity(total);
+        for i in 0..total {
+            let odf = if i < resume_start {
+                acc += 1.0;
+                let is_beat = acc >= period_hops;
+                if is_beat {
+                    acc -= period_hops;
+                }
+                if i < lock {
+                    if is_beat { 1.0 } else { 0.0 }
+                } else if s.gap_level == 0.0 {
+                    0.0
+                } else {
+                    (s.gap_level * (1.0 + 0.5 * pseudo_noise(i))).max(0.0)
+                }
+            } else {
+                racc += 1.0;
+                let is_beat = racc >= resume_period;
+                if is_beat {
+                    racc -= resume_period;
+                }
+                let floor = if s.resume_floor == 0.0 {
+                    0.0
+                } else {
+                    (s.resume_floor * (1.0 + 0.5 * pseudo_noise(i))).max(0.0)
+                };
+                if is_beat { floor + s.resume_amp } else { floor }
+            };
+            let est = bt.process_hop(odf);
+            out.push(Rec {
+                est,
+                locked: bt.is_locked(),
+                coasting: bt.is_coasting(),
+                remembered_bpm: bt.debug_stats().remembered_bpm,
+            });
+        }
+        (out, resume_start, resume_period)
+    }
+
+    /// Index and published confidence of the first hop at or after `from` where
+    /// the tracker holds a firm lock, or `None` if it never locks in that span.
+    fn first_lock_after(recs: &[Rec], from: usize) -> Option<(usize, f32)> {
+        (from..recs.len())
+            .find(|&i| recs[i].locked)
+            .map(|i| (i, recs[i].est.confidence))
+    }
+
+    /// Mean published tempo and locked fraction over the final `secs` of a run.
+    fn tail_stats(recs: &[Rec], secs: f32) -> (f32, f32) {
+        let tail = &recs[recs.len() - hops(secs)..];
+        let tempo = tail.iter().map(|r| r.est.tempo_bpm).sum::<f32>() / tail.len() as f32;
+        let locked = tail.iter().filter(|r| r.locked).count() as f32 / tail.len() as f32;
+        (tempo, locked)
+    }
+
+    /// (a) After a coast expires, the held tempo is remembered; when consistent
+    /// evidence returns it re-locks at the reduced `LOCK_OFF` threshold — while
+    /// the smoothed confidence is still well below the `LOCK_ON` a cold lock
+    /// needs. A 124 BPM lock, a 10 s weak-but-not-silent gap (coast expires
+    /// mid-gap, arming the memory), then pulses on a noise bed that holds
+    /// confidence in the real-music band (kurtosis gate keeps it under `LOCK_ON`).
+    #[test]
+    fn warm_relock_from_memory_below_cold_threshold() {
+        let s = MemScenario {
+            bpm: 124.0,
+            lock_s: 8.0,
+            gap_s: 10.0,
+            gap_level: 0.30,
+            resume_s: 8.0,
+            resume_bpm: 124.0,
+            resume_amp: 1.0,
+            resume_floor: 0.25,
+            resume_shift: 0.0,
+        };
+        let (recs, rs, _) = run_memory_scenario(&s);
+
+        // The memory was armed by the coast expiry and is live at resume.
+        let mem_gapmax = recs[..rs]
+            .iter()
+            .map(|r| r.remembered_bpm)
+            .fold(0.0f32, f32::max);
+        let mem_at_resume = recs[rs].remembered_bpm;
+
+        let (relock, relock_conf) =
+            first_lock_after(&recs, rs).expect("never re-locked after the gap");
+        let relock_dt = (relock - rs) as f32 * dt();
+        let (tail_tempo, tail_locked) = tail_stats(&recs, 1.0);
+
+        println!(
+            "beat::warm_relock_from_memory_below_cold_threshold: mem_gapmax {mem_gapmax:.1}, \
+             mem_at_resume {mem_at_resume:.1}, relock_conf {relock_conf:.3} \
+             (LOCK_OFF {LOCK_OFF}, LOCK_ON {LOCK_ON}), relock_dt {relock_dt:.2}s, \
+             tail_tempo {tail_tempo:.2}, tail_locked {tail_locked:.2}"
+        );
+
+        assert!(
+            (mem_gapmax - 124.0).abs() <= 4.0,
+            "memory not armed at ~124 during the gap (max {mem_gapmax:.1})"
+        );
+        assert!(
+            (mem_at_resume - 124.0).abs() <= 4.0,
+            "memory not live at resume (was {mem_at_resume:.1})"
+        );
+        // The decisive property: a firm lock at a confidence below LOCK_ON is only
+        // reachable through the warm-re-lock path — a cold lock requires LOCK_ON.
+        assert!(
+            relock_conf < LOCK_ON,
+            "re-lock confidence {relock_conf:.3} reached the cold LOCK_ON — the memory did \
+             not lower the threshold"
+        );
+        assert!(
+            relock_conf >= LOCK_OFF,
+            "re-lock confidence {relock_conf:.3} below LOCK_OFF — warm re-lock fired too eagerly"
+        );
+        assert!(
+            (tail_tempo - 124.0).abs() <= 3.0,
+            "re-locked tempo {tail_tempo:.2} not within ±3 of 124"
+        );
+        assert!(
+            tail_locked > 0.9,
+            "tracker did not stay firmly locked after the warm re-lock (frac {tail_locked:.2})"
+        );
+    }
+
+    /// (b) The memory expires after `MEMORY_SECONDS`: with the gap stretched past
+    /// the memory window, resumed pulses get no warm discount and must earn a full
+    /// cold lock at `LOCK_ON` again.
+    #[test]
+    fn memory_expires_then_requires_cold_lock() {
+        let s = MemScenario {
+            bpm: 124.0,
+            lock_s: 8.0,
+            // Coast arms the memory ~15 s in; MEMORY_SECONDS=30 → expires ~45 s.
+            // A 40 s gap resumes at ~48 s, comfortably past expiry.
+            gap_s: 40.0,
+            gap_level: 0.30,
+            resume_s: 8.0,
+            resume_bpm: 124.0,
+            resume_amp: 1.0,
+            resume_floor: 0.0,
+            resume_shift: 0.0,
+        };
+        let (recs, rs, _) = run_memory_scenario(&s);
+
+        let mem_at_resume = recs[rs].remembered_bpm;
+        let (_, relock_conf) =
+            first_lock_after(&recs, rs).expect("never re-locked after the long gap");
+        let (tail_tempo, _) = tail_stats(&recs, 1.0);
+
+        println!(
+            "beat::memory_expires_then_requires_cold_lock: mem_at_resume {mem_at_resume:.1}, \
+             relock_conf {relock_conf:.3} (LOCK_ON {LOCK_ON}), tail_tempo {tail_tempo:.2}"
+        );
+
+        assert_eq!(
+            mem_at_resume, 0.0,
+            "memory did not expire across a gap longer than MEMORY_SECONDS"
+        );
+        assert!(
+            relock_conf >= LOCK_ON,
+            "re-lock confidence {relock_conf:.3} < LOCK_ON — a stale memory still discounted \
+             the lock after it should have expired"
+        );
+        assert!(
+            (tail_tempo - 124.0).abs() <= 3.0,
+            "cold-re-locked tempo {tail_tempo:.2} not within ±3 of 124"
+        );
+    }
+
+    /// (c) True silence during the memory window wipes it immediately, so the next
+    /// train cannot inherit the previous tempo: it must cold-lock at `LOCK_ON`.
+    #[test]
+    fn true_silence_during_memory_clears_it() {
+        let s = MemScenario {
+            bpm: 124.0,
+            lock_s: 8.0,
+            gap_s: 4.0,
+            gap_level: 0.0, // true silence
+            resume_s: 8.0,
+            resume_bpm: 124.0,
+            resume_amp: 1.0,
+            resume_floor: 0.0,
+            resume_shift: 0.0,
+        };
+        let (recs, rs, _) = run_memory_scenario(&s);
+
+        // The silence gate wipes the memory the same hop the coast arms it, so it
+        // never becomes observable at all.
+        let mem_gapmax = recs.iter().map(|r| r.remembered_bpm).fold(0.0f32, f32::max);
+        let (_, relock_conf) =
+            first_lock_after(&recs, rs).expect("never re-locked after the silence");
+        let (tail_tempo, _) = tail_stats(&recs, 1.0);
+
+        println!(
+            "beat::true_silence_during_memory_clears_it: mem_max {mem_gapmax:.1}, \
+             relock_conf {relock_conf:.3} (LOCK_ON {LOCK_ON}), tail_tempo {tail_tempo:.2}"
+        );
+
+        assert_eq!(
+            mem_gapmax, 0.0,
+            "a tempo memory survived true silence (max {mem_gapmax:.1})"
+        );
+        assert!(
+            relock_conf >= LOCK_ON,
+            "re-lock confidence {relock_conf:.3} < LOCK_ON — silence failed to clear the memory"
+        );
+        assert!(
+            (tail_tempo - 124.0).abs() <= 3.0,
+            "cold-re-locked tempo {tail_tempo:.2} not within ±3 of 124"
+        );
+    }
+
+    /// (d) A genuinely different tempo after a coast expiry does not warm-re-lock
+    /// off the stale 124 memory: the 90 BPM candidate sits outside `MEMORY_RELOCK_REL`,
+    /// so the tracker cold-locks at 90 only once confidence reaches `LOCK_ON`.
+    #[test]
+    fn different_tempo_does_not_warm_relock() {
+        let s = MemScenario {
+            bpm: 124.0,
+            lock_s: 8.0,
+            gap_s: 10.0,
+            gap_level: 0.30,
+            resume_s: 8.0,
+            resume_bpm: 90.0,
+            resume_amp: 1.0,
+            resume_floor: 0.0,
+            resume_shift: 0.0,
+        };
+        let (recs, rs, _) = run_memory_scenario(&s);
+
+        // The 124 memory is live at resume — but must go unused by the 90 train.
+        let mem_at_resume = recs[rs].remembered_bpm;
+        let (_, relock_conf) =
+            first_lock_after(&recs, rs).expect("never re-locked at the new tempo");
+        let (tail_tempo, tail_locked) = tail_stats(&recs, 1.0);
+
+        println!(
+            "beat::different_tempo_does_not_warm_relock: mem_at_resume {mem_at_resume:.1}, \
+             relock_conf {relock_conf:.3} (LOCK_ON {LOCK_ON}), tail_tempo {tail_tempo:.2}, \
+             tail_locked {tail_locked:.2}"
+        );
+
+        assert!(
+            (mem_at_resume - 124.0).abs() <= 4.0,
+            "the 124 memory was not live at resume (was {mem_at_resume:.1})"
+        );
+        assert!(
+            relock_conf >= LOCK_ON,
+            "re-lock at the new tempo happened below LOCK_ON (conf {relock_conf:.3}) — the 124 \
+             memory wrongly discounted a different tempo"
+        );
+        assert!(
+            (tail_tempo - 90.0).abs() <= 3.0,
+            "tracker did not cold-lock at 90 (tail_tempo {tail_tempo:.2}) — the memory dragged \
+             it back toward 124"
+        );
+        assert!(
+            tail_locked > 0.9,
+            "tracker did not firmly lock at the new tempo (frac {tail_locked:.2})"
+        );
+    }
+
+    /// (f) A warm re-lock aligns the phase *hard*, not soft: the free-run phase is
+    /// stale after seconds of no publishing, so it must snap to the current ODF
+    /// grid. The resumed grid is shifted half a period off the pre-gap grid; after
+    /// the warm re-lock the published phase tracks the *new* grid (≈0 at its
+    /// beats), which a carried/soft phase — still referenced to the old grid —
+    /// could not do (it would sit ≈0.5 at the new grid's beats).
+    #[test]
+    fn warm_relock_hard_aligns_phase() {
+        let s = MemScenario {
+            bpm: 124.0,
+            lock_s: 8.0,
+            gap_s: 10.0,
+            gap_level: 0.30,
+            resume_s: 8.0,
+            resume_bpm: 124.0,
+            resume_amp: 1.0,
+            resume_floor: 0.25,
+            resume_shift: 0.5, // resumed grid is half a period off the old one
+        };
+        let (recs, rs, rp) = run_memory_scenario(&s);
+
+        let (relock, relock_conf) =
+            first_lock_after(&recs, rs).expect("never re-locked after the gap");
+        // Confirm it is genuinely the warm path (below the cold threshold).
+        assert!(
+            relock_conf < LOCK_ON,
+            "re-lock confidence {relock_conf:.3} was not a warm re-lock"
+        );
+
+        // Reconstruct the resumed beat grid (the same schedule the harness drove).
+        let mut racc = 0.5f32.rem_euclid(1.0) * rp;
+        let mut beats = Vec::new();
+        for i in rs..recs.len() {
+            racc += 1.0;
+            if racc >= rp {
+                racc -= rp;
+                beats.push(i);
+            }
+        }
+
+        // Over the ~2 s after re-lock, published phase at the new grid's beats vs.
+        // at the old grid's positions (the midpoints, half a period away).
+        let win_end = (relock + hops(2.0)).min(recs.len());
+        let dist0 = |ph: f32| ph.min(1.0 - ph);
+        let mut worst_on_grid = 0.0f32;
+        let mut best_off_grid = 1.0f32; // smallest dist at the old-grid midpoints
+        let mut n = 0;
+        for &b in &beats {
+            if b <= relock || b >= win_end {
+                continue;
+            }
+            worst_on_grid = worst_on_grid.max(dist0(recs[b].est.phase));
+            let mid = b + (rp / 2.0).round() as usize;
+            if mid < recs.len() {
+                best_off_grid = best_off_grid.min(dist0(recs[mid].est.phase));
+            }
+            n += 1;
+        }
+        assert!(n >= 2, "not enough post-relock beats to judge phase ({n})");
+
+        println!(
+            "beat::warm_relock_hard_aligns_phase: relock_conf {relock_conf:.3}, \
+             worst_on_grid {worst_on_grid:.3}, best_off_grid {best_off_grid:.3} (n {n})"
+        );
+
+        assert!(
+            worst_on_grid <= 0.12,
+            "phase did not hard-snap to the resumed grid (worst dist {worst_on_grid:.3}) — \
+             a stale phase would not track the shifted grid"
+        );
+        assert!(
+            best_off_grid >= 0.35,
+            "phase sat near the *old* grid ({best_off_grid:.3}) — the re-lock carried the stale \
+             phase instead of aligning hard"
+        );
     }
 
     fn hops(seconds: f32) -> usize {
