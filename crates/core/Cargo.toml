@@ -8,10 +8,18 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["capture-cpal"]
+default = ["capture-cpal", "perf-mode"]
 # The cpal-based capture backend (Windows WASAPI loopback, Linux ALSA/PipeWire,
 # macOS Core Audio input). On by default.
 capture-cpal = ["dep:cpal"]
+# Windows-only opt-in "perf mode": a companion silent shared-mode render stream
+# (IAudioClient3) opened at the endpoint's minimum engine period, so a loopback
+# capture on that endpoint delivers packets at the fast cadence. On by default,
+# but it ONLY affects Windows: on every other platform the module is a
+# compile-everywhere stub whose `open` returns `Unsupported`, and the `windows`
+# crate it links is a `cfg(windows)` dependency that never enters a non-Windows
+# build. Reuses `DeviceSelector`, so it pulls in `capture-cpal`.
+perf-mode = ["capture-cpal", "dep:windows"]
 # Enable cpal's native PipeWire host so Linux can capture the system output mix
 # (a sink monitor). OFF by default: it links libpipewire development libraries
 # that are not present on every build host, so it must not ride in an
@@ -28,6 +36,24 @@ triple_buffer = "9"
 [dependencies.cpal]
 version = "0.18"
 optional = true
+
+# Perf mode's raw WASAPI COM backend. Windows-only (the crate itself is
+# `#![cfg(windows)]`) and optional, enabled by the `perf-mode` feature. Licensed
+# MIT OR Apache-2.0.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+optional = true
+features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Devices_FunctionDiscovery",
+]
 
 [dev-dependencies]
 # Golden-file DSP tests only: WAV fixture I/O and JSON golden files. None of
