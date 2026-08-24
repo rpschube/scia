@@ -33,7 +33,7 @@ impl Default for EngineConfig {
 }
 
 /// A snapshot of pipeline counters.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EngineStats {
     /// Cumulative frames dropped to ring overflow.
     pub dropped_frames: u64,
@@ -43,6 +43,9 @@ pub struct EngineStats {
     pub hops_processed: u64,
     /// Hops synthesized as silence during starvation.
     pub hops_synthesized: u64,
+    /// Latest display-spectrum AGC gain (1.0 with autosens off, or before the
+    /// first hop).
+    pub agc_gain: f32,
 }
 
 /// Why the engine could not start.
@@ -131,6 +134,7 @@ impl Engine {
             pushed_frames: self.stats.pushed_frames.load(Ordering::Relaxed),
             hops_processed: self.counters.hops_processed.load(Ordering::Relaxed),
             hops_synthesized: self.counters.hops_synthesized.load(Ordering::Relaxed),
+            agc_gain: f32::from_bits(self.counters.agc_gain_bits.load(Ordering::Relaxed)),
         }
     }
 
