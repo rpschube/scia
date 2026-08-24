@@ -17,6 +17,10 @@ pub const LIVE: Color = Color::Rgb(120, 200, 120);
 pub const QUIET: Color = Color::Rgb(210, 200, 120);
 /// The debug line.
 pub const DEBUG: Color = Color::Rgb(150, 150, 160);
+/// Background fill of the debug/performance overlay panel.
+pub const OVERLAY_BG: Color = Color::Rgb(16, 16, 22);
+/// Foreground of the overlay panel's text.
+pub const OVERLAY_FG: Color = Color::Rgb(200, 200, 210);
 
 /// The three-stop bar gradient, low to high.
 const STOP_LOW: (u8, u8, u8) = (20, 180, 170); // teal

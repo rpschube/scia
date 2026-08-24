@@ -36,6 +36,14 @@ pub struct UiState {
     pub source: String,
     /// Whether the debug line is currently shown.
     pub debug: bool,
+    /// Whether the full debug/performance overlay panel is currently shown. The
+    /// one-line [`debug`](UiState::debug) field is independent; both can be on.
+    pub overlay: bool,
+    /// Age of the newest feature — capture→now in milliseconds, computed by the
+    /// render loop each frame as `clock() - snap.timestamp_ns`. The rendered
+    /// frame adds up to one more frame interval on top. `0.0` on a default
+    /// state or under clock skew.
+    pub feature_age_ms: f32,
     /// Measured frame rate for the debug line.
     pub fps_measured: f32,
     /// Median frame render time (ms) for the debug line.
@@ -78,6 +86,9 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
     render_header(buf, header, snap, ui);
     if let Some(body) = body {
         render_body(buf, body, snap);
+        if ui.overlay {
+            render_overlay(buf, body, snap, ui);
+        }
     }
     if let Some(debug) = debug {
         render_debug(buf, debug, snap, ui);
@@ -248,6 +259,163 @@ fn render_debug(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiSta
     );
 }
 
+/// Number of rows the overlay panel occupies at the bottom of the body.
+const OVERLAY_ROWS: u16 = 5;
+/// Minimum body height that hosts the full panel; below it the overlay falls
+/// back to the single debug line. Twice the panel height so the panel never
+/// blankets the whole spectrum.
+const OVERLAY_MIN_BODY: u16 = 2 * OVERLAY_ROWS;
+/// An onset lamp stays lit this many milliseconds after the last onset.
+const ONSET_LAMP_MS: f32 = 150.0;
+/// The lit onset lamp.
+const LAMP_ON: char = '●';
+/// The dim onset lamp.
+const LAMP_OFF: char = '○';
+/// The one-row spectrum-strip ramp, lowest to highest (eight levels).
+const STRIP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// The feature age in milliseconds: `now_ns - timestamp_ns`, saturating to `0.0`
+/// under clock skew (a timestamp ahead of the clock). This is capture→now for
+/// the newest feature; the rendered frame adds up to one more frame interval.
+#[must_use]
+pub(crate) fn feature_age_ms(now_ns: u64, timestamp_ns: u64) -> f32 {
+    now_ns.saturating_sub(timestamp_ns) as f32 / 1.0e6
+}
+
+/// Map a `0.0..=1.0` value to one of the eight [`STRIP`] block characters, the
+/// same eighth-block ramp the body renderer draws with.
+fn strip_char(v: f32) -> char {
+    let level = (v.clamp(0.0, 1.0) * 8.0).ceil() as usize;
+    STRIP[level.clamp(1, 8) - 1]
+}
+
+/// The debug/performance overlay: a boxed panel painted over the bottom
+/// [`OVERLAY_ROWS`] rows of the body, showing every extracted signal live. When
+/// the body is shorter than [`OVERLAY_MIN_BODY`] there is no room for the panel,
+/// so it falls back to the single debug line on the body's bottom row.
+pub(crate) fn render_overlay(buf: &mut Buffer, body: Rect, snap: &FeatureSnapshot, ui: &UiState) {
+    if body.height < OVERLAY_MIN_BODY {
+        let line = Rect::new(body.x, body.y + body.height - 1, body.width, 1);
+        render_debug(buf, line, snap, ui);
+        return;
+    }
+    let panel = Rect::new(
+        body.x,
+        body.y + body.height - OVERLAY_ROWS,
+        body.width,
+        OVERLAY_ROWS,
+    );
+    render_overlay_panel(buf, panel, snap, ui);
+}
+
+/// Paint the five-row overlay panel: clear its area, frame it with side rails,
+/// then draw the five content lines. Values are right-truncated to the panel's
+/// interior width; the only per-draw allocations are the `format!`s, matching
+/// the debug line.
+fn render_overlay_panel(buf: &mut Buffer, panel: Rect, snap: &FeatureSnapshot, ui: &UiState) {
+    let fill = Style::new().bg(palette::OVERLAY_BG).fg(palette::OVERLAY_FG);
+    let rail = Style::new().bg(palette::OVERLAY_BG).fg(palette::DEBUG);
+
+    // Clear the panel to its background so the spectrum beneath does not bleed
+    // through, then draw the left/right rails that frame it.
+    for dy in 0..panel.height {
+        let y = panel.y + dy;
+        for dx in 0..panel.width {
+            if let Some(cell) = buf.cell_mut((panel.x + dx, y)) {
+                cell.set_char(' ').set_style(fill);
+            }
+        }
+        if let Some(cell) = buf.cell_mut((panel.x, y)) {
+            cell.set_char('│').set_style(rail);
+        }
+        if let Some(cell) = buf.cell_mut((panel.x + panel.width - 1, y)) {
+            cell.set_char('│').set_style(rail);
+        }
+    }
+
+    let inner_x = panel.x + 1;
+    let inner_w = panel.width.saturating_sub(2) as usize;
+    let s = &ui.stats;
+
+    let l1 = format!(
+        "fps {:.1} · frame p50/p99 {:.2}/{:.2}ms · dropped {} · xruns {} · reopens {}",
+        ui.fps_measured, ui.p50_frame_ms, ui.p99_frame_ms, s.dropped_frames, s.xruns, s.reopens,
+    );
+    buf.set_stringn(inner_x, panel.y, &l1, inner_w, fill);
+
+    let l2 = format!(
+        "capture: {} pushes · push {}f (max {}f) · gap max {:.1}ms · synth {} · age {:.1} ms",
+        s.pushes,
+        s.last_push_frames,
+        s.max_push_frames,
+        s.max_gap_ms,
+        s.hops_synthesized,
+        ui.feature_age_ms,
+    );
+    buf.set_stringn(inner_x, panel.y + 1, &l2, inner_w, fill);
+
+    let lamp = if snap.onset_age_ms <= ONSET_LAMP_MS {
+        LAMP_ON
+    } else {
+        LAMP_OFF
+    };
+    let l3 = format!(
+        "rms {:.2} peak {:.2} · bass/mid/treb {:.2}/{:.2}/{:.2} · width {:.2} · flux {:.2} · \
+         onset {} · beat {:.0} bpm {:.2}",
+        snap.rms,
+        snap.peak,
+        snap.bands[0],
+        snap.bands[1],
+        snap.bands[2],
+        snap.mid_side_ratio,
+        snap.flux,
+        lamp,
+        snap.tempo_bpm,
+        snap.beat_confidence,
+    );
+    buf.set_stringn(inner_x, panel.y + 2, &l3, inner_w, fill);
+
+    render_overlay_strip(buf, inner_x, panel.y + 3, inner_w, snap, fill);
+
+    let tier = ui.tier.unwrap_or("bars");
+    let src = ui.label.as_deref().filter(|l| !l.is_empty()).unwrap_or({
+        if ui.source.is_empty() {
+            "—"
+        } else {
+            ui.source.as_str()
+        }
+    });
+    let l5 = format!(
+        "tier {} · {} · schema v{} · activity {}",
+        tier,
+        src,
+        snap.schema_version,
+        activity_label(s.activity),
+    );
+    buf.set_stringn(inner_x, panel.y + 4, &l5, inner_w, fill);
+}
+
+/// One-row spectrum strip: the first `min(max_w, spectrum_len)` bars mapped to
+/// the eighth-block ramp, each coloured on the body gradient.
+fn render_overlay_strip(
+    buf: &mut Buffer,
+    x0: u16,
+    y: u16,
+    max_w: usize,
+    snap: &FeatureSnapshot,
+    fill: Style,
+) {
+    let bars = &snap.spectrum[..snap.spectrum_len as usize];
+    let n = bars.len().min(max_w);
+    for (i, &raw) in bars.iter().take(n).enumerate() {
+        let v = raw.clamp(0.0, 1.0);
+        if let Some(cell) = buf.cell_mut((x0 + i as u16, y)) {
+            cell.set_char(strip_char(v))
+                .set_style(fill.fg(palette::bar_color(v)));
+        }
+    }
+}
+
 /// Map a `0.0..=1.0` bar `value` onto a body of `height` cells, returning the
 /// number of completely filled cells and the eighth-index (`0..=7`) of the
 /// fractional top cell. `0` means no partial cell.
@@ -283,6 +451,33 @@ fn column_value(bars: &[f32], width: u16, x: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_age_is_capture_to_now() {
+        // 3 ms elapsed since the feature was captured.
+        assert_eq!(feature_age_ms(3_000_000, 0), 3.0);
+        // 1.5 ms.
+        assert_eq!(feature_age_ms(2_500_000, 1_000_000), 1.5);
+        // Zero age when the timestamp equals the clock.
+        assert_eq!(feature_age_ms(42, 42), 0.0);
+    }
+
+    #[test]
+    fn feature_age_clamps_clock_skew() {
+        // A timestamp ahead of the clock (skew) saturates to zero, never negative.
+        assert_eq!(feature_age_ms(1_000_000, 5_000_000), 0.0);
+        assert_eq!(feature_age_ms(0, u64::MAX), 0.0);
+    }
+
+    #[test]
+    fn strip_char_spans_the_ramp() {
+        assert_eq!(strip_char(0.0), '▁');
+        assert_eq!(strip_char(1.0), '█');
+        assert_eq!(strip_char(0.5), '▄');
+        // Out-of-range values clamp rather than panic.
+        assert_eq!(strip_char(-1.0), '▁');
+        assert_eq!(strip_char(2.0), '█');
+    }
 
     #[test]
     fn fill_cells_rounds_to_eighths() {
