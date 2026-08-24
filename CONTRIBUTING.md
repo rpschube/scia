@@ -21,9 +21,11 @@ comments, commit messages, branch names, issues, pull requests or documentation:
 Public writing shares the minimum the project needs. When in doubt, leave it
 out.
 
-These rules are enforced, not just requested: `.gitleaks.toml` extends the
-gitleaks defaults with project-specific rules, `scripts/privacy-scan.sh` runs
-in the pre-push hook and in CI on every pull request, and
+These rules are enforced, not just requested: `.gitleaks.toml` holds the
+project-specific rules and runs as its own pass next to the stock gitleaks
+secret rules, `scripts/privacy-scan.sh` runs both passes over history, the
+working tree, commit messages and author identities — in the pre-push hook
+and in CI on every pull request — and
 `scripts/privacy-selftest.sh` proves that every rule fires before the scan is
 trusted. Anything that reaches the public repository despite the gates is
 treated as permanently disclosed: rotate or react accordingly — rewriting
@@ -44,7 +46,7 @@ first time you build. On top of the toolchain you need a few tools:
 | ---------------- | ---------------------------------------------------- |
 | `just`           | every build and workflow command (never bare cargo)  |
 | `cargo-nextest`  | the test runner                                      |
-| `cargo-deny`     | licence, ban and source checks                       |
+| `cargo-deny`     | license, ban and source checks                       |
 | `cargo-sweep`    | reclaiming stale build output                        |
 | `gitleaks`       | the privacy scan                                     |
 
@@ -203,4 +205,4 @@ GPL/LGPL/AGPL algorithm sources are never vendored or linked; where such an
 algorithm is needed it is reimplemented from the published papers, with
 attribution in the documentation. Contributions are dual-licensed by default,
 as the README states — by submitting a change you agree to release it under
-both licences.
+both licenses.
