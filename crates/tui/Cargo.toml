@@ -9,4 +9,5 @@ rust-version.workspace = true
 
 [dependencies]
 scia-core = { path = "../core", version = "0.0.0" }
-scia-scenes = { path = "../scenes", version = "0.0.0" }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
