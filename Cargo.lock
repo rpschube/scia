@@ -2344,6 +2344,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "scia-core",
+ "scia-meta",
  "scia-scenes",
 ]
 

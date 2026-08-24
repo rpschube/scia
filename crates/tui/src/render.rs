@@ -12,6 +12,7 @@ use scia_core::{Activity, EngineStats, FeatureSnapshot};
 use scia_scenes::{SceneInfo, builtin_scenes};
 
 use crate::keymap::{InputAction, Keymap};
+use crate::nowplaying::{self, NowPlayingState};
 use crate::palette;
 
 /// Version string shown in the header, resolved from Cargo metadata.
@@ -81,6 +82,18 @@ pub struct UiState {
     pub paused: bool,
     /// Whether the in-app key help overlay is shown (toggled with `?`).
     pub help: bool,
+    /// Whether the now-playing panel is shown (toggled with the now-playing key).
+    pub show_now_playing: bool,
+    /// Whether the current track's art palette is applied to the live scene. Set
+    /// by the render loop when the palette key takes effect; drives the panel's
+    /// "palette applied" marker and the loop's toggle-back.
+    pub palette_applied: bool,
+    /// A one-shot request from the palette key, consumed by the render loop:
+    /// apply the art palette (or revert) on the next tick.
+    pub palette_pending: bool,
+    /// The now-playing metadata the loop keeps current from the backend event
+    /// stream. Empty (nothing playing) by default.
+    pub now_playing: NowPlayingState,
 }
 
 /// Compute the frame layout: the header row, the optional body area, and the
@@ -117,6 +130,10 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
         // The browser panel and cycle toast paint over the body, last, like the
         // meter bridge. Inert unless the browser is open or a toast is up.
         draw_scene_nav(buf, body, &ui.scene_nav);
+        // The now-playing panel paints over the body like the meter bridge.
+        if ui.show_now_playing {
+            nowplaying::draw_now_playing(buf, body, &ui.now_playing, ui.palette_applied);
+        }
         // The help overlay is the topmost body layer; inert unless toggled on.
         draw_help(buf, body, ui);
     }

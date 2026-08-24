@@ -151,6 +151,72 @@ pub fn extract(bytes: &[u8]) -> Result<ArtPalette, PaletteError> {
     Ok(build_palette(&clusters))
 }
 
+/// A decoded, downscaled RGB preview of album art, for a consumer that needs the
+/// pixels themselves (a coarse cell-mosaic preview) rather than a palette.
+///
+/// `pixels` is row-major `width * height` sRGB triples. Decoding lives here — in
+/// the one crate that already links the `image` decoder — so a UI consumer never
+/// takes an image dependency of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewImage {
+    /// Preview width in pixels.
+    pub width: u32,
+    /// Preview height in pixels.
+    pub height: u32,
+    /// Row-major sRGB pixels, `width * height` of them.
+    pub pixels: Vec<[u8; 3]>,
+}
+
+/// Decode encoded artwork and downscale it to fit within `max_w × max_h`,
+/// preserving aspect and never upscaling.
+///
+/// Like [`extract`], this is pure and synchronous and MUST run off the render
+/// path — it decodes and resizes, which is not free. It absorbs the same
+/// near-black padding crop [`extract`] uses, so a letterboxed SMTC thumbnail
+/// previews as the real cover rather than as bars.
+///
+/// # Errors
+///
+/// [`PaletteError::Decode`] if the bytes are not a supported/valid image,
+/// [`PaletteError::Empty`] if the decoded image has no pixels.
+pub fn decode_preview(bytes: &[u8], max_w: u32, max_h: u32) -> Result<PreviewImage, PaletteError> {
+    let img = image::load_from_memory(bytes).map_err(|e| PaletteError::Decode(e.to_string()))?;
+    let rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return Err(PaletteError::Empty);
+    }
+
+    // Same crop the palette uses, so a padded thumbnail previews cleanly.
+    let (x0, y0, x1, y1) = padding_crop(&rgb);
+    let cropped = image::imageops::crop_imm(&rgb, x0, y0, x1 - x0, y1 - y0).to_image();
+    let (cw, ch) = cropped.dimensions();
+
+    let max_w = max_w.max(1);
+    let max_h = max_h.max(1);
+    // Fit inside the box, preserving aspect; never upscale (`.min(1.0)`).
+    let scale = (f64::from(max_w) / f64::from(cw))
+        .min(f64::from(max_h) / f64::from(ch))
+        .min(1.0);
+    let nw = ((f64::from(cw) * scale).round() as u32).clamp(1, max_w);
+    let nh = ((f64::from(ch) * scale).round() as u32).clamp(1, max_h);
+
+    let small = if nw == cw && nh == ch {
+        cropped
+    } else {
+        // A filtered downscale (not the nearest sampling k-means uses): this is
+        // shown to a human, so a smooth reduction reads better.
+        image::imageops::resize(&cropped, nw, nh, FilterType::Triangle)
+    };
+
+    let pixels = small.pixels().map(|p| [p.0[0], p.0[1], p.0[2]]).collect();
+    Ok(PreviewImage {
+        width: nw,
+        height: nh,
+        pixels,
+    })
+}
+
 /// A cluster: its mean colour and how many pixels it holds.
 struct Cluster {
     mean: Oklab,
@@ -884,6 +950,72 @@ mod tests {
         );
         // Print the measurement so the runner surfaces it.
         println!("extraction_640x640_ms = {}", elapsed.as_secs_f64() * 1000.0);
+    }
+
+    #[test]
+    fn decode_preview_downscales_within_bounds() {
+        // A 100×100 solid image reduced into a 10×10 box → 10×10, all one colour.
+        let colour = [180, 90, 40];
+        let bytes = png_bytes(&solid(100, 100, colour));
+        let prev = decode_preview(&bytes, 10, 10).expect("preview");
+        assert_eq!((prev.width, prev.height), (10, 10));
+        assert_eq!(prev.pixels.len(), 100);
+        // A solid source stays solid through a filtered downscale.
+        for p in &prev.pixels {
+            let d = (0..3)
+                .map(|i| (i32::from(p[i]) - i32::from(colour[i])).abs())
+                .max()
+                .unwrap();
+            assert!(d <= 2, "pixel {p:?} drifted from {colour:?}");
+        }
+    }
+
+    #[test]
+    fn decode_preview_preserves_aspect() {
+        // 120 wide × 60 tall into a 10×10 box → width-bound, aspect kept: 10×5.
+        let bytes = png_bytes(&solid(120, 60, [30, 120, 200]));
+        let prev = decode_preview(&bytes, 10, 10).expect("preview");
+        assert_eq!((prev.width, prev.height), (10, 5));
+        assert_eq!(prev.pixels.len(), 50);
+    }
+
+    #[test]
+    fn decode_preview_never_upscales() {
+        // A tiny source is returned at its own size, not blown up to the box.
+        let bytes = png_bytes(&solid(4, 4, [10, 20, 30]));
+        let prev = decode_preview(&bytes, 100, 100).expect("preview");
+        assert_eq!((prev.width, prev.height), (4, 4));
+        assert_eq!(prev.pixels.len(), 16);
+    }
+
+    #[test]
+    fn decode_preview_crops_letterbox_bars() {
+        // A coloured core in thick black bars: the crop strips the bars, so the
+        // preview is the core's aspect (120×80 → 12×8 in a 12×12 box), not 12×12.
+        let core = [40, 190, 90];
+        let mut img = solid(200, 200, [0, 0, 0]);
+        for y in 60..140 {
+            for x in 40..160 {
+                img.put_pixel(x, y, Rgb(core));
+            }
+        }
+        let prev = decode_preview(&png_bytes(&img), 12, 12).expect("preview");
+        assert_eq!((prev.width, prev.height), (12, 8));
+        // Every previewed pixel is the core colour, never the black bars.
+        for p in &prev.pixels {
+            assert!(
+                p[1] > p[0] && p[1] > p[2],
+                "cropped pixel is core-ish: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_preview_undecodable_errors() {
+        assert!(matches!(
+            decode_preview(b"nonsense", 8, 8),
+            Err(PaletteError::Decode(_))
+        ));
     }
 
     #[test]
