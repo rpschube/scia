@@ -31,13 +31,71 @@ pub struct PerfModeConfig {
     /// The render endpoint to open the companion stream on. `Default` selects
     /// the default render endpoint (`eRender`, `eConsole`).
     pub device: DeviceSelector,
+    /// Refuse to open a useless companion stream on a driver-locked endpoint.
+    /// When `true`, [`PerfModeStream::open`] returns
+    /// [`CaptureError::Unsupported`] on an endpoint whose minimum engine period
+    /// is not below its default (no faster period exists to pull the endpoint
+    /// down to). When `false` (the default), `open` keeps its historical
+    /// behaviour and falls back to the default period. The engine sets this
+    /// `true`: it has already capability-detected the endpoint via
+    /// [`availability`] and only opens when a faster period exists.
+    pub require_fast: bool,
 }
 
 impl Default for PerfModeConfig {
     fn default() -> Self {
         Self {
             device: DeviceSelector::Default,
+            require_fast: false,
         }
+    }
+}
+
+/// The capability verdict for perf mode on an endpoint, decided before any
+/// render stream is opened. See [`classify`] for the rule and [`availability`]
+/// for the query that produces it.
+#[derive(Clone, Debug)]
+pub enum PerfModeAvailability {
+    /// The endpoint advertises a minimum engine period below its default, so a
+    /// companion stream can pull it down to a faster cadence.
+    Available {
+        /// The queried engine periods. `chosen_period_frames` is `0`: no stream
+        /// has been opened yet.
+        info: PerfModeInfo,
+    },
+    /// The endpoint's minimum engine period equals its default: no faster period
+    /// exists, so a companion stream would bring nothing.
+    DriverLocked {
+        /// The queried engine periods. `chosen_period_frames` is `0`.
+        info: PerfModeInfo,
+    },
+    /// Perf mode could not be evaluated: not Windows, no render endpoint, a COM
+    /// failure, or a degenerate period report. The string is a one-line reason.
+    Unsupported(String),
+}
+
+/// Classify an endpoint's engine periods into a [`PerfModeAvailability`]. Pure
+/// and platform-independent — it decides only from the numbers, so it compiles
+/// and unit-tests on every OS.
+///
+/// - Zero default or minimum period → [`PerfModeAvailability::Unsupported`]
+///   (a degenerate report; nothing can be decided).
+/// - `min < default` → [`PerfModeAvailability::Available`] (a faster period
+///   exists).
+/// - otherwise (`min == default`, or a degenerate `min > default`) →
+///   [`PerfModeAvailability::DriverLocked`] (no faster period).
+#[must_use]
+pub fn classify(info: &PerfModeInfo) -> PerfModeAvailability {
+    if info.default_period_frames == 0 || info.min_period_frames == 0 {
+        return PerfModeAvailability::Unsupported(format!(
+            "endpoint reported a degenerate engine period (default {} frames, min {} frames)",
+            info.default_period_frames, info.min_period_frames
+        ));
+    }
+    if info.min_period_frames < info.default_period_frames {
+        PerfModeAvailability::Available { info: *info }
+    } else {
+        PerfModeAvailability::DriverLocked { info: *info }
     }
 }
 
@@ -88,7 +146,7 @@ mod win_impl {
     use windows::Win32::Media::Audio::{
         AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         DEVICE_STATE_ACTIVE, IAudioClient3, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
-        MMDeviceEnumerator, eConsole, eRender,
+        MMDeviceEnumerator, WAVEFORMATEX, eConsole, eRender,
     };
     use windows::Win32::System::Com::StructuredStorage::{
         PropVariantClear, PropVariantToStringAlloc,
@@ -127,11 +185,12 @@ mod win_impl {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_thread = Arc::clone(&stop);
             let selector = config.device.clone();
+            let require_fast = config.require_fast;
             let (tx, rx) = mpsc::channel::<Result<PerfModeInfo, CaptureError>>();
 
             let join = thread::Builder::new()
                 .name("scia-perf-render".into())
-                .spawn(move || render_thread(&selector, &stop_thread, &tx))
+                .spawn(move || render_thread(&selector, require_fast, &stop_thread, &tx))
                 .map_err(|e| {
                     CaptureError::Backend(format!("failed to spawn perf render thread: {e}"))
                 })?;
@@ -171,21 +230,49 @@ mod win_impl {
         }
     }
 
-    /// Render-thread entry point: initialise COM for the thread, run the stream,
-    /// and tear COM down on exit. All COM objects live and die here.
-    fn render_thread(
+    /// Capability query: return the endpoint's engine periods **without opening
+    /// a render stream**. Runs on a short-lived COM thread, exactly like
+    /// [`PerfModeStream::open`], so the two share this query path.
+    ///
+    /// Off Windows this lives in the module's non-Windows arm; here it spawns a
+    /// probe thread, initialises COM on it, queries, and tears COM down.
+    pub fn availability(config: &super::PerfModeConfig) -> super::PerfModeAvailability {
+        let selector = config.device.clone();
+        let (tx, rx) = mpsc::channel::<Result<PerfModeInfo, CaptureError>>();
+
+        let join = match thread::Builder::new()
+            .name("scia-perf-probe".into())
+            .spawn(move || probe_thread(&selector, &tx))
+        {
+            Ok(join) => join,
+            Err(e) => {
+                return super::PerfModeAvailability::Unsupported(format!(
+                    "failed to spawn perf probe thread: {e}"
+                ));
+            }
+        };
+
+        let result = rx.recv();
+        let _ = join.join();
+        match result {
+            Ok(Ok(info)) => super::classify(&info),
+            Ok(Err(e)) => super::PerfModeAvailability::Unsupported(format!("{e}")),
+            Err(_) => super::PerfModeAvailability::Unsupported(
+                "perf probe thread exited before reporting".to_string(),
+            ),
+        }
+    }
+
+    /// Probe-thread entry point: initialise COM, query the endpoint periods, and
+    /// tear COM down. Sends the [`PerfModeInfo`] (or a [`CaptureError`]) once.
+    fn probe_thread(
         selector: &DeviceSelector,
-        stop: &Arc<AtomicBool>,
         tx: &mpsc::Sender<Result<PerfModeInfo, CaptureError>>,
     ) {
         // SAFETY: COM is initialised and uninitialised on this thread only, and
         // every COM object created below is confined to this thread.
         unsafe {
             let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-            // A fresh thread never has a conflicting apartment, but tolerate
-            // RPC_E_CHANGED_MODE defensively: it means COM is already up in a
-            // different mode (usable), and that call did not take a reference,
-            // so it must not be balanced with CoUninitialize.
             let com_owned = hr.is_ok();
             if hr.is_err() && hr != RPC_E_CHANGED_MODE {
                 let _ = tx.send(Err(CaptureError::Backend(format!(
@@ -194,9 +281,7 @@ mod win_impl {
                 return;
             }
 
-            if let Err(e) = run_render(selector, stop, tx) {
-                let _ = tx.send(Err(e));
-            }
+            let _ = tx.send(probe_periods(selector));
 
             if com_owned {
                 CoUninitialize();
@@ -204,22 +289,37 @@ mod win_impl {
         }
     }
 
-    /// Open, start and pump the companion stream. Reports the resolved
-    /// [`PerfModeInfo`] over `tx` exactly once on success, then renders silence
-    /// until `stop` is set. Returns `Err` only for a failure *before* the
-    /// success report; once reported, later faults just end the loop.
+    /// Create the enumerator, query the endpoint periods, and release the COM
+    /// objects. No render stream is opened.
     ///
     /// # Safety
-    /// Must run on a thread that has initialised COM (see [`render_thread`]).
-    unsafe fn run_render(
-        selector: &DeviceSelector,
-        stop: &Arc<AtomicBool>,
-        tx: &mpsc::Sender<Result<PerfModeInfo, CaptureError>>,
-    ) -> Result<(), CaptureError> {
+    /// Must run on a thread that has initialised COM (see [`probe_thread`]).
+    unsafe fn probe_periods(selector: &DeviceSelector) -> Result<PerfModeInfo, CaptureError> {
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(backend_err)?;
-            let device = resolve_device(&enumerator, selector)?;
+            let (client, mix, info) = query_periods(&enumerator, selector)?;
+            CoTaskMemFree(Some(mix.cast()));
+            drop(client);
+            Ok(info)
+        }
+    }
+
+    /// Resolve the endpoint, activate an [`IAudioClient3`], and read its mix
+    /// format and engine periods. Returns the live client and the caller-owned
+    /// mix-format pointer (the caller frees it with [`CoTaskMemFree`]) alongside
+    /// a [`PerfModeInfo`] whose `chosen_period_frames` is `0` — no stream is
+    /// opened here. Shared by the capability probe and the render open path.
+    ///
+    /// # Safety
+    /// Must run on a COM-initialised thread; the returned client and mix pointer
+    /// must be used and released on that same thread.
+    unsafe fn query_periods(
+        enumerator: &IMMDeviceEnumerator,
+        selector: &DeviceSelector,
+    ) -> Result<(IAudioClient3, *mut WAVEFORMATEX, PerfModeInfo), CaptureError> {
+        unsafe {
+            let device = resolve_device(enumerator, selector)?;
             let client: IAudioClient3 = device.Activate(CLSCTX_ALL, None).map_err(backend_err)?;
 
             let mix = client.GetMixFormat().map_err(backend_err)?;
@@ -241,6 +341,94 @@ mod win_impl {
             ) {
                 CoTaskMemFree(Some(mix.cast()));
                 return Err(backend_err(e));
+            }
+
+            let info = PerfModeInfo {
+                default_period_frames: default_p,
+                fundamental_period_frames: fundamental_p,
+                min_period_frames: min_p,
+                max_period_frames: max_p,
+                chosen_period_frames: 0,
+                sample_rate,
+                channels,
+            };
+            Ok((client, mix, info))
+        }
+    }
+
+    /// Render-thread entry point: initialise COM for the thread, run the stream,
+    /// and tear COM down on exit. All COM objects live and die here.
+    fn render_thread(
+        selector: &DeviceSelector,
+        require_fast: bool,
+        stop: &Arc<AtomicBool>,
+        tx: &mpsc::Sender<Result<PerfModeInfo, CaptureError>>,
+    ) {
+        // SAFETY: COM is initialised and uninitialised on this thread only, and
+        // every COM object created below is confined to this thread.
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            // A fresh thread never has a conflicting apartment, but tolerate
+            // RPC_E_CHANGED_MODE defensively: it means COM is already up in a
+            // different mode (usable), and that call did not take a reference,
+            // so it must not be balanced with CoUninitialize.
+            let com_owned = hr.is_ok();
+            if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+                let _ = tx.send(Err(CaptureError::Backend(format!(
+                    "CoInitializeEx failed: {hr:?}"
+                ))));
+                return;
+            }
+
+            if let Err(e) = run_render(selector, require_fast, stop, tx) {
+                let _ = tx.send(Err(e));
+            }
+
+            if com_owned {
+                CoUninitialize();
+            }
+        }
+    }
+
+    /// Open, start and pump the companion stream. Reports the resolved
+    /// [`PerfModeInfo`] over `tx` exactly once on success, then renders silence
+    /// until `stop` is set. Returns `Err` only for a failure *before* the
+    /// success report; once reported, later faults just end the loop.
+    ///
+    /// # Safety
+    /// Must run on a thread that has initialised COM (see [`render_thread`]).
+    unsafe fn run_render(
+        selector: &DeviceSelector,
+        require_fast: bool,
+        stop: &Arc<AtomicBool>,
+        tx: &mpsc::Sender<Result<PerfModeInfo, CaptureError>>,
+    ) -> Result<(), CaptureError> {
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(backend_err)?;
+            let (client, mix, info) = query_periods(&enumerator, selector)?;
+            let default_p = info.default_period_frames;
+            let fundamental_p = info.fundamental_period_frames;
+            let min_p = info.min_period_frames;
+            let sample_rate = info.sample_rate;
+            let channels = info.channels;
+
+            // When the caller requires a genuinely faster period, refuse a
+            // driver-locked endpoint instead of opening a companion stream that
+            // would run at the default period and bring nothing. The engine sets
+            // this after capability-detecting via `availability`.
+            if require_fast
+                && !matches!(
+                    super::classify(&info),
+                    super::PerfModeAvailability::Available { .. }
+                )
+            {
+                let ms = f64::from(default_p) * 1000.0 / f64::from(sample_rate.max(1));
+                CoTaskMemFree(Some(mix.cast()));
+                return Err(CaptureError::Unsupported(format!(
+                    "endpoint offers no engine period below the default \
+                     ({default_p} frames, {ms:.3} ms)"
+                )));
             }
 
             // Aim for the minimum period, rounded up to a multiple of the
@@ -320,7 +508,7 @@ mod win_impl {
                 default_period_frames: default_p,
                 fundamental_period_frames: fundamental_p,
                 min_period_frames: min_p,
-                max_period_frames: max_p,
+                max_period_frames: info.max_period_frames,
                 chosen_period_frames: chosen,
                 sample_rate,
                 channels,
@@ -429,7 +617,7 @@ mod win_impl {
 }
 
 #[cfg(windows)]
-pub use win_impl::PerfModeStream;
+pub use win_impl::{PerfModeStream, availability};
 
 /// Non-Windows stub: perf mode is a Windows-only capability. The type exists so
 /// callers compile everywhere; [`open`](PerfModeStream::open) always reports
@@ -453,5 +641,103 @@ impl PerfModeStream {
     #[must_use]
     pub fn info(&self) -> PerfModeInfo {
         PerfModeInfo::default()
+    }
+}
+
+/// Non-Windows stub: perf mode cannot be evaluated off Windows.
+#[cfg(not(windows))]
+#[must_use]
+pub fn availability(_config: &PerfModeConfig) -> PerfModeAvailability {
+    PerfModeAvailability::Unsupported("perf mode is Windows-only".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PerfModeAvailability, PerfModeInfo, classify};
+
+    /// An endpoint whose minimum period is below its default is `Available`.
+    #[test]
+    fn classify_available_when_min_below_default() {
+        let info = PerfModeInfo {
+            default_period_frames: 480,
+            fundamental_period_frames: 128,
+            min_period_frames: 128,
+            max_period_frames: 480,
+            chosen_period_frames: 0,
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        match classify(&info) {
+            PerfModeAvailability::Available { info: got } => assert_eq!(got, info),
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    /// An endpoint whose minimum period equals its default is `DriverLocked` —
+    /// the P1 onboard-codec case: no faster period to pull the endpoint down to.
+    #[test]
+    fn classify_driver_locked_when_min_equals_default() {
+        let info = PerfModeInfo {
+            default_period_frames: 480,
+            fundamental_period_frames: 480,
+            min_period_frames: 480,
+            max_period_frames: 480,
+            chosen_period_frames: 0,
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        match classify(&info) {
+            PerfModeAvailability::DriverLocked { info: got } => assert_eq!(got, info),
+            other => panic!("expected DriverLocked, got {other:?}"),
+        }
+    }
+
+    /// A degenerate `min > default` still means no usable faster period, so it
+    /// classifies as `DriverLocked` rather than `Available`.
+    #[test]
+    fn classify_driver_locked_when_min_above_default() {
+        let info = PerfModeInfo {
+            default_period_frames: 240,
+            fundamental_period_frames: 240,
+            min_period_frames: 480,
+            max_period_frames: 480,
+            chosen_period_frames: 0,
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        assert!(matches!(
+            classify(&info),
+            PerfModeAvailability::DriverLocked { .. }
+        ));
+    }
+
+    /// A zero default or minimum period is a degenerate report: `Unsupported`.
+    #[test]
+    fn classify_unsupported_on_zero_periods() {
+        let zero_min = PerfModeInfo {
+            default_period_frames: 480,
+            min_period_frames: 0,
+            ..PerfModeInfo::default()
+        };
+        assert!(matches!(
+            classify(&zero_min),
+            PerfModeAvailability::Unsupported(_)
+        ));
+
+        let zero_default = PerfModeInfo {
+            default_period_frames: 0,
+            min_period_frames: 128,
+            ..PerfModeInfo::default()
+        };
+        assert!(matches!(
+            classify(&zero_default),
+            PerfModeAvailability::Unsupported(_)
+        ));
+
+        // The all-zero default (nothing queried) is also Unsupported.
+        assert!(matches!(
+            classify(&PerfModeInfo::default()),
+            PerfModeAvailability::Unsupported(_)
+        ));
     }
 }
