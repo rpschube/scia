@@ -8,7 +8,7 @@
 //! capture path.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Ring capacity in **frames** (~170 ms at 48 kHz). The ring is always sized
@@ -70,6 +70,23 @@ pub struct SinkStats {
     pub last_push_ns: AtomicU64,
     /// Cumulative frames successfully written into the ring.
     pub pushed_frames: AtomicU64,
+    /// Number of non-empty pushes (capture-callback deliveries) so far. The
+    /// probe divides [`pushed_frames`] by this for the mean callback size.
+    ///
+    /// [`pushed_frames`]: SinkStats::pushed_frames
+    pub pushes: AtomicU64,
+    /// Frames delivered by the most recent push (whether or not they all fit
+    /// in the ring). `0` until the first push.
+    pub last_push_frames: AtomicU32,
+    /// Largest frame count seen in a single push. `0` until the first push.
+    pub max_push_frames: AtomicU32,
+    /// Largest interval, in nanoseconds, ever observed between two consecutive
+    /// pushes. `0` until at least two pushes have landed. A callback-cadence
+    /// metric for the probe; the DSP thread uses [`last_push_ns`] for its own
+    /// (independent) starvation check.
+    ///
+    /// [`last_push_ns`]: SinkStats::last_push_ns
+    pub max_gap_ns: AtomicU64,
     /// Interleaved channel count, set by the engine once the backend reports
     /// its format. `0` until then; frame accounting falls back to the ring's
     /// design width (stereo) in that startup window, which is exact for the
@@ -85,6 +102,10 @@ impl SinkStats {
             dropped_frames: AtomicU64::new(0),
             last_push_ns: AtomicU64::new(0),
             pushed_frames: AtomicU64::new(0),
+            pushes: AtomicU64::new(0),
+            last_push_frames: AtomicU32::new(0),
+            max_push_frames: AtomicU32::new(0),
+            max_gap_ns: AtomicU64::new(0),
             channels: AtomicU16::new(0),
             epoch,
         }
@@ -131,16 +152,33 @@ impl SampleSink {
     /// gap detection.
     pub fn push(&mut self, interleaved: &[f32]) {
         // Delivery time first: gap detection must see the attempt even if the
-        // ring is full and nothing is written.
-        self.stats
-            .last_push_ns
-            .store(self.stats.now_ns(), Ordering::Release);
+        // ring is full and nothing is written. `swap` hands back the previous
+        // delivery time so the callback-cadence gap can be measured without a
+        // second clock read.
+        let now = self.stats.now_ns();
+        let prev_push_ns = self.stats.last_push_ns.swap(now, Ordering::AcqRel);
 
         if interleaved.is_empty() {
             return;
         }
 
         let channels = self.stats.accounting_channels();
+
+        // Callback-cadence statistics (probe-facing; independent of the ring's
+        // success). Counted per non-empty push, on the delivered frame count.
+        let frames_in = (interleaved.len() / channels) as u32;
+        self.stats.pushes.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .last_push_frames
+            .store(frames_in, Ordering::Relaxed);
+        self.stats
+            .max_push_frames
+            .fetch_max(frames_in, Ordering::Relaxed);
+        if prev_push_ns != 0 {
+            self.stats
+                .max_gap_ns
+                .fetch_max(now.saturating_sub(prev_push_ns), Ordering::Relaxed);
+        }
         let available = self.producer.slots();
         // Never split a frame: writing a partial frame would misalign every
         // channel in the ring for the rest of the stream. Whole frames only;
@@ -250,10 +288,29 @@ pub fn sample_ring(epoch: Instant) -> (SampleSink, SampleConsumer) {
     )
 }
 
+/// Health of a live capture stream, read back through
+/// [`CaptureStream::health`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamHealth {
+    /// No stream error has been reported.
+    Ok,
+    /// The backend's error callback has fired at least once; the payload is the
+    /// most recent error message.
+    Errored(String),
+}
+
 /// A live capture stream. Dropping it stops capture.
 pub trait CaptureStream: Send {
     /// The negotiated stream format, fixed for the stream's lifetime.
     fn format(&self) -> StreamFormat;
+
+    /// Whether the stream's error callback has fired. The default returns
+    /// [`StreamHealth::Ok`] for backends (e.g. the synthetic source) that
+    /// cannot fail asynchronously; real hardware backends override it to
+    /// surface the device error that a data callback never sees.
+    fn health(&self) -> StreamHealth {
+        StreamHealth::Ok
+    }
 }
 
 /// A capture backend: opens a stream for a target, wiring it to a

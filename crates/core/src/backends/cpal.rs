@@ -1,0 +1,435 @@
+//! The cpal-based capture backend: one code path that captures the system
+//! output mix on every desktop platform cpal supports.
+//!
+//! - **Windows (WASAPI):** the system mix is captured by opening the *default
+//!   output device* and building an **input** stream on it. cpal's WASAPI host
+//!   turns an input stream on an output endpoint into a shared-mode loopback
+//!   capture of everything that endpoint is playing.
+//! - **Linux:** with [`prefer_pipewire`](CpalBackend::prefer_pipewire) and the
+//!   `capture-pipewire` feature compiled in, the PipeWire host is selected and
+//!   the default *output* device is opened as an input — a monitor of the sink,
+//!   i.e. the real system mix. Otherwise the default host (ALSA) is used and the
+//!   default *input* device is opened. **On plain ALSA that is the default
+//!   capture device (microphone-level), not the system mix.** Capturing system
+//!   audio on Linux needs either PipeWire (this feature) or an ALSA loopback /
+//!   monitor device selected by name via [`DeviceSelector::Named`].
+//! - **macOS (Core Audio):** the default *input* device, as a best-effort
+//!   placeholder; a true system-audio tap is a later card.
+//!
+//! The data callback does exactly one thing (Bencina rules — no allocation,
+//! locks, logging or syscalls): convert the incoming buffer to interleaved
+//! `f32` mono/stereo and push it to the ring. The conversion buffer is
+//! preallocated at open; a callback larger than it is processed in chunks, never
+//! reallocated. The error callback (which is allowed to lock, being off the
+//! data path) records the fault for [`CaptureStream::health`].
+
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+use super::convert::{
+    Downmix, convert_and_push, f32_id, i16_to_f32, i32_to_f32, u8_to_f32, u16_to_f32,
+};
+use crate::capture::{
+    CaptureBackend, CaptureError, CaptureStream, CaptureTarget, SampleSink, StreamFormat,
+    StreamHealth,
+};
+
+/// Fallback upper bound (in frames) for the preallocated conversion buffer when
+/// the backend reports no maximum buffer size. Matches the ring's frame span.
+const DEFAULT_CAP_FRAMES: usize = 8192;
+
+/// Which device a [`CpalBackend`] opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceSelector {
+    /// The platform default (default output on Windows / PipeWire, default input
+    /// on ALSA / Core Audio).
+    Default,
+    /// A device selected by its cpal name.
+    Named(String),
+}
+
+/// A cpal capture backend. Construct it with the device to open and, on Linux,
+/// whether to prefer the PipeWire sink monitor over the default host.
+#[derive(Clone, Debug)]
+pub struct CpalBackend {
+    /// The device to open.
+    pub device: DeviceSelector,
+    /// Linux only: prefer the PipeWire host (sink monitor = system mix) when the
+    /// `capture-pipewire` feature is compiled in and the host is available.
+    /// Ignored on other platforms and when the feature is absent.
+    pub prefer_pipewire: bool,
+}
+
+impl Default for CpalBackend {
+    fn default() -> Self {
+        Self {
+            device: DeviceSelector::Default,
+            prefer_pipewire: true,
+        }
+    }
+}
+
+/// Shared error state written by the stream's error callback and read back
+/// through [`CaptureStream::health`].
+#[derive(Default)]
+struct StreamErrorState {
+    /// Set once the error callback has fired at least once.
+    errored: AtomicBool,
+    /// The most recent error message. The error callback may lock — it does not
+    /// run on the data path.
+    last: Mutex<Option<String>>,
+}
+
+/// A live cpal capture stream. Dropping it stops and joins the cpal stream.
+struct CpalStream {
+    format: StreamFormat,
+    error_state: Arc<StreamErrorState>,
+    // Dropped last; keeps the callback (and its borrow of the sink) alive.
+    _stream: cpal::Stream,
+}
+
+impl CaptureStream for CpalStream {
+    fn format(&self) -> StreamFormat {
+        self.format
+    }
+
+    fn health(&self) -> StreamHealth {
+        if self.error_state.errored.load(Ordering::Acquire) {
+            let msg = self
+                .error_state
+                .last
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_else(|| "stream error".to_string());
+            StreamHealth::Errored(msg)
+        } else {
+            StreamHealth::Ok
+        }
+    }
+}
+
+impl CaptureBackend for CpalBackend {
+    fn open(
+        &mut self,
+        _target: CaptureTarget,
+        sink: SampleSink,
+    ) -> Result<Box<dyn CaptureStream>, CaptureError> {
+        let (device, supported) = self.resolve()?;
+        let stream = build_stream(&device, supported, sink)?;
+        Ok(Box::new(stream))
+    }
+}
+
+impl CpalBackend {
+    /// Resolve the device and its default stream configuration for the current
+    /// platform.
+    #[cfg(target_os = "windows")]
+    fn resolve(&self) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CaptureError> {
+        // System mix = the default output endpoint, opened as an input
+        // (shared-mode loopback).
+        let host = cpal::default_host();
+        let device = match &self.device {
+            DeviceSelector::Default => {
+                host.default_output_device().ok_or(CaptureError::NoDevice)?
+            }
+            DeviceSelector::Named(name) => find_by_name(output_devices(&host)?, name)?,
+        };
+        let supported = device.default_output_config().map_err(map_cpal_err)?;
+        Ok((device, supported))
+    }
+
+    /// Resolve the device and its default stream configuration for the current
+    /// platform.
+    #[cfg(target_os = "linux")]
+    fn resolve(&self) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CaptureError> {
+        // Prefer the PipeWire sink monitor (the real system mix) when asked and
+        // available. This whole branch only compiles with the feature; the
+        // fallback below is the plain-ALSA default-input path.
+        #[cfg(feature = "capture-pipewire")]
+        if self.prefer_pipewire && cpal::available_hosts().contains(&cpal::HostId::PipeWire) {
+            if let Ok(host) = cpal::host_from_id(cpal::HostId::PipeWire) {
+                let device = match &self.device {
+                    DeviceSelector::Default => {
+                        host.default_output_device().ok_or(CaptureError::NoDevice)?
+                    }
+                    DeviceSelector::Named(name) => find_by_name(output_devices(&host)?, name)?,
+                };
+                let supported = device.default_output_config().map_err(map_cpal_err)?;
+                return Ok((device, supported));
+            }
+        }
+
+        // Default host (ALSA): the default *input* device — microphone-level on
+        // plain ALSA, not the system mix.
+        let host = cpal::default_host();
+        let device = match &self.device {
+            DeviceSelector::Default => host.default_input_device().ok_or(CaptureError::NoDevice)?,
+            DeviceSelector::Named(name) => find_by_name(input_devices(&host)?, name)?,
+        };
+        let supported = device.default_input_config().map_err(map_cpal_err)?;
+        Ok((device, supported))
+    }
+
+    /// Resolve the device and its default stream configuration for the current
+    /// platform.
+    #[cfg(target_os = "macos")]
+    fn resolve(&self) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CaptureError> {
+        // Best-effort: default input. A Core Audio system tap is a later card.
+        let host = cpal::default_host();
+        let device = match &self.device {
+            DeviceSelector::Default => host.default_input_device().ok_or(CaptureError::NoDevice)?,
+            DeviceSelector::Named(name) => find_by_name(input_devices(&host)?, name)?,
+        };
+        let supported = device.default_input_config().map_err(map_cpal_err)?;
+        Ok((device, supported))
+    }
+
+    /// Resolve the device and its default stream configuration for the current
+    /// platform.
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    fn resolve(&self) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CaptureError> {
+        let host = cpal::default_host();
+        let device = match &self.device {
+            DeviceSelector::Default => host.default_input_device().ok_or(CaptureError::NoDevice)?,
+            DeviceSelector::Named(name) => find_by_name(input_devices(&host)?, name)?,
+        };
+        let supported = device.default_input_config().map_err(map_cpal_err)?;
+        Ok((device, supported))
+    }
+}
+
+/// Build, start and wrap the cpal input stream. Selects the per-sample-format
+/// converter once, preallocates the conversion buffer, and installs the data
+/// and error callbacks.
+fn build_stream(
+    device: &cpal::Device,
+    supported: cpal::SupportedStreamConfig,
+    mut sink: SampleSink,
+) -> Result<CpalStream, CaptureError> {
+    let sample_format = supported.sample_format();
+    let device_channels = supported.channels() as usize;
+    let sample_rate = supported.sample_rate();
+    if sample_rate == 0 || device_channels == 0 {
+        return Err(CaptureError::Unsupported(format!(
+            "device reported {sample_rate} Hz / {device_channels} channels"
+        )));
+    }
+    let config: cpal::StreamConfig = supported.config();
+
+    let downmix = Downmix::new(device_channels);
+    let out_channels = downmix.out_channels;
+
+    // Preallocate the conversion buffer for the largest plausible callback: the
+    // backend's max buffer size if it reports one, else DEFAULT_CAP_FRAMES.
+    let cap_frames = match supported.buffer_size() {
+        cpal::SupportedBufferSize::Range { max, .. } => (*max as usize).max(DEFAULT_CAP_FRAMES),
+        cpal::SupportedBufferSize::Unknown => DEFAULT_CAP_FRAMES,
+    };
+    let mut out_buf = vec![0.0f32; cap_frames * out_channels];
+
+    let format = StreamFormat {
+        sample_rate,
+        channels: out_channels as u16,
+    };
+
+    let error_state = Arc::new(StreamErrorState::default());
+    let err_state = Arc::clone(&error_state);
+    let error_callback = move |err: cpal::Error| {
+        // Off the data path: locking here is allowed.
+        if let Ok(mut slot) = err_state.last.lock() {
+            *slot = Some(err.to_string());
+        }
+        err_state.errored.store(true, Ordering::Release);
+    };
+
+    // Timeout `None`: wait for the backend to initialise the stream.
+    let timeout = None;
+
+    // One closure per sample format, selected here so the hot path carries no
+    // per-callback branch on the format.
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            config,
+            move |data: &[f32], _| {
+                convert_and_push(data, f32_id, &downmix, &mut out_buf, &mut sink)
+            },
+            error_callback,
+            timeout,
+        ),
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            config,
+            move |data: &[i16], _| {
+                convert_and_push(data, i16_to_f32, &downmix, &mut out_buf, &mut sink)
+            },
+            error_callback,
+            timeout,
+        ),
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            config,
+            move |data: &[u16], _| {
+                convert_and_push(data, u16_to_f32, &downmix, &mut out_buf, &mut sink)
+            },
+            error_callback,
+            timeout,
+        ),
+        cpal::SampleFormat::I32 => device.build_input_stream(
+            config,
+            move |data: &[i32], _| {
+                convert_and_push(data, i32_to_f32, &downmix, &mut out_buf, &mut sink)
+            },
+            error_callback,
+            timeout,
+        ),
+        cpal::SampleFormat::U8 => device.build_input_stream(
+            config,
+            move |data: &[u8], _| {
+                convert_and_push(data, u8_to_f32, &downmix, &mut out_buf, &mut sink)
+            },
+            error_callback,
+            timeout,
+        ),
+        other => {
+            return Err(CaptureError::Unsupported(format!(
+                "sample format {other:?} is not handled"
+            )));
+        }
+    }
+    .map_err(map_cpal_err)?;
+
+    stream.play().map_err(map_cpal_err)?;
+
+    Ok(CpalStream {
+        format,
+        error_state,
+        _stream: stream,
+    })
+}
+
+// The two enumeration helpers are each used only by some platforms' `resolve`
+// (output on Windows / PipeWire, input on ALSA / Core Audio), so one is dead on
+// any single target — that is expected, not a bug.
+
+/// Enumerate output devices, mapping enumeration failure to a capture error.
+#[allow(dead_code)]
+fn output_devices(host: &cpal::Host) -> Result<Vec<cpal::Device>, CaptureError> {
+    Ok(host.output_devices().map_err(map_cpal_err)?.collect())
+}
+
+/// Enumerate input devices, mapping enumeration failure to a capture error.
+#[allow(dead_code)]
+fn input_devices(host: &cpal::Host) -> Result<Vec<cpal::Device>, CaptureError> {
+    Ok(host.input_devices().map_err(map_cpal_err)?.collect())
+}
+
+/// Find a device by its cpal display name (the name printed by `--list`).
+#[allow(dead_code)]
+fn find_by_name(devices: Vec<cpal::Device>, name: &str) -> Result<cpal::Device, CaptureError> {
+    devices
+        .into_iter()
+        .find(|d| d.to_string() == name)
+        .ok_or(CaptureError::NoDevice)
+}
+
+/// Map a cpal error onto a [`CaptureError`], treating a missing device as
+/// [`CaptureError::NoDevice`] and everything else as a backend fault.
+fn map_cpal_err(err: cpal::Error) -> CaptureError {
+    match err.kind() {
+        cpal::ErrorKind::DeviceNotAvailable => CaptureError::NoDevice,
+        cpal::ErrorKind::UnsupportedConfig | cpal::ErrorKind::UnsupportedOperation => {
+            CaptureError::Unsupported(err.to_string())
+        }
+        _ => CaptureError::Backend(err.to_string()),
+    }
+}
+
+/// Which direction a [`DeviceInfo`] entry can serve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceKind {
+    /// A capture (input) device.
+    Input,
+    /// A playback (output) device.
+    Output,
+}
+
+/// One enumerated device, for a future `--list-devices` surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// The cpal device name (also the string [`DeviceSelector::Named`] matches).
+    pub name: String,
+    /// Whether this device is the host's default input.
+    pub is_default_input: bool,
+    /// Whether this device is the host's default output.
+    pub is_default_output: bool,
+    /// Input or output.
+    pub kind: DeviceKind,
+    /// The host that owns the device (e.g. `"alsa"`, `"wasapi"`, `"pipewire"`).
+    pub host: String,
+}
+
+/// Enumerate every device on every available cpal host, both directions.
+///
+/// Returns [`CaptureError::NoDevice`] only when no host yields any device; an
+/// otherwise-empty host contributes nothing but is not an error. Intended for a
+/// `--list-devices` command and diagnostics, never the hot path.
+///
+/// # Errors
+/// Propagates a [`CaptureError::Backend`] if a host cannot be initialised and no
+/// device could be listed at all.
+pub fn list_devices() -> Result<Vec<DeviceInfo>, CaptureError> {
+    let mut out = Vec::new();
+    let mut last_err: Option<CaptureError> = None;
+
+    for host_id in cpal::available_hosts() {
+        let host = match cpal::host_from_id(host_id) {
+            Ok(h) => h,
+            Err(e) => {
+                last_err = Some(map_cpal_err(e));
+                continue;
+            }
+        };
+        let host_name = host_id.to_string();
+
+        let default_in = host
+            .default_input_device()
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        let default_out = host
+            .default_output_device()
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+
+        if let Ok(devices) = host.input_devices() {
+            for d in devices {
+                let name = d.to_string();
+                out.push(DeviceInfo {
+                    is_default_input: !default_in.is_empty() && name == default_in,
+                    is_default_output: false,
+                    kind: DeviceKind::Input,
+                    host: host_name.clone(),
+                    name,
+                });
+            }
+        }
+        if let Ok(devices) = host.output_devices() {
+            for d in devices {
+                let name = d.to_string();
+                out.push(DeviceInfo {
+                    is_default_input: false,
+                    is_default_output: !default_out.is_empty() && name == default_out,
+                    kind: DeviceKind::Output,
+                    host: host_name.clone(),
+                    name,
+                });
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return Err(last_err.unwrap_or(CaptureError::NoDevice));
+    }
+    Ok(out)
+}

@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backends;
 pub mod bands;
 pub mod bus;
 pub mod capture;
@@ -27,11 +28,13 @@ pub mod onset;
 pub mod spectrum;
 pub mod synthetic;
 
+#[cfg(feature = "capture-cpal")]
+pub use backends::cpal::{CpalBackend, DeviceInfo, DeviceKind, DeviceSelector, list_devices};
 pub use bands::{BandConfig, BandSplitter};
 pub use bus::{FeatureReader, FeatureWriter, feature_bus};
 pub use capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, RING_FRAMES, SampleConsumer,
-    SampleSink, SinkStats, StreamFormat, sample_ring,
+    SampleSink, SinkStats, StreamFormat, StreamHealth, sample_ring,
 };
 pub use dsp::{DspConfig, HopProcessor};
 pub use engine::{Engine, EngineConfig, EngineError, EngineStats};
