@@ -98,8 +98,32 @@ grid (5.33 ms at 48 kHz), the 1 ms DSP poll while waiting for a partial hop, the
 
 ## Results
 
-Pending — filled in from the real-machine run.
+First live run — Windows 11 desktop, onboard Realtek endpoint (shared mode,
+48 kHz, 2 ch), default mode (perf mode off), 25 clicks at 400 ms spacing:
 
-| Run | Clicks | Matched | Missed | Spurious | emit→publish median | publish→observe median | emit→observe median | output delay median |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| | | | | | | | | |
+```
+clicks 25 · matched 25 · missed 0 · spurious 0
+                           min  median     p95     max   (ms)
+emit → publish           81.03   81.31   81.89   81.99
+publish → observe         0.75    1.36    2.17    2.19
+emit → observe           82.09   82.59   83.34   83.44
+output delay (cb→play)   39.65   39.85   39.94   39.94
+engine: pushes 1224 · dropped 0 · xruns 1 · hops 2293/0 (processed/synthesized)
+```
+
+Reading:
+
+- Detection is airtight: 25/25 matched, no drops, no synthesized hops, and
+  the feature bus adds ~1.4 ms (publish → observe).
+- The ~39.9 ms output delay is the probe player's own render buffering
+  (cpal's default WASAPI output stream) plus the click's intra-buffer
+  offset — it is NOT part of scia's capture path; a real player's audio is
+  already in the mix.
+- **Open question:** estimated playback → publish ≈ 41 ms median
+  (81.3 − 39.9), vs ~15–20 ms expected from the P1 cadence (10 ms loopback
+  packet + 5.3 ms hop + polls). Either cpal's output playback timestamp
+  underestimates the true chain (making the residual smaller than it looks)
+  or the loopback path buffers more than its packet cadence suggests. A
+  follow-up probe should cross-correlate raw ring samples against the
+  emitted click (sub-millisecond, no hop quantization) before the ≤ 33 ms
+  US-PERF-1 criterion is scored on this endpoint.
