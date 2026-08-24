@@ -36,9 +36,15 @@ struct Cli {
     #[arg(long)]
     demo: bool,
 
-    /// Which synthetic waveform the demo feed generates.
-    #[arg(long, value_enum, default_value_t = DemoSignal::Sine)]
+    /// Which synthetic waveform the demo feed generates. Defaults to the
+    /// musically plausible mix; `sine` and `clicks` keep the old probe signals.
+    #[arg(long, value_enum, default_value_t = DemoSignal::Music)]
     demo_signal: DemoSignal,
+
+    /// Tempo for the `music` demo signal, in BPM (clamped 40..=220). Ignored by
+    /// the `sine` and `clicks` signals.
+    #[arg(long, default_value_t = 112.0)]
+    demo_bpm: f32,
 
     /// Capture device name (exact match from --list-devices). Defaults to the
     /// system mix (Windows loopback / PipeWire sink) or the default input.
@@ -148,6 +154,8 @@ impl PresenterTier {
 /// The synthetic waveform choices for `--demo`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum DemoSignal {
+    /// A musically plausible mix (kick, hats, bass, pad, sparkle) on a beat grid.
+    Music,
     /// A 220 Hz sine at amplitude 0.5.
     Sine,
     /// 120 bpm clicks at amplitude 0.8.
@@ -155,8 +163,11 @@ enum DemoSignal {
 }
 
 impl DemoSignal {
-    fn signal(self) -> Signal {
+    /// The [`Signal`] to generate. `bpm` (already clamped) sets the tempo of the
+    /// music signal and is ignored by the others.
+    fn signal(self, bpm: f32) -> Signal {
         match self {
+            DemoSignal::Music => Signal::Music { bpm },
             DemoSignal::Sine => Signal::Sine {
                 hz: 220.0,
                 amp: 0.5,
@@ -253,8 +264,9 @@ fn print_device_table() -> ExitCode {
 
 /// Start the engine on the built-in synthetic feed and run the TUI.
 fn run_demo(cli: &Cli) -> ExitCode {
+    let bpm = cli.demo_bpm.clamp(40.0, 220.0);
     let backend = SyntheticBackend {
-        signal: cli.demo_signal.signal(),
+        signal: cli.demo_signal.signal(bpm),
         pacing: Pacing::Realtime,
         ..SyntheticBackend::default()
     };
@@ -266,6 +278,12 @@ fn run_demo(cli: &Cli) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // Headless demo: the same once-a-second status loop the live path uses, so
+    // the synthetic feed can be exercised with no terminal (CI, probes).
+    if cli.headless {
+        return run_headless(engine, reader, cli.seconds);
+    }
 
     // A `--scene-file` preset is loaded and its watcher started before the TUI
     // takes the terminal; `_watcher` must outlive `run` to keep the watch alive.
