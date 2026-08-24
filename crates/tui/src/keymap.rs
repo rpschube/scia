@@ -13,11 +13,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A runtime action a key can be bound to.
 ///
-/// Every variant is rebindable from the config `[keys]` table. [`NowPlaying`] is
-/// parsed and bindable but does nothing yet — its panel has not landed — and is
-/// unbound by default.
+/// Every variant is rebindable from the config `[keys]` table. [`NowPlaying`]
+/// toggles the now-playing panel (default `n`); [`Palette`] applies the current
+/// track's art palette to the live scene, and reverts to the scene's own palette
+/// when pressed again (default `p`).
 ///
 /// [`NowPlaying`]: InputAction::NowPlaying
+/// [`Palette`]: InputAction::Palette
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputAction {
     /// Cycle to the next scene (default `→`).
@@ -32,14 +34,17 @@ pub enum InputAction {
     Pause,
     /// Quit (default `q`).
     Quit,
-    /// Reserved for the now-playing panel; unbound by default.
+    /// Toggle the now-playing panel (default `n`).
     NowPlaying,
+    /// Apply the current track's art palette to the live scene, toggling back to
+    /// the scene's own palette on a second press (default `p`).
+    Palette,
 }
 
 impl InputAction {
     /// Every action, in a stable order. [`Keymap::action_for`] scans this order,
     /// so an earlier action wins if two are ever bound to the same chord.
-    pub const ALL: [InputAction; 7] = [
+    pub const ALL: [InputAction; 8] = [
         InputAction::SceneNext,
         InputAction::ScenePrev,
         InputAction::Browser,
@@ -47,6 +52,7 @@ impl InputAction {
         InputAction::Pause,
         InputAction::Quit,
         InputAction::NowPlaying,
+        InputAction::Palette,
     ];
 
     /// The config `[keys]` name this action is bound under.
@@ -60,6 +66,7 @@ impl InputAction {
             InputAction::Pause => "pause",
             InputAction::Quit => "quit",
             InputAction::NowPlaying => "now_playing",
+            InputAction::Palette => "palette",
         }
     }
 
@@ -74,6 +81,7 @@ impl InputAction {
             InputAction::Pause => "pause",
             InputAction::Quit => "quit",
             InputAction::NowPlaying => "now playing",
+            InputAction::Palette => "apply palette",
         }
     }
 
@@ -222,8 +230,10 @@ pub struct Keymap {
     pub pause: Option<KeyChord>,
     /// Quit.
     pub quit: Option<KeyChord>,
-    /// Now-playing panel (reserved; unbound by default).
+    /// Toggle the now-playing panel.
     pub now_playing: Option<KeyChord>,
+    /// Apply / revert the current track's art palette.
+    pub palette: Option<KeyChord>,
 }
 
 impl Default for Keymap {
@@ -235,7 +245,8 @@ impl Default for Keymap {
             overlay: Some(KeyChord::plain(KeyCode::Char('`'))),
             pause: Some(KeyChord::plain(KeyCode::Char(' '))),
             quit: Some(KeyChord::plain(KeyCode::Char('q'))),
-            now_playing: None,
+            now_playing: Some(KeyChord::plain(KeyCode::Char('n'))),
+            palette: Some(KeyChord::plain(KeyCode::Char('p'))),
         }
     }
 }
@@ -252,6 +263,7 @@ impl Keymap {
             InputAction::Pause => self.pause,
             InputAction::Quit => self.quit,
             InputAction::NowPlaying => self.now_playing,
+            InputAction::Palette => self.palette,
         }
     }
 
@@ -265,6 +277,7 @@ impl Keymap {
             InputAction::Pause => &mut self.pause,
             InputAction::Quit => &mut self.quit,
             InputAction::NowPlaying => &mut self.now_playing,
+            InputAction::Palette => &mut self.palette,
         };
         *slot = chord;
     }
@@ -362,7 +375,26 @@ mod tests {
         assert!(km.scene_next.unwrap().matches(&key(KeyCode::Right, false)));
         assert!(km.scene_prev.unwrap().matches(&key(KeyCode::Left, false)));
         assert!(km.pause.unwrap().matches(&key(KeyCode::Char(' '), false)));
-        assert_eq!(km.now_playing, None);
+        // The now-playing panel and palette-apply keys ship bound by default.
+        assert!(
+            km.now_playing
+                .unwrap()
+                .matches(&key(KeyCode::Char('n'), false))
+        );
+        assert!(km.palette.unwrap().matches(&key(KeyCode::Char('p'), false)));
+    }
+
+    #[test]
+    fn now_playing_and_palette_resolve_to_their_actions() {
+        let km = Keymap::default();
+        assert_eq!(
+            km.action_for(&key(KeyCode::Char('n'), false)),
+            Some(InputAction::NowPlaying)
+        );
+        assert_eq!(
+            km.action_for(&key(KeyCode::Char('p'), false)),
+            Some(InputAction::Palette)
+        );
     }
 
     #[test]

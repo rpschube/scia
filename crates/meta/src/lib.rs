@@ -82,4 +82,4 @@ pub mod smtc;
 
 pub mod palette;
 
-pub use palette::{ArtPalette, PaletteCache, PaletteError};
+pub use palette::{ArtPalette, PaletteCache, PaletteError, PreviewImage, decode_preview};

@@ -17,6 +17,7 @@
 
 mod keymap;
 mod mosaic;
+mod nowplaying;
 mod pacing;
 mod palette;
 mod presenter;
@@ -40,10 +41,14 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use scia_core::{Activity, EngineStats, FeatureReader, FeatureSnapshot, StreamHealth};
-use scia_scenes::{Preset, ReloadEvent, builtin_preset, builtin_scenes};
+use scia_scenes::{Palette, Preset, ReloadEvent, builtin_preset, builtin_scenes};
 
 pub use keymap::{ChordParseError, InputAction, KeyChord, Keymap, parse_chord};
 pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
+pub use nowplaying::{
+    ArtResult, DecodeJob, MetaRuntime, NowPlayingState, TrackArt, art_palette_to_scene,
+    draw_now_playing, extrapolated_position,
+};
 pub use presenter::{SceneError, ScenePresenter, build_scene_presenter};
 pub use probe::{
     CapabilityReport, Da1, SyncSupport, TermFamily, classify_family, default_tier, parse_cell_size,
@@ -308,6 +313,15 @@ fn run_loop(
     // identical frame every tick.
     let mut pause_state = PauseState::default();
 
+    // The now-playing runtime: the platform backend (MPRIS/SMTC) plus a decode
+    // worker, wired by channels. Absence is normal — no backend or no media
+    // session leaves the state empty and the panel quiet. Dropped at loop exit,
+    // which stops the backend and joins the worker.
+    let meta = MetaRuntime::spawn();
+    // The scene's own palette, remembered when an art palette is applied so the
+    // palette key can crossfade back to it.
+    let mut scene_base_palette: Option<Palette> = None;
+
     let mut frames: u64 = 0;
     // When the current continuous starvation began, if any.
     let mut starved_since: Option<Instant> = None;
@@ -348,10 +362,37 @@ fn run_loop(
             if let Some(p) = presenter.as_mut() {
                 if let Some(Ok(preset)) = builtin_preset(id) {
                     p.swap_preset(&preset);
+                    // The new scene carries its own palette; a swap cancels the
+                    // applied art palette so a later palette key re-captures the
+                    // new base.
+                    ui.palette_applied = false;
+                    scene_base_palette = None;
                 }
             }
         }
         ui.scene_nav.tick(scene_dt);
+
+        // Drain now-playing backend events into the state, dispatching artwork to
+        // the decode worker, then fold in any finished decodes. Both are
+        // non-blocking, so a quiet or absent backend costs a couple of empty
+        // `try_recv`s per frame.
+        while let Some(ev) = meta.try_event() {
+            if let Some(job) = ui.now_playing.apply_event(ev) {
+                meta.submit(job);
+            }
+        }
+        while let Some(res) = meta.try_result() {
+            ui.now_playing
+                .apply_art(res.track_key, res.preview, res.palette);
+        }
+
+        // Resolve a palette-key request here, where the presenter lives: apply the
+        // current track's palette via crossfade, revert to the scene's own, or —
+        // with no scene or no art — note it rather than erroring.
+        if std::mem::take(&mut ui.palette_pending) {
+            apply_palette_toggle(presenter.as_mut(), &mut ui, &mut scene_base_palette);
+            notice_deadline = Some(frame_start + NOTICE_TTL);
+        }
 
         // Refresh the engine counters first: activity feeds the idle downshift.
         ui.stats = stats();
@@ -445,6 +486,16 @@ fn run_loop(
                         // The browser panel and cycle toast paint over the live
                         // scene, like the meter bridge, so they draw after it.
                         render::draw_scene_nav(frame.buffer_mut(), body, &ui.scene_nav);
+                        // The now-playing panel paints over the scene, like the
+                        // meter bridge.
+                        if ui.show_now_playing {
+                            nowplaying::draw_now_playing(
+                                frame.buffer_mut(),
+                                body,
+                                &ui.now_playing,
+                                ui.palette_applied,
+                            );
+                        }
                         // The help overlay is the topmost body layer.
                         render::draw_help(frame.buffer_mut(), body, &ui);
                     }
@@ -634,12 +685,51 @@ fn apply_action(action: InputAction, ui: &mut UiState, browsing: bool) -> Action
             ui.paused = !ui.paused;
             Action::Redraw
         }
-        // Reserved: the now-playing panel has not landed, so a bound key is a
-        // no-op for now. The browser/cycle guards fall through here too.
-        InputAction::NowPlaying
-        | InputAction::Browser
-        | InputAction::SceneNext
-        | InputAction::ScenePrev => Action::None,
+        // Toggle the now-playing panel. Works in every mode, paused or not.
+        InputAction::NowPlaying => {
+            ui.show_now_playing = !ui.show_now_playing;
+            Action::Redraw
+        }
+        // Request a palette apply/revert; the loop decides on the next tick
+        // (it owns the presenter), so this only raises the one-shot flag.
+        InputAction::Palette => {
+            ui.palette_pending = true;
+            Action::Redraw
+        }
+        // The browser/cycle guards fall through here when not in scene mode.
+        InputAction::Browser | InputAction::SceneNext | InputAction::ScenePrev => Action::None,
+    }
+}
+
+/// Resolve a palette-key press: apply the current track's art palette to the
+/// live scene via crossfade, or, if it is already applied, revert to the scene's
+/// own palette. With no presenter (direct-bars / no `--scene`) or no decoded art
+/// (demo, nothing playing) it is a no-op that leaves a short status note rather
+/// than erroring. Sets `ui.notice` in every branch.
+fn apply_palette_toggle(
+    presenter: Option<&mut ScenePresenter>,
+    ui: &mut UiState,
+    scene_base: &mut Option<Palette>,
+) {
+    let Some(p) = presenter else {
+        ui.notice = Some("no scene to theme".to_string());
+        return;
+    };
+    if ui.palette_applied {
+        // Revert: crossfade back to the remembered scene palette.
+        let base = scene_base.take().unwrap_or_else(|| p.palette());
+        p.fade_palette(base);
+        ui.palette_applied = false;
+        ui.notice = Some("scene palette".to_string());
+    } else if let Some(art) = ui.now_playing.art_palette() {
+        // Apply: remember the scene palette, then crossfade to the art palette.
+        let art_palette = art_palette_to_scene(art);
+        *scene_base = Some(p.palette());
+        p.fade_palette(art_palette);
+        ui.palette_applied = true;
+        ui.notice = Some("art palette".to_string());
+    } else {
+        ui.notice = Some("nothing playing".to_string());
     }
 }
 
@@ -865,6 +955,124 @@ mod tests {
             Action::Redraw
         ));
         assert!(!ui.paused, "space should resume");
+    }
+
+    #[test]
+    fn n_toggles_the_now_playing_panel() {
+        let mut ui = UiState::default();
+        assert!(!ui.show_now_playing);
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('n')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(ui.show_now_playing, "n opens the now-playing panel");
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('n')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(!ui.show_now_playing, "n closes it again");
+    }
+
+    #[test]
+    fn now_playing_toggles_while_paused() {
+        // The panel toggle is independent of pause: a paused scene can still open
+        // and close the now-playing panel.
+        let mut ui = UiState {
+            paused: true,
+            ..UiState::default()
+        };
+        let _ = handle_event(press(KeyCode::Char('n')), &mut ui);
+        assert!(ui.show_now_playing, "panel opens while paused");
+        assert!(ui.paused, "toggling the panel does not resume");
+        let _ = handle_event(press(KeyCode::Char('n')), &mut ui);
+        assert!(!ui.show_now_playing, "panel closes while still paused");
+        assert!(ui.paused);
+    }
+
+    #[test]
+    fn p_raises_a_palette_request() {
+        // `p` only raises the one-shot request; the loop resolves it against the
+        // presenter on the next tick.
+        let mut ui = UiState::default();
+        assert!(!ui.palette_pending);
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('p')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(ui.palette_pending, "p requests a palette apply/revert");
+    }
+
+    #[test]
+    fn palette_toggle_no_ops_without_a_scene() {
+        // With no presenter (direct-bars) the toggle notes it and never flips.
+        let mut ui = UiState::default();
+        let mut base = None;
+        apply_palette_toggle(None, &mut ui, &mut base);
+        assert!(!ui.palette_applied);
+        assert_eq!(ui.notice.as_deref(), Some("no scene to theme"));
+    }
+
+    #[test]
+    fn palette_toggle_notes_nothing_playing_when_no_art() {
+        // A presenter exists but nothing is playing: a no-op with a status note.
+        let preset = builtin_preset("spectra").expect("preset").expect("parses");
+        let mut p = presenter::ScenePresenter::from_preset(&preset, Tier::Half);
+        let mut ui = UiState::default();
+        let mut base = None;
+        apply_palette_toggle(Some(&mut p), &mut ui, &mut base);
+        assert!(!ui.palette_applied, "no art means nothing to apply");
+        assert_eq!(ui.notice.as_deref(), Some("nothing playing"));
+    }
+
+    #[test]
+    fn palette_toggle_applies_and_reverts_with_art() {
+        use scia_meta::ArtPalette;
+        let preset = builtin_preset("spectra").expect("preset").expect("parses");
+        let mut p = presenter::ScenePresenter::from_preset(&preset, Tier::Half);
+        let scene_palette = p.palette();
+
+        // Seed a now-playing track with a decoded art palette.
+        let track = scia_meta::NowPlaying::new(
+            Some("T".into()),
+            Some("A".into()),
+            None,
+            scia_meta::PlaybackStatus::Playing,
+            None,
+            None,
+        );
+        let key = track.track_key.clone();
+        let mut ui = UiState::default();
+        ui.now_playing.current = Some(track);
+        ui.now_playing.apply_art(
+            key,
+            scia_meta::PreviewImage {
+                width: 1,
+                height: 1,
+                pixels: vec![[9, 9, 9]],
+            },
+            ArtPalette {
+                dominant: [200, 10, 10],
+                accents: vec![],
+                light: [255, 60, 60],
+                dark: [90, 0, 0],
+                slots: [[200, 10, 10]; 8],
+            },
+        );
+
+        let mut base = None;
+        // Apply: remembers the scene palette and starts a fade toward the art one.
+        apply_palette_toggle(Some(&mut p), &mut ui, &mut base);
+        assert!(ui.palette_applied);
+        assert_eq!(base, Some(scene_palette), "the scene palette is remembered");
+        assert!(p.is_palette_fading());
+
+        // Revert: fades back to the remembered scene palette.
+        apply_palette_toggle(Some(&mut p), &mut ui, &mut base);
+        assert!(!ui.palette_applied);
+        for _ in 0..12 {
+            p.frame(&scia_core::FeatureSnapshot::default(), 0.05);
+        }
+        assert_eq!(p.palette(), scene_palette, "reverts to the scene palette");
     }
 
     #[test]

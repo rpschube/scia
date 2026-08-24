@@ -41,6 +41,20 @@ struct Fade {
     elapsed: f32,
 }
 
+/// A palette cross-fade in progress: the endpoints and how far into [`FADE_SECS`]
+/// it has advanced. Unlike a preset [`Fade`], this interpolates the palette
+/// itself and keeps the current layers, so a track's colours ease in without a
+/// hard snap and without duplicating the scene stack.
+#[derive(Clone, Copy, Debug)]
+struct PaletteFade {
+    /// The palette the fade started from.
+    from: Palette,
+    /// The palette the fade is easing toward.
+    to: Palette,
+    /// Seconds elapsed since the palette fade began.
+    elapsed: f32,
+}
+
 pub struct ScenePresenter {
     tier: Tier,
     fb: FrameBuffer,
@@ -66,6 +80,8 @@ pub struct ScenePresenter {
     fb_out_ready: bool,
     /// The active cross-fade, if any.
     fade: Option<Fade>,
+    /// The active palette cross-fade, if any.
+    palette_fade: Option<PaletteFade>,
 }
 
 impl ScenePresenter {
@@ -97,6 +113,7 @@ impl ScenePresenter {
             fb_out: FrameBuffer::new(),
             fb_out_ready: false,
             fade: None,
+            palette_fade: None,
         }
     }
 
@@ -135,6 +152,31 @@ impl ScenePresenter {
     #[must_use]
     pub fn is_fading(&self) -> bool {
         self.fade.is_some()
+    }
+
+    /// The palette the presenter is currently rendering with.
+    #[must_use]
+    pub fn palette(&self) -> Palette {
+        self.palette
+    }
+
+    /// Whether a palette cross-fade is currently in progress.
+    #[must_use]
+    pub fn is_palette_fading(&self) -> bool {
+        self.palette_fade.is_some()
+    }
+
+    /// Cross-fade the host palette to `to` over [`FADE_SECS`], keeping the
+    /// current layers and their animation. The colours ease from the presenter's
+    /// current palette to `to` frame by frame — no hard colour snap — reusing the
+    /// same frame/`dt` drive the preset fade uses. Applying the current track's
+    /// palette and reverting to the scene's own palette are both just calls here.
+    pub fn fade_palette(&mut self, to: Palette) {
+        self.palette_fade = Some(PaletteFade {
+            from: self.palette,
+            to,
+            elapsed: 0.0,
+        });
     }
 
     /// Swap in a new preset, carrying scene continuity and starting a 300 ms
@@ -180,6 +222,9 @@ impl ScenePresenter {
         self.fb_out.resize(self.cols, self.rows, self.tier);
         self.fb_out_ready = true;
         self.fade = Some(Fade { elapsed: 0.0 });
+        // A preset swap sets its own palette; abandon any in-flight palette fade
+        // rather than let it fight the new scene's colours.
+        self.palette_fade = None;
     }
 
     /// Advance and rasterize one frame from the newest features.
@@ -191,6 +236,20 @@ impl ScenePresenter {
     /// layers paint in order into one buffer; the encoded [`CellGrid`] is
     /// produced last.
     pub fn frame(&mut self, snap: &FeatureSnapshot, dt: f32) {
+        // Advance an active palette fade first, so the layers rasterize with the
+        // interpolated palette this frame.
+        if let Some(mut pf) = self.palette_fade {
+            pf.elapsed += dt.max(0.0);
+            let t = (pf.elapsed / FADE_SECS).clamp(0.0, 1.0);
+            self.palette = lerp_palette(&pf.from, &pf.to, t);
+            if pf.elapsed >= FADE_SECS {
+                self.palette = pf.to;
+                self.palette_fade = None;
+            } else {
+                self.palette_fade = Some(pf);
+            }
+        }
+
         // The incoming (or, without a fade, the only) layers rasterize into the
         // primary buffer.
         Self::rasterize_layers(
@@ -308,6 +367,18 @@ fn to_color((r, g, b): (u8, u8, u8)) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// Interpolate every slot of two palettes at `t` in `0.0..=1.0` (sRGB-linear in
+/// byte space — plenty for a UI colour crossfade).
+fn lerp_palette(a: &Palette, b: &Palette, t: f32) -> Palette {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    let mut slots = a.slots;
+    for (dst, (sa, sb)) in slots.iter_mut().zip(a.slots.iter().zip(b.slots.iter())) {
+        *dst = Rgb(lerp(sa.0, sb.0), lerp(sa.1, sb.1), lerp(sa.2, sb.2));
+    }
+    Palette { slots }
+}
+
 /// A failure to build a [`ScenePresenter`] from a `--scene` name: the preset was
 /// unknown, or it existed but failed validation. The [`Display`] is a
 /// user-facing message; for an unknown name it lists the available presets.
@@ -389,5 +460,102 @@ mod tests {
         p.frame(&snap, 0.1);
         let resumed = snapshot_buffer(&p, cols, rows);
         assert_ne!(before, resumed, "resuming (dt>0) must advance the scene");
+    }
+
+    /// A distinctive flat palette, far from any scene default, so a swap is
+    /// unmistakable in both the palette values and the rendered frame.
+    fn flat_palette(c: Rgb) -> Palette {
+        Palette { slots: [c; 8] }
+    }
+
+    #[test]
+    fn palette_fade_interpolates_without_snapping() {
+        // spectra's geometry is a pure function of the snapshot (no dt drift), so
+        // with a fixed snapshot the frame changes only when the palette changes.
+        let preset = builtin_preset("spectra")
+            .expect("spectra is a built-in preset")
+            .expect("spectra parses");
+        let mut p = ScenePresenter::from_preset(&preset, Tier::Half);
+        let (cols, rows) = (24u16, 12u16);
+        p.resize(cols, rows);
+
+        let mut snap = FeatureSnapshot::default();
+        for (i, bar) in snap.spectrum.iter_mut().enumerate() {
+            *bar = 0.4 + 0.5 * ((i % 5) as f32) / 5.0;
+        }
+        snap.spectrum_len = snap.spectrum.len() as u16;
+
+        // Warm to a steady geometry so only the palette moves afterwards.
+        let base_palette = p.palette();
+        for _ in 0..80 {
+            p.frame(&snap, 0.05);
+        }
+        let scene_buf = snapshot_buffer(&p, cols, rows);
+
+        let target = flat_palette(Rgb(255, 0, 0));
+        p.fade_palette(target);
+        assert!(p.is_palette_fading());
+
+        // Halfway (FADE_SECS = 0.3): the interpolated palette differs from both
+        // endpoints — a true crossfade, not a jump.
+        p.frame(&snap, 0.05);
+        p.frame(&snap, 0.05);
+        p.frame(&snap, 0.05);
+        let mid_palette = p.palette();
+        assert_ne!(mid_palette, base_palette, "mid palette is not the scene's");
+        assert_ne!(mid_palette, target, "mid palette is not the target yet");
+        let mid_buf = snapshot_buffer(&p, cols, rows);
+
+        // Finish the fade.
+        for _ in 0..10 {
+            p.frame(&snap, 0.05);
+        }
+        assert!(!p.is_palette_fading(), "the fade completes");
+        assert_eq!(
+            p.palette(),
+            target,
+            "the palette lands exactly on the target"
+        );
+        let art_buf = snapshot_buffer(&p, cols, rows);
+
+        // The rendered frames confirm no hard snap: the mid frame differs from
+        // both endpoints, and the endpoints themselves differ.
+        assert_ne!(
+            mid_buf, scene_buf,
+            "mid frame differs from the scene endpoint"
+        );
+        assert_ne!(mid_buf, art_buf, "mid frame differs from the art endpoint");
+        assert_ne!(scene_buf, art_buf, "the palette visibly changed the frame");
+    }
+
+    #[test]
+    fn palette_fade_toggles_back_to_the_scene_palette() {
+        let preset = builtin_preset("spectra")
+            .expect("spectra is a built-in preset")
+            .expect("spectra parses");
+        let mut p = ScenePresenter::from_preset(&preset, Tier::Half);
+        p.resize(16, 8);
+        let scene_palette = p.palette();
+
+        // Apply an art palette and let it settle.
+        p.fade_palette(flat_palette(Rgb(12, 200, 60)));
+        for _ in 0..10 {
+            p.frame(&FeatureSnapshot::default(), 0.05);
+        }
+        assert_ne!(p.palette(), scene_palette);
+
+        // Toggle back: fade to the remembered scene palette.
+        p.fade_palette(scene_palette);
+        // Mid-fade it is neither endpoint.
+        p.frame(&FeatureSnapshot::default(), 0.05);
+        assert!(p.is_palette_fading());
+        for _ in 0..10 {
+            p.frame(&FeatureSnapshot::default(), 0.05);
+        }
+        assert_eq!(
+            p.palette(),
+            scene_palette,
+            "reverts exactly to the scene palette"
+        );
     }
 }

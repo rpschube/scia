@@ -43,14 +43,15 @@ CONFIG:
     Windows:  %APPDATA%\\scia\\config.toml
   [defaults]  scene, presenter, overlay, perf_mode, demo_bpm
   [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
-              quit, now_playing. A value is a single character, a named key
-              (tab, esc, left, right, up, down, enter, space, backtick), or
+              quit, now_playing, palette. A value is a single character, a named
+              key (tab, esc, left, right, up, down, enter, space, backtick), or
               ctrl+<key>. Unknown actions or unparseable keys warn and are
               ignored.
 
 KEYS (defaults, all rebindable; press ? in-app for the active map):
   right/left  next / prev scene      tab    scene browser
   `           debug overlay          space  pause         q  quit
+  n           now-playing panel      p      apply palette
   esc         back (browser) / quit  ?      toggle help
 
 EXIT CODES:
