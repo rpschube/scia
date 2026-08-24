@@ -1,0 +1,67 @@
+# verso — the typographic preset: the track title is the analyzer.
+#
+# This is a copy-and-edit template: every table and key the preset format
+# understands appears here, either set or shown in a comment. See
+# docs/presets.md for the full reference (types, ranges, the feature
+# vocabulary, curve formulas, envelope semantics and the error format).
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric).
+name = "verso"
+# Required. A registered scene id. `verso` renders the track title as glyphs
+# that each ride a spectrum band.
+scene = "verso"
+# Optional. A one-line human description.
+description = "The track title is the analyzer: each letter rides its own spectrum band, floating and shedding a dotted falling trail."
+# Optional. A one-word mood; defaults to the scene's own mood ("literal").
+mood = "literal"
+
+# Typed parameters for the preset's scene. Every key must exist in the scene's
+# parameter manifest; every value is a number within the stated range. Omitted
+# keys keep their manifest default.
+[params]
+# baseline  0.58   range 0.2..=0.85   resting vertical position of the letters (fraction of height)
+baseline = 0.58
+# lift      0.34   range 0.0..=0.6    how far a letter rises above the baseline at full band
+lift = 0.34
+# trail     1.0    range 0.0..=2.0    trail lifetime multiplier (0 disables the trail)
+trail = 1.0
+# fall      0.25   range 0.0..=1.0    how fast a trail mark falls (canvas heights / second)
+fall = 0.25
+
+# Optional layer stack. With no [[layer]] tables the preset is exactly one
+# layer: [preset].scene with [params]. Each layer names its own scene, an
+# optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0); [layer.params] is typed against THAT layer's scene manifest and
+# merges over its defaults. When layers are present, [map] targets the FIRST
+# layer's scene.
+#
+# [[layer]]
+# scene = "verso"
+# blend = "over"
+# intensity = 1.0
+# [layer.params]
+# lift = 0.4
+
+# Feature -> parameter mappings. Each key is a parameter of the mapped scene;
+# each value is either a table naming a feature and a response, or a string
+# expression over the feature vocabulary (evaluated per frame).
+#
+# feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
+# curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+[map]
+# Let overall loudness set how far the letters can rise: quiet passages keep the
+# title close to its baseline, loud passages give it more room to leap. Stays
+# inside lift's 0.0..=0.6 range (offset 0.2, plus up to scale 0.25).
+lift = { feature = "loud", curve = "linear", attack_ms = 120, decay_ms = 350, scale = 0.25, offset = 0.2 }
+
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries; only meaningful with a
+# static source. Omit to use the host default palette. A quiet paper-and-ink
+# ramp: slots 6/7 carry the trail (dim) and the letters (bright) the scene uses.
+slots = ["#101318", "#20242c", "#3a4048", "#5a616b", "#8a929c", "#12141c", "#6b7280", "#f2f4f8"]

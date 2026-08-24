@@ -117,6 +117,20 @@ impl ScenePresenter {
         }
     }
 
+    /// Push an external text value to every layer's scene.
+    ///
+    /// Forwards to [`Scene::apply_text`](scia_scenes::Scene::apply_text) on each
+    /// current layer (and any outgoing layer still cross-fading), so a scene that
+    /// renders host text — for example `verso` — rebuilds when the value changes.
+    /// The host calls this only on a change (e.g. the now-playing track line),
+    /// never per frame. Scenes that do not render text ignore it (the trait
+    /// default is a no-op).
+    pub fn set_text(&mut self, key: &str, value: &str) {
+        for layer in self.layers.iter_mut().chain(self.outgoing.iter_mut()) {
+            layer.scene.apply_text(key, value);
+        }
+    }
+
     /// The active tier.
     #[must_use]
     pub fn tier(&self) -> Tier {
@@ -526,6 +540,58 @@ mod tests {
         );
         assert_ne!(mid_buf, art_buf, "mid frame differs from the art endpoint");
         assert_ne!(scene_buf, art_buf, "the palette visibly changed the frame");
+    }
+
+    /// Concatenate every glyph the buffer holds into one string.
+    fn buffer_text(buf: &Buffer) -> String {
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn set_text_forwards_to_a_text_scene() {
+        // `verso` renders the host track line as glyphs. Setting the text must
+        // reach the scene through the presenter and change what is drawn.
+        let preset = builtin_preset("verso")
+            .expect("verso is a built-in preset")
+            .expect("verso parses");
+        let mut p = ScenePresenter::from_preset(&preset, Tier::Half);
+        let (cols, rows) = (48u16, 16u16);
+        p.resize(cols, rows);
+
+        // A spectrum with signal so the letters render brightly on the baseline.
+        let mut snap = FeatureSnapshot {
+            spectrum_len: scia_core::SPECTRUM_BINS as u16,
+            ..FeatureSnapshot::default()
+        };
+        for b in &mut snap.spectrum {
+            *b = 0.8;
+        }
+
+        // Before: the fallback word `scia` is on screen.
+        for _ in 0..8 {
+            p.frame(&snap, 0.05);
+        }
+        let before = buffer_text(&snapshot_buffer(&p, cols, rows));
+        assert!(
+            before.contains('s') && before.contains('c'),
+            "fallback drawn"
+        );
+
+        // Forward a new track line and let it settle.
+        p.set_text("track", "zephyr");
+        for _ in 0..8 {
+            p.frame(&snap, 0.05);
+        }
+        let after = buffer_text(&snapshot_buffer(&p, cols, rows));
+        for ch in ['z', 'e', 'p', 'h', 'y', 'r'] {
+            assert!(
+                after.contains(ch),
+                "the forwarded track line `zephyr` should draw `{ch}`: {after:?}"
+            );
+        }
     }
 
     #[test]

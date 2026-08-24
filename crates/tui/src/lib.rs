@@ -425,6 +425,11 @@ fn run_loop(
         let cur_track = ui.track_line().map(str::to_owned);
         if cur_track != last_track {
             ui.chrome.on_track_change();
+            // Push the new track line to the scenes so a text scene (verso) can
+            // rebuild its letters; an empty value means "no track".
+            if let Some(p) = presenter.as_mut() {
+                p.set_text("track", cur_track.as_deref().unwrap_or(""));
+            }
             last_track = cur_track;
         }
         ui.chrome.tick(dt);
@@ -926,7 +931,7 @@ mod tests {
     #[test]
     fn arrows_cycle_scenes_in_registry_order_and_wrap() {
         let mut ui = scene_ui();
-        for expected in ["lattice", "aurora", "starfall", "spectra"] {
+        for expected in ["lattice", "aurora", "starfall", "tide", "verso", "spectra"] {
             assert!(matches!(
                 handle_event(press(KeyCode::Right), &mut ui),
                 Action::Redraw
@@ -938,7 +943,7 @@ mod tests {
             handle_event(press(KeyCode::Left), &mut ui),
             Action::Redraw
         ));
-        assert_eq!(ui.scene_nav.take_pending(), Some("starfall"));
+        assert_eq!(ui.scene_nav.take_pending(), Some("verso"));
     }
 
     #[test]
