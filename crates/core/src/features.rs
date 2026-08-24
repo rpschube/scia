@@ -101,11 +101,17 @@ pub struct FeatureSnapshot {
     /// saturating at `60_000.0` (the value that means "no recent onset"). Range
     /// `0.0..=60_000.0`.
     pub onset_age_ms: f32,
-    /// Beat phase in `0.0..1.0`. Reserved, 0 in schema 1.
+    /// Beat phase in `0.0..1.0`: position within the current beat period,
+    /// wrapping at each predicted beat. `0.0` while the beat tracker is
+    /// unlocked. Filled by the causal beat tracker in schema 1.
     pub beat_phase: f32,
-    /// Beat-tracker confidence in `0.0..=1.0`. Reserved, 0 in schema 1.
+    /// Beat-tracker confidence in `0.0..=1.0`: how dominant the locked tempo
+    /// hypothesis is. Always published — low on silence, noise and arrhythmic
+    /// input, high on steady music. Consumers gate the beat fields on it.
+    /// Filled by the causal beat tracker in schema 1.
     pub beat_confidence: f32,
-    /// Estimated tempo in BPM. Reserved, 0 in schema 1.
+    /// Estimated tempo in BPM: the locked tempo, `0.0` while unlocked. Filled by
+    /// the causal beat tracker in schema 1.
     pub tempo_bpm: f32,
     /// Inter-channel correlation in `-1.0..=1.0`. Reserved, 0 in schema 1.
     pub stereo_correlation: f32,

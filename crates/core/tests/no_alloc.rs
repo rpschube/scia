@@ -151,6 +151,66 @@ fn full_hop_path_does_not_allocate() {
 }
 
 #[test]
+fn beat_tracker_induction_does_not_allocate() {
+    // The beat tracker's periodic autocorrelation/comb induction pass — which
+    // fires from inside `try_process` roughly once a second once its ODF ring
+    // has filled — must be allocation-free too. Warm past the first induction so
+    // the ring is full and locked, then measure a span long enough to cross
+    // several more induction boundaries, driving a click train so the ODF has
+    // real structure and the tracker actually runs its full induction.
+    let format = StreamFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    };
+    let hop = 256usize;
+    let channels = 2usize;
+    let sr = 48_000u64;
+    let period = sr / 5; // a click every 200 ms (150 bpm ≈ 320 ms; 200 ms is fine)
+
+    let (mut sink, mut consumer) = sample_ring(Instant::now());
+    let mut processor = HopProcessor::new(hop, 2, 48_000);
+    let mut chunk = vec![0.0f32; hop * channels];
+    let mut frame: u64 = 0;
+    let fill = |chunk: &mut [f32], frame: &mut u64| {
+        for f in 0..hop {
+            let s = if (*frame + f as u64) % period == 0 {
+                0.8
+            } else {
+                0.0
+            };
+            chunk[f * channels] = s;
+            chunk[f * channels + 1] = s;
+        }
+        *frame += hop as u64;
+    };
+
+    // Warm-up: ~5 s of hops so the ~6 s ring fills and the first (allocating in
+    // `new`, but never here) induction passes have all run.
+    for _ in 0..950 {
+        fill(&mut chunk, &mut frame);
+        sink.push(&chunk);
+        let _ = processor.try_process(&mut consumer, format, 0, 0);
+    }
+
+    // Measure ~4 s: crosses at least three induction boundaries.
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..750 {
+            fill(&mut chunk, &mut frame);
+            sink.push(&chunk);
+            let snapshot = processor.try_process(&mut consumer, format, 0, 0);
+            assert!(snapshot.is_some());
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "beat induction path allocated {} time(s):\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
+
+#[test]
 fn spectrum_analyzer_hot_path_does_not_allocate() {
     let sr = 48_000u32;
     let hop = 256usize;

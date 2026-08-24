@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::bands::{BandConfig, BandSplitter};
+use crate::beat::BeatTracker;
 use crate::bus::FeatureWriter;
 use crate::capture::{SampleConsumer, SinkStats, StreamFormat};
 use crate::features::{Activity, FEATURE_SCHEMA_VERSION, FeatureSnapshot};
@@ -103,10 +104,14 @@ pub struct HopProcessor {
     spectrum_out: Vec<f32>,
     band_splitter: BandSplitter,
     onset_detector: OnsetDetector,
+    beat_tracker: BeatTracker,
     bands_out: [f32; 3],
     flux: f32,
     onset: bool,
     onset_age_ms: f32,
+    tempo_bpm: f32,
+    beat_phase: f32,
+    beat_confidence: f32,
     // The configs the analyzer/bands/onset were built from, kept so a
     // sample-rate/channel change ([`reformat`](HopProcessor::reformat)) can
     // rebuild them exactly as the constructor did.
@@ -167,6 +172,7 @@ impl HopProcessor {
         let fft_bass = analyzer.config().fft_bass;
         let band_splitter = BandSplitter::new(bands, sample_rate, fft_main, fft_bass);
         let onset_detector = OnsetDetector::new(onset, sample_rate, fft_main);
+        let beat_tracker = BeatTracker::new(sample_rate, hop_frames);
         Self {
             hop_frames,
             channels,
@@ -180,10 +186,14 @@ impl HopProcessor {
             spectrum_out: vec![0.0; bars],
             band_splitter,
             onset_detector,
+            beat_tracker,
             bands_out: [0.0; 3],
             flux: 0.0,
             onset: false,
             onset_age_ms: 0.0,
+            tempo_bpm: 0.0,
+            beat_phase: 0.0,
+            beat_confidence: 0.0,
             spectrum_config: spectrum,
             bands_config: bands,
             onset_config: onset,
@@ -208,6 +218,7 @@ impl HopProcessor {
         let fft_bass = analyzer.config().fft_bass;
         let band_splitter = BandSplitter::new(self.bands_config, sample_rate, fft_main, fft_bass);
         let onset_detector = OnsetDetector::new(self.onset_config, sample_rate, fft_main);
+        let beat_tracker = BeatTracker::new(sample_rate, self.hop_frames);
 
         self.channels = channels;
         self.dt_seconds = self.hop_frames as f32 / sample_rate.max(1) as f32;
@@ -219,10 +230,14 @@ impl HopProcessor {
         self.spectrum_out = vec![0.0; bars];
         self.band_splitter = band_splitter;
         self.onset_detector = onset_detector;
+        self.beat_tracker = beat_tracker;
         self.bands_out = [0.0; 3];
         self.flux = 0.0;
         self.onset = false;
         self.onset_age_ms = 0.0;
+        self.tempo_bpm = 0.0;
+        self.beat_phase = 0.0;
+        self.beat_confidence = 0.0;
         // `generation` deliberately preserved: the grid keeps climbing.
     }
 
@@ -322,6 +337,18 @@ impl HopProcessor {
         self.flux = flux;
         self.onset = onset;
         self.onset_age_ms = self.onset_detector.onset_age_ms();
+        self.update_beat();
+    }
+
+    /// Feed this hop's onset detection function (the normalized spectral flux)
+    /// into the causal beat tracker and cache its tempo/phase/confidence for the
+    /// next snapshot. Called exactly once per hop on every publish path.
+    /// Allocation-free.
+    fn update_beat(&mut self) {
+        let est = self.beat_tracker.process_hop(self.flux);
+        self.tempo_bpm = est.tempo_bpm;
+        self.beat_phase = est.phase;
+        self.beat_confidence = est.confidence;
     }
 
     /// Emit a silent hop (rms/peak 0, `starved = true`), incrementing the
@@ -361,6 +388,7 @@ impl HopProcessor {
         self.flux = flux;
         self.onset = onset;
         self.onset_age_ms = self.onset_detector.onset_age_ms();
+        self.update_beat();
     }
 
     /// Idle-path counterpart to [`try_process`](Self::try_process): pop one
@@ -443,6 +471,9 @@ impl HopProcessor {
         snapshot.flux = self.flux;
         snapshot.onset = self.onset;
         snapshot.onset_age_ms = self.onset_age_ms;
+        snapshot.tempo_bpm = self.tempo_bpm;
+        snapshot.beat_phase = self.beat_phase;
+        snapshot.beat_confidence = self.beat_confidence;
         snapshot
     }
 }
