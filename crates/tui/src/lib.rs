@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod chrome;
+mod devicepick;
 mod keymap;
 mod kitty;
 mod mapping_ui;
@@ -48,10 +49,17 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
-use scia_core::{Activity, EngineStats, FeatureReader, FeatureSnapshot, StreamHealth};
+use scia_core::{
+    Activity, DeviceInfo, DeviceSelector, EngineStats, FeatureReader, FeatureSnapshot,
+    StreamHealth, list_devices,
+};
 use scia_scenes::{Palette, Preset, ReloadEvent, builtin_preset, builtin_presets, builtin_scenes};
 
 pub use chrome::{ChromeMode, ChromeState, Fade};
+pub use devicepick::{
+    CaptureFilter, DevicePicker, DeviceRow, EnumState, Platform, apply_device_pin, build_rows,
+    capture_filter, draw_devices, pin_device, platform_filter,
+};
 pub use keymap::{ChordParseError, InputAction, KeyChord, Keymap, parse_chord};
 pub use kitty::{CLEANUP as KITTY_CLEANUP, KittyEncoder};
 pub use mapping_ui::{MappingUi, SourceSignal, draw_mapping, table_display};
@@ -129,7 +137,14 @@ pub struct TuiOptions {
     /// The base config directory (the one `config.toml` lives in), used as the
     /// root of the tuning strip's builtin-export path
     /// (`<config_dir>/presets/<name>.toml`). `None` disables export write-back.
+    /// The device picker also pins into `<config_dir>/config.toml`.
     pub config_dir: Option<PathBuf>,
+    /// The capture device the session started on, so the device picker can mark
+    /// the active endpoint. Defaults to the platform default.
+    pub device: DeviceSelector,
+    /// Whether the capture backend prefers the PipeWire host, so the device
+    /// picker filters to the matching capture direction. Defaults to `true`.
+    pub prefer_pipewire: bool,
 }
 
 impl Default for TuiOptions {
@@ -149,6 +164,8 @@ impl Default for TuiOptions {
             chrome: ChromeMode::Invisible,
             scene_file: None,
             config_dir: None,
+            device: DeviceSelector::Default,
+            prefer_pipewire: true,
         }
     }
 }
@@ -198,6 +215,7 @@ pub fn run(
     stats: impl FnMut() -> EngineStats,
     health: impl FnMut() -> StreamHealth,
     clock: impl FnMut() -> u64,
+    switch_device: impl FnMut(DeviceSelector),
     reload: Option<Receiver<ReloadEvent>>,
     opts: TuiOptions,
 ) -> Result<RunSummary, RunError> {
@@ -218,6 +236,7 @@ pub fn run(
         stats,
         health,
         clock,
+        switch_device,
         reload,
         &opts,
         presenter,
@@ -317,6 +336,7 @@ fn run_loop(
     mut stats: impl FnMut() -> EngineStats,
     mut health: impl FnMut() -> StreamHealth,
     mut clock: impl FnMut() -> u64,
+    mut switch_device: impl FnMut(DeviceSelector),
     reload: Option<Receiver<ReloadEvent>>,
     opts: &TuiOptions,
     mut presenter: Option<ScenePresenter>,
@@ -347,8 +367,13 @@ fn run_loop(
         scene_nav: SceneNav::new(initial_scene),
         keymap: opts.keymap,
         chrome: ChromeState::new(opts.chrome),
+        devices: DevicePicker::new(opts.device.clone(), opts.prefer_pipewire),
         ..UiState::default()
     };
+    // The in-flight device-enumeration worker's result channel, alive only while
+    // the picker is open and enumerating. Enumeration blocks (device probing), so
+    // it runs off the UI thread and its result is folded in on a later frame.
+    let mut device_rx: Option<std::sync::mpsc::Receiver<Result<Vec<DeviceInfo>, String>>> = None;
     // Tracks the now-playing line so a track change can reset the invisible-mode
     // fade. `track_line` is `None` until the metadata seam is wired, so this
     // stays inert today but is ready for it.
@@ -498,6 +523,49 @@ fn run_loop(
                 &ui.scene_nav,
                 opts,
             ));
+            notice_deadline = Some(frame_start + NOTICE_TTL);
+        }
+        // Open the device picker: spawn the (blocking) enumeration on a worker
+        // thread and show the `enumerating…` placeholder until its result lands.
+        // A re-open always re-enumerates.
+        if std::mem::take(&mut ui.device_open_pending) {
+            ui.devices.open_enumerating();
+            let (tx, rx) = std::sync::mpsc::channel();
+            device_rx = Some(rx);
+            // The worker owns no UI state; it just enumerates and reports back.
+            // If the receiver is gone (picker re-opened), the send is dropped.
+            let _ = std::thread::Builder::new()
+                .name("scia-devlist".into())
+                .spawn(move || {
+                    let result = list_devices().map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                });
+        }
+        // Fold in a finished enumeration, building the capture-target rows.
+        if let Some(rx) = device_rx.as_ref() {
+            if let Ok(result) = rx.try_recv() {
+                ui.devices.set_devices(result);
+                device_rx = None;
+            }
+        }
+        // Switch capture to the selected device: call the engine seam, mark it
+        // active, close the picker, and leave a notice. The route watcher does
+        // the actual reopen, so the UI thread never blocks on it.
+        if std::mem::take(&mut ui.device_switch_pending) {
+            if let Some(row) = ui.devices.selected_row() {
+                let selector = row.selector.clone();
+                let label = row.name.clone();
+                switch_device(selector.clone());
+                ui.devices.set_active(selector);
+                ui.devices.close();
+                ui.notice = Some(format!("capture → {label}"));
+                notice_deadline = Some(frame_start + NOTICE_TTL);
+            }
+        }
+        // Pin the selected device into the config file (comment-preserving), or
+        // note why it could not be pinned.
+        if std::mem::take(&mut ui.device_pin_pending) {
+            ui.notice = Some(pin_device_selection(&ui.devices, opts));
             notice_deadline = Some(frame_start + NOTICE_TTL);
         }
 
@@ -678,6 +746,9 @@ fn run_loop(
                         }
                         // The help overlay is the topmost body layer.
                         render::draw_help(frame.buffer_mut(), body, &ui);
+                        // The device picker is a modal overlay drawn above the
+                        // rest, like the help panel.
+                        devicepick::draw_devices(frame.buffer_mut(), body, &ui.devices);
                     }
                     // The reload notice lands on top of the scene body, so it
                     // draws after the presenter rather than inside the chrome.
@@ -824,7 +895,7 @@ impl PauseState {
 ///
 /// The rebindable actions come from [`UiState::keymap`]; the browser's internal
 /// navigation (highlight up/down, accept), Esc's context-sensitive quit/cancel,
-/// Ctrl-C's always-on quit, the `d` debug-line toggle and the `?` help overlay
+/// Ctrl-C's always-on quit, the `s` debug-line toggle and the `?` help overlay
 /// are structural and stay hard-coded.
 fn handle_event(event: Event, ui: &mut UiState) -> Action {
     match event {
@@ -914,6 +985,35 @@ fn handle_event(event: Event, ui: &mut UiState) -> Action {
                     _ => {}
                 }
             }
+            // While the device picker is open it is modal: its keys take priority
+            // over scene cycling, the browser and Esc-quit. ↑↓ (or j/k) select,
+            // ⏎ switches, `p` pins, esc closes. The devices key itself falls
+            // through to the keymap, which closes an open picker.
+            if ui.devices.is_open() {
+                match key.code {
+                    KeyCode::Esc => {
+                        ui.devices.close();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        ui.devices.select_prev();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        ui.devices.select_next();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Enter => {
+                        ui.device_switch_pending = true;
+                        return Action::Redraw;
+                    }
+                    KeyCode::Char('p') => {
+                        ui.device_pin_pending = true;
+                        return Action::Redraw;
+                    }
+                    _ => {}
+                }
+            }
             // Esc is structural and context-sensitive: it closes the browser
             // (restoring the original scene) while open, otherwise it quits.
             if key.code == KeyCode::Esc {
@@ -947,7 +1047,7 @@ fn handle_event(event: Event, ui: &mut UiState) -> Action {
                 ui.help = !ui.help;
                 return Action::Redraw;
             }
-            if key.code == KeyCode::Char('d') {
+            if key.code == KeyCode::Char('s') {
                 ui.debug = !ui.debug;
                 return Action::Redraw;
             }
@@ -1023,6 +1123,16 @@ fn apply_action(action: InputAction, ui: &mut UiState, browsing: bool) -> Action
                 ui.mapping.close();
             } else {
                 ui.mapping_open_pending = true;
+            }
+            Action::Redraw
+        }
+        // Toggle the device picker. Closing is immediate; opening is a one-shot
+        // request the loop fulfils by spawning the off-thread enumeration.
+        InputAction::Devices => {
+            if ui.devices.is_open() {
+                ui.devices.close();
+            } else {
+                ui.device_open_pending = true;
             }
             Action::Redraw
         }
@@ -1173,6 +1283,26 @@ fn write_mapping(
     }
 }
 
+/// Pin the picker's selected device into the config file, returning the status
+/// notice. Needs the config dir (`--headless`/no-config runs have none) and a
+/// selected row; pinning the follow-system entry removes the key. Never panics —
+/// every failure is a notice.
+fn pin_device_selection(picker: &DevicePicker, opts: &TuiOptions) -> String {
+    let Some(row) = picker.selected_row() else {
+        return "no device to pin".to_string();
+    };
+    let Some(dir) = &opts.config_dir else {
+        return "no config dir to pin into".to_string();
+    };
+    match devicepick::pin_device(dir, &row.selector) {
+        Ok(_) => match &row.selector {
+            DeviceSelector::Default => "unpinned (follow system)".to_string(),
+            DeviceSelector::Named(_) => format!("pinned {}", row.name),
+        },
+        Err(err) => format!("pin failed: {err}"),
+    }
+}
+
 /// A short label for a written file: its file name, or the full path when it has
 /// none.
 fn file_label(path: &Path) -> String {
@@ -1223,14 +1353,107 @@ mod tests {
     #[test]
     fn overlay_and_debug_toggle_independently() {
         let mut ui = UiState::default();
-        // The debug-line key keeps its meaning and does not touch the overlay.
-        let _ = handle_event(press(KeyCode::Char('d')), &mut ui);
+        // The debug-line key (`s`, since `d` now opens the device picker) keeps
+        // its meaning and does not touch the overlay.
+        let _ = handle_event(press(KeyCode::Char('s')), &mut ui);
         assert!(ui.debug);
         assert!(!ui.overlay);
         // The overlay key does not touch the debug line.
         let _ = handle_event(press(KeyCode::Char('`')), &mut ui);
         assert!(ui.debug);
         assert!(ui.overlay);
+    }
+
+    #[test]
+    fn d_opens_the_device_picker_and_toggles_it_shut() {
+        let mut ui = UiState::default();
+        assert!(!ui.device_open_pending);
+        // `d` requests the picker (the loop spawns the enumeration).
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('d')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(ui.device_open_pending, "d asks the loop to open the picker");
+        assert!(!ui.debug, "d no longer toggles the debug line");
+        // With the picker open, `d` closes it (mirrors the tuning `t` toggle).
+        ui.devices.open_enumerating();
+        let _ = handle_event(press(KeyCode::Char('d')), &mut ui);
+        assert!(!ui.devices.is_open(), "d closes an open picker");
+    }
+
+    #[test]
+    fn device_picker_keys_are_modal_while_open() {
+        use crate::devicepick::{CaptureFilter, build_rows};
+        use scia_core::{DeviceInfo, DeviceKind};
+        let mut ui = scene_ui();
+        // Seed the picker with rows so selection has somewhere to go.
+        ui.devices.open_enumerating();
+        let devices = vec![
+            DeviceInfo {
+                name: "one".into(),
+                is_default_input: true,
+                is_default_output: true,
+                kind: DeviceKind::Output,
+                host: "pipewire".into(),
+            },
+            DeviceInfo {
+                name: "two".into(),
+                is_default_input: false,
+                is_default_output: false,
+                kind: DeviceKind::Output,
+                host: "pipewire".into(),
+            },
+        ];
+        let filter = CaptureFilter {
+            kind: DeviceKind::Output,
+            host: Some("pipewire".into()),
+        };
+        let _ = build_rows(&devices, &filter, &DeviceSelector::Default);
+        ui.devices.set_devices(Ok(devices));
+        let n = ui.devices.rows().len();
+        assert!(n >= 2, "fixture yields at least two rows");
+
+        // Down moves the selection, it does not cycle the scene.
+        let start = ui.devices.selected();
+        let _ = handle_event(press(KeyCode::Down), &mut ui);
+        assert_eq!(ui.devices.selected(), (start + 1) % n);
+        assert_eq!(ui.scene_nav.take_pending(), None, "no scene cycle");
+        // Enter raises the one-shot switch request.
+        let _ = handle_event(press(KeyCode::Enter), &mut ui);
+        assert!(ui.device_switch_pending, "enter requests a switch");
+        // `p` pins rather than applying the palette.
+        let _ = handle_event(press(KeyCode::Char('p')), &mut ui);
+        assert!(ui.device_pin_pending, "p requests a pin");
+        assert!(
+            !ui.palette_pending,
+            "p does not apply the palette while modal"
+        );
+        // Esc closes the picker instead of quitting.
+        assert!(matches!(
+            handle_event(press(KeyCode::Esc), &mut ui),
+            Action::Redraw
+        ));
+        assert!(!ui.devices.is_open());
+    }
+
+    #[test]
+    fn rebinding_devices_drives_the_new_key() {
+        let mut ui = UiState {
+            keymap: Keymap {
+                devices: Some(KeyChord::plain(KeyCode::Char('g'))),
+                ..Keymap::default()
+            },
+            ..UiState::default()
+        };
+        // The rebound key requests the picker; the old `d` no longer does.
+        let _ = handle_event(press(KeyCode::Char('g')), &mut ui);
+        assert!(ui.device_open_pending);
+        ui.device_open_pending = false;
+        let _ = handle_event(press(KeyCode::Char('d')), &mut ui);
+        assert!(
+            !ui.device_open_pending,
+            "the old devices key is inert after a rebind"
+        );
     }
 
     /// A UiState with the browser/cycle keys live, as the loop sets it on the

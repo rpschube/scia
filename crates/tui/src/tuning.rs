@@ -477,8 +477,9 @@ fn to_io(err: toml_edit::TomlError) -> io::Error {
 
 /// Write `contents` to `path` atomically: write a sibling temp file in the same
 /// directory, flush and sync it, then rename it over `path`. A reader of `path`
-/// therefore never sees a partial or empty file.
-fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
+/// therefore never sees a partial or empty file. Shared with the device picker's
+/// config pin.
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let file_name = path
         .file_name()

@@ -168,6 +168,12 @@ struct Shared {
     swap: Arc<RingSwap>,
     /// An out-of-band reopen request the watcher honours on its next tick.
     request: AtomicBool,
+    /// A runtime device switch requested through [`Engine::set_device`], applied
+    /// to the backend at the start of the next reopen (before `open`). `None`
+    /// when no switch is pending. Only the cpal backend acts on it; a backend
+    /// with no device concept ignores the applied selector.
+    #[cfg(feature = "capture-cpal")]
+    pending_device: Mutex<Option<crate::backends::cpal::DeviceSelector>>,
     reopens: AtomicU64,
     reopen_failures: AtomicU64,
     /// Whether perf mode was requested (`EngineConfig::perf_mode`). When set,
@@ -185,6 +191,17 @@ impl Shared {
     /// under the DSP thread without stopping it. See [`Engine::reopen`].
     fn reopen(&self) -> Result<StreamFormat, CaptureError> {
         let mut route = self.route.lock().unwrap_or_else(|e| e.into_inner());
+        // Apply a pending runtime device switch to the backend before opening, so
+        // this reopen binds the newly chosen device.
+        #[cfg(feature = "capture-cpal")]
+        if let Some(selector) = self
+            .pending_device
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            route.backend.set_device(selector);
+        }
         // A brand-new ring that keeps feeding the same cumulative stats.
         let (sink, consumer) = sample_ring_with_stats(Arc::clone(&self.stats));
         let target = route.target;
@@ -379,6 +396,8 @@ impl Engine {
             stats,
             swap,
             request: AtomicBool::new(false),
+            #[cfg(feature = "capture-cpal")]
+            pending_device: Mutex::new(None),
             reopens: AtomicU64::new(0),
             reopen_failures: AtomicU64::new(0),
             perf_mode: config.perf_mode,
@@ -553,6 +572,23 @@ impl Engine {
     /// Returns the backend's [`CaptureError`] if the new stream cannot open.
     pub fn reopen(&self) -> Result<StreamFormat, CaptureError> {
         self.shared.reopen()
+    }
+
+    /// Select a different capture device at runtime. The selector is recorded
+    /// and applied to the backend at the start of the next reopen, so the caller
+    /// pairs this with [`request_reopen`](Engine::request_reopen) to make the
+    /// switch happen: the route watcher then tears down the current stream and
+    /// opens the newly chosen device, swapping its ring under the running DSP
+    /// thread the same way a fault recovery or route change does. Recording a
+    /// selector never blocks capture, and a switch with the watcher disabled is
+    /// inert (nothing drives the reopen). Callable from any thread.
+    #[cfg(feature = "capture-cpal")]
+    pub fn set_device(&self, selector: crate::backends::cpal::DeviceSelector) {
+        *self
+            .shared
+            .pending_device
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(selector);
     }
 
     /// Ask the route watcher to reopen on its next tick. This is the seam a

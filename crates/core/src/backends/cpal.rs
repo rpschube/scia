@@ -144,6 +144,12 @@ impl CaptureBackend for CpalBackend {
             .ok()
             .map(|(device, _)| device.to_string())
     }
+
+    fn set_device(&mut self, selector: DeviceSelector) {
+        // Record the new selector; the next `resolve`/`open` (driven by the
+        // engine's reopen) binds it.
+        self.device = selector;
+    }
 }
 
 /// Which default-config direction a resolved device is opened with. WASAPI and
