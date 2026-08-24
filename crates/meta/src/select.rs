@@ -9,7 +9,7 @@
 //! The rule, in priority order:
 //!
 //! 1. **Playing beats everything.** A session whose status
-//!    [`is_playing`](crate::model::PlaybackStatus::is_playing) outranks any
+//!    [`is_playing`](crate::types::PlaybackStatus::is_playing) outranks any
 //!    number of paused or stopped sessions.
 //! 2. **Most recent activity wins.** Among sessions of equal playing-rank, the
 //!    one with the larger `last_activity` marker wins. The marker is a
@@ -21,13 +21,34 @@
 //!    always resolves to the same winner regardless of enumeration order.
 //!
 //! An empty session set yields `None` — the caller emits
-//! [`MetaEvent::Cleared`](crate::model::MetaEvent::Cleared). A non-empty set
-//! always has a winner: when nothing is playing, the most-recently-active
-//! session (typically a freshly paused track) still supplies metadata, which is
-//! the desired behaviour — a paused Spotify track should still theme the
-//! scenes. Genuine absence is only ever the empty set.
+//! [`MetaEvent::Cleared`](crate::MetaEvent::Cleared). A non-empty set always has
+//! a winner: when nothing is playing, the most-recently-active session
+//! (typically a freshly paused track) still supplies metadata, which is the
+//! desired behaviour — a paused Spotify track should still theme the scenes.
+//! Genuine absence is only ever the empty set.
+//!
+//! # Relationship to the MPRIS selector
+//!
+//! This module and [`mpris::select_winner`](crate::mpris::select_winner)
+//! implement the *same* three-part policy — playing first, then most recent
+//! activity, then the lexicographically smallest identifier. They are kept as
+//! two functions rather than one shared generic because they are not a
+//! mechanical `id`-swap of each other:
+//!
+//! * They take different inputs — a `&[SessionSnapshot]` returning the winning
+//!   *index* here, versus a `&[PlayerState]` returning a `&PlayerState` there —
+//!   each shaped to how its backend already carries session state, and each
+//!   with its own established unit tests.
+//! * They differ deliberately on one point. The MPRIS selector treats a
+//!   [`Stopped`](crate::PlaybackStatus::Stopped) player as **absence** and
+//!   excludes it, so an all-stopped set yields no winner. The SMTC backend
+//!   instead reports on the most-recently-active session even when nothing is
+//!   playing (a just-paused or just-stopped session still carries the metadata
+//!   worth theming), and treats genuine absence as the *empty* set — matching
+//!   how SMTC surfaces sessions. Folding the two into one function would have to
+//!   erase that difference, so they are left separate and documented here.
 
-use crate::model::PlaybackStatus;
+use crate::types::PlaybackStatus;
 
 /// The minimal, platform-neutral view of one media session the policy needs.
 ///
@@ -115,7 +136,7 @@ pub fn select_winner_snapshot(sessions: &[SessionSnapshot]) -> Option<SessionSna
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::PlaybackStatus::{Paused, Playing, Stopped};
+    use crate::types::PlaybackStatus::{Paused, Playing, Stopped};
 
     fn s(app: &str, status: PlaybackStatus, act: u64) -> SessionSnapshot {
         SessionSnapshot::new(app, status, act)

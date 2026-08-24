@@ -1,5 +1,4 @@
-//! The cross-platform **artwork debounce / retry driver** and byte-plumbing
-//! helpers.
+//! The **SMTC artwork debounce / retry driver** and encoded-image helpers.
 //!
 //! Album art is the awkward part of a now-playing backend. Players swap the
 //! thumbnail *after* they publish the new title — Spotify in particular can lag
@@ -21,6 +20,38 @@
 //! [`is_usable_artwork`] is the acceptance predicate the driver uses to decide
 //! whether a fetch succeeded: bytes that are absent, too small, or not a
 //! recognisable image are treated as "not ready yet" and drive a retry.
+//!
+//! # Why this exists beside [`FetchScheduler`](crate::FetchScheduler)
+//!
+//! The crate has two artwork schedulers because the two backends fetch art in
+//! fundamentally different shapes, and forcing them through one type would
+//! misrepresent one of them:
+//!
+//! * [`FetchScheduler`](crate::FetchScheduler) is **address-based with an
+//!   injected clock**. MPRIS resolves a player's `mpris:artUrl` to an
+//!   [`ArtworkRef`](crate::ArtworkRef) (a `file://` path, an `http(s)` URL, or
+//!   inline `data:` bytes) and hands that address to a worker that fetches it
+//!   off the event thread; the scheduler is told the current [`Instant`] and
+//!   tracks *one* pending [`ArtworkRef`] through debounce and backoff. It owns
+//!   *when to fetch which address*.
+//! * [`ArtworkDriver`] is **live-handle based with a sleep-duration interface**.
+//!   SMTC has no addressable art: each attempt re-queries the winning session's
+//!   thumbnail stream directly from a COM handle — a handle that cannot be an
+//!   [`ArtworkRef`](crate::ArtworkRef) (it is neither `Clone`/`Eq` nor `Send`
+//!   into that value type), so there is nothing for `FetchScheduler` to hold.
+//!   The driver instead hands the backend a [`Duration`] to sleep on its
+//!   interruptible `recv_timeout`, and judges each re-query with
+//!   [`is_usable_artwork`] to reject the empty or placeholder thumbnails Windows
+//!   returns mid-swap. It owns *when to re-query and whether the bytes count*.
+//!
+//! Both encode the same intent — debounce, then bounded exponential backoff —
+//! but against different I/O models. `FetchScheduler` is the canonical policy
+//! for address-based fetches; `ArtworkDriver` is its SMTC-shaped counterpart,
+//! adding the encoded-image acceptance and backoff ceiling that a live-thumbnail
+//! re-query needs.
+//!
+//! [`Duration`]: std::time::Duration
+//! [`Instant`]: std::time::Instant
 
 use std::time::Duration;
 

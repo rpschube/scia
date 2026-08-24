@@ -5,10 +5,16 @@
 //! the [`GlobalSystemMediaTransportControlsSessionManager`], subscribes to
 //! `SessionsChanged` on the manager and to `MediaPropertiesChanged` /
 //! `PlaybackInfoChanged` on every live session, and turns those callbacks into
-//! [`MetaEvent`]s pushed over the shared [`MetaSender`] contract. The design is
-//! event-driven per US-META-1 — there is no polling loop, only a ≤5 s
-//! safety-net re-check that runs when the manager has been quiet, to paper over
-//! any missed notification.
+//! [`MetaEvent`]s pushed over the `Sender<MetaEvent>` the caller supplies —
+//! exactly the shared backend contract the MPRIS backend also speaks. The
+//! design is event-driven per US-META-1 — there is no polling loop, only a
+//! ≤5 s safety-net re-check that runs when the manager has been quiet, to paper
+//! over any missed notification.
+//!
+//! **Handle.** [`start`] returns a [`MetaHandle`]; dropping it flips a shared
+//! stop flag and joins the backend thread (which unsubscribes every handler and
+//! uninitialises COM). The thread polls that flag on a short cadence, so a drop
+//! stops it promptly.
 //!
 //! **Threading.** WinRT delivers `*Changed` callbacks on its own threadpool
 //! threads. Those callbacks do the absolute minimum — push a lightweight marker
@@ -25,13 +31,23 @@
 //! time a session signals activity, so "last activity wins" among playing
 //! sessions and ties fall to the lexicographically smallest `AppUserModelId`.
 //!
+//! **Metadata.** The winner's title/artist/album and playback status become a
+//! [`NowPlaying`] via [`NowPlaying::new`], tagged with the session's
+//! `AppUserModelId` as [`NowPlaying::source_app`]. A [`MetaEvent::TrackChanged`]
+//! is emitted whenever that snapshot changes (a track change *or* a bare
+//! play/pause), matching the shared contract. `position` is left `None`: SMTC
+//! exposes a `GetTimelineProperties` timeline that a later change can wire in,
+//! but it is not read here yet.
+//!
 //! **Artwork.** Album art is fetched through [`crate::artwork::ArtworkDriver`]:
 //! a ~250 ms debounce then bounded exponential-backoff retries, re-querying the
 //! session's thumbnail on each attempt so a late Spotify thumbnail swap is
-//! still caught. Bytes are passed through untouched with the session's
-//! `AppUserModelId` in [`Artwork::source_app`]; this module never decodes or
-//! crops pixels (the palette module owns that, and needs the source app to
-//! strip Spotify's letterbox padding).
+//! still caught, and only when the track identity (or the winning app) actually
+//! changed — never on a bare play/pause. Bytes are passed through untouched as
+//! [`MetaEvent::Artwork`] tagged with the track's `track_key` and the session's
+//! `AppUserModelId` as `source_app`; this module never decodes or crops pixels
+//! (the palette module owns that, and needs the source app to strip Spotify's
+//! letterbox padding).
 //!
 //! **Absence & failure.** No sessions is the normal idle state: the backend
 //! emits [`MetaEvent::Cleared`] and goes quiet. If the manager request itself
@@ -39,9 +55,11 @@
 //! platform without SMTC is not an error.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use windows::Foundation::TypedEventHandler;
 use windows::Media::Control::{
@@ -54,65 +72,51 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use windows::core::{HSTRING, Result as WinResult};
 
 use crate::artwork::{ArtworkDriver, ArtworkStep, RetryPolicy};
-use crate::model::{Artwork, MetaEvent, MetaSender, NowPlaying, PlaybackStatus};
 use crate::select::{SessionSnapshot, select_winner};
+use crate::types::{MetaEvent, MetaHandle, NowPlaying, PlaybackStatus};
 
 /// The safety-net re-check interval. The backend is event-driven; this only
 /// fires when the internal channel has been idle this long, catching any
 /// notification WinRT might have dropped. US-META-1 asks for at most 5 s.
 const SAFETY_NET: Duration = Duration::from_secs(5);
 
-/// A live SMTC backend. Dropping it stops the backend thread (which unsubscribes
-/// every handler and uninitialises COM) and joins it.
-pub struct SmtcBackend {
-    /// Sends the stop marker to the backend thread. `Option` so `Drop` can take
-    /// it before joining.
-    stop: Option<Sender<Internal>>,
-    join: Option<JoinHandle<()>>,
+/// How long the backend thread will block on the internal channel before
+/// looping to re-check the stop flag. It caps the safety-net wait so a dropped
+/// [`MetaHandle`] stops the thread within this bound rather than after a full
+/// [`SAFETY_NET`] period.
+const POLL_CAP: Duration = Duration::from_millis(250);
+
+/// Start the Windows SMTC backend on its own thread and return a
+/// [`MetaHandle`] that stops and joins it on drop. Events are pushed to `out`.
+/// Spawning never blocks on the WinRT request — the manager is acquired on the
+/// backend thread — and never fails: a machine without an SMTC manager simply
+/// emits [`MetaEvent::Cleared`] and idles.
+#[must_use]
+pub fn start(out: Sender<MetaEvent>) -> MetaHandle {
+    start_with_policy(out, RetryPolicy::default())
 }
 
-impl SmtcBackend {
-    /// Spawn the backend. It pushes [`MetaEvent`]s over `out` until the returned
-    /// handle is dropped. Spawning never blocks on the WinRT request — the
-    /// manager is acquired on the backend thread — and never fails: a machine
-    /// without an SMTC manager simply emits [`MetaEvent::Cleared`] and idles.
-    #[must_use]
-    pub fn spawn(out: MetaSender) -> Self {
-        Self::spawn_with_policy(out, RetryPolicy::default())
-    }
-
-    /// Spawn with an explicit artwork [`RetryPolicy`] (used by tests of the
-    /// wiring; production uses [`RetryPolicy::default`] via [`spawn`]).
-    ///
-    /// [`spawn`]: SmtcBackend::spawn
-    #[must_use]
-    pub fn spawn_with_policy(out: MetaSender, policy: RetryPolicy) -> Self {
-        let (tx, rx) = mpsc::channel::<Internal>();
-        let tx_for_thread = tx.clone();
-        let join = thread::Builder::new()
-            .name("scia-smtc".into())
-            .spawn(move || run(&out, &tx_for_thread, &rx, policy))
-            .expect("spawn scia-smtc thread");
-        Self {
-            stop: Some(tx),
-            join: Some(join),
-        }
-    }
-}
-
-impl Drop for SmtcBackend {
-    fn drop(&mut self) {
-        if let Some(tx) = self.stop.take() {
-            let _ = tx.send(Internal::Stop);
-        }
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
+/// Start with an explicit artwork [`RetryPolicy`] (used by tests of the wiring;
+/// production uses [`RetryPolicy::default`] via [`start`]).
+#[must_use]
+pub fn start_with_policy(out: Sender<MetaEvent>, policy: RetryPolicy) -> MetaHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let join = thread::Builder::new()
+        .name("scia-smtc".into())
+        .spawn(move || {
+            // The internal channel the WinRT callbacks push markers onto lives
+            // and dies with this thread; both ends stay on it.
+            let (tx, rx) = mpsc::channel::<Internal>();
+            run(&out, &thread_stop, &tx, &rx, policy);
+        })
+        .expect("spawn scia-smtc thread");
+    MetaHandle::new(stop, vec![join])
 }
 
 /// Markers the WinRT callbacks and the safety net push onto the backend
-/// thread's internal channel. Everything here is [`Send`].
+/// thread's internal channel. Everything here is [`Send`]. Shutdown is signalled
+/// out-of-band by the [`MetaHandle`]'s stop flag, not by a channel message.
 enum Internal {
     /// The manager's session set changed: re-enumerate and re-subscribe.
     SessionsChanged,
@@ -120,8 +124,6 @@ enum Internal {
     SessionChanged(String),
     /// The safety-net timer elapsed: re-evaluate defensively.
     Recheck,
-    /// The handle was dropped: unwind.
-    Stop,
 }
 
 /// One session's live subscriptions, kept so they can be removed when the
@@ -147,7 +149,7 @@ struct BackendState {
     counter: u64,
     /// Per-`AppUserModelId` recency marker fed to the selection policy.
     activity: HashMap<String, u64>,
-    /// The last `NowPlaying` emitted, for de-duplication.
+    /// The last `NowPlaying` emitted, for de-duplication and change detection.
     last_track: Option<NowPlaying>,
     /// Whether the last emission was [`MetaEvent::Cleared`], for de-duplication.
     cleared: bool,
@@ -181,7 +183,13 @@ impl BackendState {
 }
 
 /// The backend thread entry point.
-fn run(out: &MetaSender, tx: &Sender<Internal>, rx: &Receiver<Internal>, policy: RetryPolicy) {
+fn run(
+    out: &Sender<MetaEvent>,
+    stop: &AtomicBool,
+    tx: &Sender<Internal>,
+    rx: &Receiver<Internal>,
+    policy: RetryPolicy,
+) {
     // SMTC is delivered on the WinRT threadpool (MTA). Initialise COM in the
     // multithreaded apartment on this thread so async `.join()` calls and event
     // delivery behave. A benign S_FALSE/RPC_E_CHANGED_MODE is ignored.
@@ -191,7 +199,7 @@ fn run(out: &MetaSender, tx: &Sender<Internal>, rx: &Receiver<Internal>, policy:
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    let result = run_inner(out, tx, rx, policy);
+    let result = run_inner(out, stop, tx, rx, policy);
 
     // SAFETY: pairs with the `CoInitializeEx` above on the same thread.
     unsafe {
@@ -207,7 +215,8 @@ fn run(out: &MetaSender, tx: &Sender<Internal>, rx: &Receiver<Internal>, policy:
 
 /// The fallible body; any WinRT error unwinds to a quiet `Cleared` in [`run`].
 fn run_inner(
-    out: &MetaSender,
+    out: &Sender<MetaEvent>,
+    stop: &AtomicBool,
     tx: &Sender<Internal>,
     rx: &Receiver<Internal>,
     policy: RetryPolicy,
@@ -226,32 +235,53 @@ fn run_inner(
 
     // Initial subscription + evaluation.
     resubscribe(&manager, tx, &mut subs);
-    let mut pending = evaluate(&manager, out, &mut state, rx, policy);
+    let mut pending = evaluate(&manager, out, &mut state, stop, rx, policy);
+    let mut last_eval = Instant::now();
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
         let msg = match pending.take() {
-            Some(m) => m,
-            None => match rx.recv_timeout(SAFETY_NET) {
-                Ok(m) => m,
-                Err(RecvTimeoutError::Timeout) => Internal::Recheck,
-                Err(RecvTimeoutError::Disconnected) => break,
-            },
+            Some(m) => Some(m),
+            None => {
+                // Wake on the next internal marker, but never sleep longer than
+                // POLL_CAP so the stop flag is observed promptly; only after a
+                // full SAFETY_NET of quiet does the timeout mean "re-check".
+                let wait = SAFETY_NET.saturating_sub(last_eval.elapsed()).min(POLL_CAP);
+                match rx.recv_timeout(wait) {
+                    Ok(m) => Some(m),
+                    Err(RecvTimeoutError::Timeout) => {
+                        if last_eval.elapsed() >= SAFETY_NET {
+                            Some(Internal::Recheck)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        };
+
+        let Some(msg) = msg else {
+            continue;
         };
 
         match msg {
-            Internal::Stop => break,
             Internal::SessionsChanged => {
                 resubscribe(&manager, tx, &mut subs);
-                pending = evaluate(&manager, out, &mut state, rx, policy);
+                pending = evaluate(&manager, out, &mut state, stop, rx, policy);
             }
             Internal::SessionChanged(app_id) => {
                 state.bump(&app_id);
-                pending = evaluate(&manager, out, &mut state, rx, policy);
+                pending = evaluate(&manager, out, &mut state, stop, rx, policy);
             }
             Internal::Recheck => {
-                pending = evaluate(&manager, out, &mut state, rx, policy);
+                pending = evaluate(&manager, out, &mut state, stop, rx, policy);
             }
         }
+        last_eval = Instant::now();
     }
 
     // Teardown: drop every per-session subscription and the manager handler.
@@ -304,15 +334,16 @@ fn resubscribe(manager: &Manager, tx: &Sender<Internal>, subs: &mut Vec<SessionS
 }
 
 /// Apply the selection policy over the current sessions, emit any metadata
-/// change, and run the artwork campaign for a new winner.
+/// change, and run the artwork campaign when the winning track (or app) changed.
 ///
 /// Returns an [`Internal`] message that arrived on `rx` during the (blocking)
 /// artwork campaign and must be handled next, so a rapid follow-up change is
 /// not lost while album art is being fetched.
 fn evaluate(
     manager: &Manager,
-    out: &MetaSender,
+    out: &Sender<MetaEvent>,
     state: &mut BackendState,
+    stop: &AtomicBool,
     rx: &Receiver<Internal>,
     policy: RetryPolicy,
 ) -> Option<Internal> {
@@ -351,27 +382,44 @@ fn evaluate(
     };
 
     let winner_app = snaps[winner_idx].app_id.clone();
+    let winner_status = snaps[winner_idx].status;
     let winner_session = &handles[winner_idx];
 
-    // Read the winner's textual metadata and emit it if it changed.
-    let now = read_now_playing(winner_session, &winner_app);
-    let changed = state.last_track.as_ref() != Some(&now);
-    if changed || state.cleared {
-        let _ = out.send(MetaEvent::Track(now.clone()));
-        state.last_track = Some(now);
+    // Read the winner's textual metadata + status into a NowPlaying.
+    let now = read_now_playing(winner_session, &winner_app, winner_status);
+
+    // Art is (re)fetched only when the track identity or the winning app
+    // changed — a bare play/pause updates the snapshot but keeps the same art.
+    let prev = state.last_track.as_ref();
+    let track_changed = prev.map(|p| p.track_key.as_str()) != Some(now.track_key.as_str());
+    let app_changed = prev.and_then(|p| p.source_app.as_deref()) != now.source_app.as_deref();
+    let art_needed = track_changed || app_changed;
+    let track_key = now.track_key.clone();
+
+    // Emit whenever the snapshot differs from what we last sent (or we were
+    // cleared): this covers a new track, a status flip, or a new winner.
+    if prev != Some(&now) || state.cleared {
+        let _ = out.send(MetaEvent::TrackChanged(now.clone()));
         state.cleared = false;
     }
+    state.last_track = Some(now);
 
-    // Fetch artwork only when the track actually changed; a bare playback-state
-    // flip does not need a re-fetch.
-    if changed {
-        return run_artwork_campaign(winner_session, &winner_app, out, rx, policy);
+    if art_needed {
+        return run_artwork_campaign(
+            winner_session,
+            &winner_app,
+            &track_key,
+            out,
+            stop,
+            rx,
+            policy,
+        );
     }
     None
 }
 
 /// Emit [`MetaEvent::Cleared`] unless it was already the last thing emitted.
-fn emit_cleared(out: &MetaSender, state: &mut BackendState) {
+fn emit_cleared(out: &Sender<MetaEvent>, state: &mut BackendState) {
     if !state.cleared {
         let _ = out.send(MetaEvent::Cleared);
         state.cleared = true;
@@ -379,26 +427,32 @@ fn emit_cleared(out: &MetaSender, state: &mut BackendState) {
     }
 }
 
-/// Drive the artwork [`ArtworkDriver`] for one track: debounce, then bounded
-/// retries, re-querying the thumbnail each attempt. Between the driver's sleeps
-/// it drains the internal channel; if a message arrives it abandons the
-/// campaign and returns that message so the caller processes it next (a new
-/// track supersedes a stale artwork fetch).
+/// Drive the [`ArtworkDriver`] for one track: debounce, then bounded retries,
+/// re-querying the thumbnail each attempt. Between the driver's sleeps it drains
+/// the internal channel; if a message arrives it abandons the campaign and
+/// returns that message so the caller processes it next (a new track supersedes
+/// a stale artwork fetch). It also bails if the stop flag is set.
 fn run_artwork_campaign(
     session: &Session,
     app_id: &str,
-    out: &MetaSender,
+    track_key: &str,
+    out: &Sender<MetaEvent>,
+    stop: &AtomicBool,
     rx: &Receiver<Internal>,
     policy: RetryPolicy,
 ) -> Option<Internal> {
     let mut driver = ArtworkDriver::new(policy);
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         match driver.next_step() {
             ArtworkStep::Emit(bytes) => {
-                let _ = out.send(MetaEvent::Artwork(Artwork {
+                let _ = out.send(MetaEvent::Artwork {
+                    track_key: track_key.to_string(),
                     bytes,
                     source_app: Some(app_id.to_string()),
-                }));
+                });
                 return None;
             }
             ArtworkStep::GiveUp => return None,
@@ -418,23 +472,23 @@ fn run_artwork_campaign(
     }
 }
 
-/// Read the winner's title/artist/album into a [`NowPlaying`], tagging it with
-/// the source app. Missing or empty fields become `None`; a failed metadata
-/// call yields a snapshot with only the source app set.
-fn read_now_playing(session: &Session, app_id: &str) -> NowPlaying {
-    let mut np = NowPlaying {
-        source_app: Some(app_id.to_string()),
-        ..NowPlaying::default()
-    };
+/// Read the winner's title/artist/album and status into a [`NowPlaying`],
+/// tagging it with the source app. Missing or empty fields become `None`; a
+/// failed metadata call yields a snapshot with only status and source app set.
+/// `position` is `None` — the SMTC timeline is not read here yet.
+fn read_now_playing(session: &Session, app_id: &str, status: PlaybackStatus) -> NowPlaying {
+    let mut title = None;
+    let mut artist = None;
+    let mut album = None;
     if let Ok(props) = session
         .TryGetMediaPropertiesAsync()
         .and_then(|op| op.join())
     {
-        np.title = props.Title().ok().and_then(hstr_opt);
-        np.artist = props.Artist().ok().and_then(hstr_opt);
-        np.album = props.AlbumTitle().ok().and_then(hstr_opt);
+        title = props.Title().ok().and_then(hstr_opt);
+        artist = props.Artist().ok().and_then(hstr_opt);
+        album = props.AlbumTitle().ok().and_then(hstr_opt);
     }
-    np
+    NowPlaying::new(title, artist, album, status, None, Some(app_id.to_string()))
 }
 
 /// Perform one artwork fetch: re-query the session's media properties, open the
@@ -473,26 +527,22 @@ fn app_id_of(session: &Session) -> String {
 }
 
 /// Map a session's SMTC playback status onto the neutral [`PlaybackStatus`].
+/// The neutral enum has three states, so `Changing`, `Opened` and `Closed` — as
+/// well as unreadable playback info — all fold onto `Stopped` (no advancing,
+/// no held track worth distinguishing here).
 fn status_of(session: &Session) -> PlaybackStatus {
     let Ok(raw) = session
         .GetPlaybackInfo()
         .and_then(|info| info.PlaybackStatus())
     else {
-        // Unreadable playback info counts as closed.
-        return PlaybackStatus::Closed;
+        return PlaybackStatus::Stopped;
     };
     if raw == WinStatus::Playing {
         PlaybackStatus::Playing
     } else if raw == WinStatus::Paused {
         PlaybackStatus::Paused
-    } else if raw == WinStatus::Stopped {
-        PlaybackStatus::Stopped
-    } else if raw == WinStatus::Changing {
-        PlaybackStatus::Changing
-    } else if raw == WinStatus::Opened {
-        PlaybackStatus::Opened
     } else {
-        PlaybackStatus::Closed
+        PlaybackStatus::Stopped
     }
 }
 
