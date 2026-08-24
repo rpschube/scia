@@ -57,6 +57,16 @@ release = 0.15
 gap = 0.2
 ```
 
+The `lattice` manifest:
+
+| key          | default | range       | meaning                                               |
+| ------------ | ------- | ----------- | ----------------------------------------------------- |
+| `density`    | `24`    | `4.0..=96.0`| dots across the width (rows follow from the aspect)   |
+| `ring_speed` | `0.9`   | `0.1..=4.0` | how fast a ring front travels (canvas units / second) |
+| `ring_width` | `0.14`  | `0.02..=0.5`| thickness of the ring front (canvas units)            |
+| `flash`      | `0.7`   | `0.0..=1.0` | ring brightness boost as its front passes a dot       |
+| `glow`       | `0.35`  | `0.0..=1.0` | base dot intensity that loudness rides on             |
+
 ### `[[layer]]` (optional)
 
 A layer stack. With **no** `[[layer]]` tables the preset is exactly one layer:

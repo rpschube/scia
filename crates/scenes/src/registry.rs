@@ -1,8 +1,7 @@
 //! The built-in scene registry: enumerate the scenes compiled into this crate
 //! and construct one by id.
 
-use crate::builtin::Spectra;
-use crate::builtin::spectra;
+use crate::builtin::{Lattice, Spectra, lattice, spectra};
 use crate::scene::{ParamSpec, Scene};
 
 /// A catalog entry describing a built-in scene, for a browser to list.
@@ -25,12 +24,20 @@ pub struct SceneInfo {
 }
 
 /// Every built-in scene, in listing order.
-static BUILTINS: &[SceneInfo] = &[SceneInfo {
-    id: "spectra",
-    mood: "kinetic",
-    summary: "The canonical analyzer: log-spaced bars whose low end punches on the onset envelope.",
-    params: spectra::PARAMS,
-}];
+static BUILTINS: &[SceneInfo] = &[
+    SceneInfo {
+        id: "spectra",
+        mood: "kinetic",
+        summary: "The canonical analyzer: log-spaced bars whose low end punches on the onset envelope.",
+        params: spectra::PARAMS,
+    },
+    SceneInfo {
+        id: "lattice",
+        mood: "serene",
+        summary: "A calm dot lattice; onsets fire rings that ripple outward and loudness sets the base glow.",
+        params: lattice::PARAMS,
+    },
+];
 
 /// The catalog of built-in scenes.
 #[must_use]
@@ -49,6 +56,7 @@ pub fn scene_info(id: &str) -> Option<&'static SceneInfo> {
 pub fn create_builtin(id: &str) -> Option<Box<dyn Scene>> {
     match id {
         "spectra" => Some(Box::new(Spectra::new())),
+        "lattice" => Some(Box::new(Lattice::new())),
         _ => None,
     }
 }
