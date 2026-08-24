@@ -190,6 +190,7 @@ fn probe(device: Option<String>, seconds: u64) -> ExitCode {
     println!("last push frames:    {}", stats.last_push_frames);
     println!("total frames pushed: {}", stats.pushed_frames);
     println!("dropped frames:      {}", stats.dropped_frames);
+    println!("buffer xruns:        {}", stats.xruns);
     println!("max callback gap:    {:.1} ms", stats.max_gap_ms);
     println!(
         "hops processed/synth: {}/{}  (synthesized fraction {:.4})",

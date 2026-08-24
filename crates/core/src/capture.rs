@@ -303,6 +303,10 @@ pub enum StreamHealth {
 pub trait CaptureStream: Send {
     /// The negotiated stream format, fixed for the stream's lifetime.
     fn format(&self) -> StreamFormat;
+    /// Transient buffer under/overruns the backend reported so far (never fatal).
+    fn xruns(&self) -> u64 {
+        0
+    }
 
     /// Whether the stream's error callback has fired. The default returns
     /// [`StreamHealth::Ok`] for backends (e.g. the synthetic source) that
