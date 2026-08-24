@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["capture-cpal", "perf-mode"]
+default = ["capture-cpal", "perf-mode", "route-notify"]
 # The cpal-based capture backend (Windows WASAPI loopback, Linux ALSA/PipeWire,
 # macOS Core Audio input). On by default.
 capture-cpal = ["dep:cpal"]
@@ -20,6 +20,15 @@ capture-cpal = ["dep:cpal"]
 # crate it links is a `cfg(windows)` dependency that never enters a non-Windows
 # build. Reuses `DeviceSelector`, so it pulls in `capture-cpal`.
 perf-mode = ["capture-cpal", "dep:windows"]
+# Windows-only event-driven route-change notification: an `IMMNotificationClient`
+# registered with the device enumerator flips the engine's reopen-request flag
+# the instant the default render endpoint changes or a device is removed, so a
+# switch is picked up on the route watcher's next tick instead of waiting out a
+# poll cycle. On by default, but it ONLY affects Windows: on every other platform
+# the module is a compile-everywhere stub whose `start` returns `Unsupported` and
+# the engine falls back to polling. Shares the same `cfg(windows)` `windows`
+# dependency perf mode links (never entering a non-Windows build).
+route-notify = ["dep:windows", "dep:windows-core"]
 # Enable cpal's native PipeWire host so Linux can capture the system output mix
 # (a sink monitor). OFF by default: it links libpipewire development libraries
 # that are not present on every build host, so it must not ride in an
@@ -47,6 +56,13 @@ optional = true
 # Perf mode's raw WASAPI COM backend. Windows-only (the crate itself is
 # `#![cfg(windows)]`) and optional, enabled by the `perf-mode` feature. Licensed
 # MIT OR Apache-2.0.
+# The #[implement] macro in `wasapi_route` expands to absolute `::windows_core`
+# paths, so the core crate must name the crate directly. Windows-only and
+# optional, enabled by the same `route-notify` feature. Licensed MIT OR Apache-2.0.
+[target.'cfg(windows)'.dependencies.windows-core]
+version = "0.62"
+optional = true
+
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 optional = true
