@@ -24,10 +24,10 @@ mood = "serene"
 drift = 1.0
 # scale     1.0    range 0.2..=4.0    spatial frequency: how many wave cycles span the field
 scale = 1.0
-# band      0.14   range 0.02..=0.5   base band half-width (fraction of height) at silence
-band = 0.14
-# response  0.35   range 0.0..=1.0    loudness-to-width gain: extra band half-width at full loudness
-response = 0.35
+# band      0.10   range 0.02..=0.5   base band half-width (fraction of height) at silence
+band = 0.10
+# response  0.30   range 0.0..=0.6    loudness-to-width gain: extra band half-width at full (normalized) loudness
+response = 0.30
 # contrast  2.2    range 1.0..=4.0    contrast shaping: higher pushes darks darker and brights brighter
 contrast = 2.2
 
@@ -46,17 +46,24 @@ contrast = 2.2
 # scale = 1.4
 
 # Feature -> parameter mappings. Each key is a parameter of the mapped scene;
-# each value is a table naming a feature and a response. A string value here is
-# reserved for the expression VM (a later card) and is rejected today.
+# each value is either a table naming a feature and a response, or a string
+# expression over the feature vocabulary (evaluated per frame).
 #
 # feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
 # curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
 # attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
-[map]
-# Widen the band with loudness on a slow, calm envelope: nearly a second to
-# swell in, a second and a half to settle back. Keeps the result inside band's
-# 0.02..=0.5 range (offset 0.1, plus up to scale 0.3).
-band = { feature = "loud", curve = "linear", attack_ms = 800, decay_ms = 1500, scale = 0.3, offset = 0.1 }
+#
+# No active mappings: aurora now normalizes loudness and widens the band from its
+# own `response` parameter (with an adaptive loudness ceiling and the calm
+# attack/release envelope built into the scene), so an external band <- loud map
+# is redundant and would drive the width off RAW rms — the exact level-dependence
+# the scene's normalizer removes. The mapping below is kept, commented, only as a
+# format example:
+#
+# [map]
+# Table form — widen the band with loudness on a slow, calm envelope:
+# band = { feature = "loud", curve = "linear", attack_ms = 800, decay_ms = 1500, scale = 0.3, offset = 0.1 }
+# Expression form (same shape, terser): band = "0.1 + loud * 0.3"
 
 [palette]
 # static | album-art. `album-art` is accepted and validated but resolves to the

@@ -1,5 +1,6 @@
 //! The built-in `aurora` scene: field validity, the loudness-driven band, the
-//! no-jitter guarantee, drift continuity and continuity across a hot reload.
+//! level-independent normalizer, the no-jitter guarantee, drift continuity and
+//! continuity across a hot reload.
 
 use scia_core::FeatureSnapshot;
 use scia_scenes::{Canvas, Primitive, Scene, SceneCtx, create_builtin};
@@ -122,6 +123,74 @@ fn aurora_loudness_widens_the_band() {
 }
 
 #[test]
+fn aurora_response_is_level_independent() {
+    // The adaptive loudness ceiling calibrates to each material's own loud
+    // passages, so two *sustained* signals at very different absolute levels — a
+    // quiet-mastered 0.08 and a loud 0.30 — both drive the normalized loudness to
+    // ~1.0 and must settle to essentially the same band width. This is the whole
+    // point of the normalizer: response independent of mastering level.
+    let frames = 300;
+    let dt = 0.05;
+
+    let mut quiet = aurora();
+    quiet.init(&SceneCtx::default());
+    let quiet_field = settle_and_render(quiet.as_mut(), 0.08, frames, dt);
+
+    let mut loud = aurora();
+    loud.init(&SceneCtx::default());
+    let loud_field = settle_and_render(loud.as_mut(), 0.30, frames, dt);
+
+    let quiet_extent = band_extent(&quiet_field);
+    let loud_extent = band_extent(&loud_field);
+
+    // They converge: settled widths differ by at most a row. (Measured: both
+    // settle to 54 rows — the band fills the field at normalized loudness ~1.)
+    let delta = (quiet_extent as i32 - loud_extent as i32).abs();
+    assert!(
+        delta <= 1,
+        "level-independent response: quiet-mastered ({quiet_extent}) and loud \
+         ({loud_extent}) settled band widths should converge, differ by {delta}"
+    );
+    // ...and both are genuinely widened, not converging on the narrow floor.
+    assert!(
+        quiet_extent >= 40 && loud_extent >= 40,
+        "both sustained levels should widen the band well past the quiet floor: \
+         quiet {quiet_extent}, loud {loud_extent}"
+    );
+}
+
+#[test]
+fn aurora_loud_quiet_band_ratio_is_visible() {
+    // Within one normalization context the swing from a quiet floor to a settled
+    // loud passage must be large enough to read on real music: assert the settled
+    // loud band is at least twice the quiet band's height.
+    let frames = 300;
+    let dt = 0.05;
+
+    let mut quiet = aurora();
+    quiet.init(&SceneCtx::default());
+    let quiet_field = settle_and_render(quiet.as_mut(), 0.0, frames, dt);
+
+    let mut loud = aurora();
+    loud.init(&SceneCtx::default());
+    let loud_field = settle_and_render(loud.as_mut(), 0.30, frames, dt);
+
+    let quiet_extent = band_extent(&quiet_field);
+    let loud_extent = band_extent(&loud_field);
+
+    // Measured: quiet floor ~18 rows, settled loud ~54 rows (ratio ~3x).
+    assert!(
+        quiet_extent > 0,
+        "the quiet floor should still light a band, got {quiet_extent}"
+    );
+    assert!(
+        loud_extent >= 2 * quiet_extent,
+        "settled loud band ({loud_extent} rows) should be at least twice the \
+         quiet band ({quiet_extent} rows) to read as a visible response"
+    );
+}
+
+#[test]
 fn aurora_ignores_onset_at_equal_loudness() {
     // Two scenes fed the SAME loudness; one has its onset flag flipping every
     // frame, the other never. Nothing in aurora reads the onset, so the fields
@@ -184,6 +253,17 @@ fn aurora_state_round_trip() {
         a.update(&warm, dt);
     }
     let state = a.state();
+    // The loudness ceiling is part of the calibration that must survive a hot
+    // reload: after sustaining rms 0.6 it has climbed to roughly that level, and
+    // the round-trip below only reproduces the next render if `next` (rms 0.2,
+    // below the ceiling) reads the same normalized loudness on both scenes.
+    let ceil = state
+        .get("ceil")
+        .expect("state carries the loudness ceiling");
+    assert!(
+        ceil > 0.4,
+        "the ceiling should have climbed toward the sustained level, got {ceil}"
+    );
     a.update(&next, dt);
     let field_a = render_field(a.as_mut()).2;
 
