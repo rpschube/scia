@@ -464,6 +464,63 @@ fn mapping_makes_the_presenter_feature_responsive() {
     );
 }
 
+/// A built-in preset by scene id, the same one `--scene <id>` and the browser
+/// preview resolve.
+fn builtin(id: &str) -> Preset {
+    builtin_preset(id)
+        .expect("known built-in preset")
+        .expect("valid built-in preset")
+}
+
+/// A snapshot with strong signals across the board, so every built-in scene
+/// lights cells: a full spectrum ramp, high loudness, and an onset.
+fn lively_snapshot() -> FeatureSnapshot {
+    let mut snap = FeatureSnapshot::default();
+    for i in 0..32 {
+        snap.spectrum[i] = (i as f32 / 31.0).clamp(0.3, 1.0);
+    }
+    snap.spectrum_len = 32;
+    snap.rms = 0.9;
+    snap.peak = 0.95;
+    snap.bands = [1.0, 0.8, 0.6];
+    snap.flux = 0.7;
+    snap.onset = true;
+    snap.onset_age_ms = 0.0;
+    snap.tempo_bpm = 120.0;
+    snap.beat_confidence = 0.8;
+    snap
+}
+
+#[test]
+fn rapid_switches_never_blank_the_canvas() {
+    let (cols, rows) = (16u16, 8u16);
+    let area = Rect::new(0, 0, cols, rows);
+    let snap = lively_snapshot();
+
+    // Start on a lit scene, warmed one frame.
+    let mut p = ScenePresenter::from_preset(&builtin("spectra"), Tier::Half);
+    p.resize(cols, rows);
+    p.frame(&snap, 0.016);
+
+    // Retarget the crossfade every couple of short frames, mid-fade — the way a
+    // run of highlight moves does. The canvas must stay lit through each switch,
+    // and the fade must still be running (a retarget, not a completed swap).
+    for id in ["lattice", "aurora", "starfall", "spectra", "lattice"] {
+        p.swap_preset(&builtin(id));
+        for step in 0..2 {
+            // 30 ms per step keeps every swap well inside the 300 ms fade.
+            p.frame(&snap, 0.03);
+            let buf = paint(&p, cols, rows);
+            let lit: u16 = (0..cols).map(|x| column_fill(&buf, area, x)).sum();
+            assert!(lit > 0, "canvas blanked switching to {id} (step {step})");
+            assert!(
+                p.is_fading(),
+                "a mid-fade retarget keeps the fade active ({id}, step {step})"
+            );
+        }
+    }
+}
+
 #[test]
 fn fade_completes_after_300ms() {
     let mut p = ScenePresenter::from_preset(&spectra_preset("gap = 0.0"), Tier::Half);
