@@ -102,14 +102,14 @@ privacy:
 # THE merge gate: fmt, lint, deny, core isolation, privacy, tests. CI mirrors this.
 gate: fmt-check clippy deny core-deps privacy test
 
-# Create a new worktree + branch under ../scia-wt and copy local-only files in.
-wt branch:
+# Create a new worktree + branch under ../scia-wt (off `base`) and copy local-only files in.
+wt branch base="master":
     #!/usr/bin/env bash
     set -euo pipefail
     common=$(git rev-parse --path-format=absolute --git-common-dir)
     main=$(dirname "$common")
     dest="$main/../scia-wt/{{branch}}"
-    git worktree add -b "{{branch}}" "$dest" master
+    git worktree add -b "{{branch}}" "$dest" "{{base}}"
     dest=$(realpath -m "$dest")
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
