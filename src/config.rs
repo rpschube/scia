@@ -238,15 +238,16 @@ pub fn parse(text: &str) -> Config {
     }
 }
 
-/// The config file path for this platform, or `None` when no base directory is
-/// known (no `HOME`/`XDG_CONFIG_HOME`, or no `APPDATA` on Windows).
-fn config_path() -> Option<PathBuf> {
+/// The `scia` config directory for this platform, or `None` when no base
+/// directory is known (no `HOME`/`XDG_CONFIG_HOME`, or no `APPDATA` on Windows).
+/// This is the directory `config.toml` lives in, and the root the tuning strip
+/// exports builtin presets under (`<config_dir>/presets/<name>.toml`).
+#[must_use]
+pub fn config_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        let base = std::env::var_os("APPDATA")?;
-        let mut path = PathBuf::from(base);
+        let mut path = PathBuf::from(std::env::var_os("APPDATA")?);
         path.push("scia");
-        path.push("config.toml");
         Some(path)
     }
     #[cfg(not(windows))]
@@ -263,9 +264,16 @@ fn config_path() -> Option<PathBuf> {
             }
         };
         path.push("scia");
-        path.push("config.toml");
         Some(path)
     }
+}
+
+/// The config file path for this platform, or `None` when no base directory is
+/// known. `config.toml` inside [`config_dir`].
+fn config_path() -> Option<PathBuf> {
+    let mut path = config_dir()?;
+    path.push("config.toml");
+    Some(path)
 }
 
 #[cfg(test)]

@@ -41,12 +41,14 @@ pub enum InputAction {
     /// Apply the current track's art palette to the live scene, toggling back to
     /// the scene's own palette on a second press (default `p`).
     Palette,
+    /// Toggle the quick tuning strip (default `t`).
+    Tuning,
 }
 
 impl InputAction {
     /// Every action, in a stable order. [`Keymap::action_for`] scans this order,
     /// so an earlier action wins if two are ever bound to the same chord.
-    pub const ALL: [InputAction; 9] = [
+    pub const ALL: [InputAction; 10] = [
         InputAction::SceneNext,
         InputAction::ScenePrev,
         InputAction::Browser,
@@ -56,6 +58,7 @@ impl InputAction {
         InputAction::Chrome,
         InputAction::NowPlaying,
         InputAction::Palette,
+        InputAction::Tuning,
     ];
 
     /// The config `[keys]` name this action is bound under.
@@ -71,6 +74,7 @@ impl InputAction {
             InputAction::Chrome => "chrome",
             InputAction::NowPlaying => "now_playing",
             InputAction::Palette => "palette",
+            InputAction::Tuning => "tuning",
         }
     }
 
@@ -87,6 +91,7 @@ impl InputAction {
             InputAction::Chrome => "chrome mode",
             InputAction::NowPlaying => "now playing",
             InputAction::Palette => "apply palette",
+            InputAction::Tuning => "tuning strip",
         }
     }
 
@@ -241,6 +246,8 @@ pub struct Keymap {
     pub now_playing: Option<KeyChord>,
     /// Apply / revert the current track's art palette.
     pub palette: Option<KeyChord>,
+    /// Toggle the quick tuning strip.
+    pub tuning: Option<KeyChord>,
 }
 
 impl Default for Keymap {
@@ -255,6 +262,7 @@ impl Default for Keymap {
             chrome: Some(KeyChord::plain(KeyCode::Char('c'))),
             now_playing: Some(KeyChord::plain(KeyCode::Char('n'))),
             palette: Some(KeyChord::plain(KeyCode::Char('p'))),
+            tuning: Some(KeyChord::plain(KeyCode::Char('t'))),
         }
     }
 }
@@ -273,6 +281,7 @@ impl Keymap {
             InputAction::Chrome => self.chrome,
             InputAction::NowPlaying => self.now_playing,
             InputAction::Palette => self.palette,
+            InputAction::Tuning => self.tuning,
         }
     }
 
@@ -288,6 +297,7 @@ impl Keymap {
             InputAction::Chrome => &mut self.chrome,
             InputAction::NowPlaying => &mut self.now_playing,
             InputAction::Palette => &mut self.palette,
+            InputAction::Tuning => &mut self.tuning,
         };
         *slot = chord;
     }
@@ -405,6 +415,30 @@ mod tests {
             km.action_for(&key(KeyCode::Char('p'), false)),
             Some(InputAction::Palette)
         );
+    }
+
+    #[test]
+    fn tuning_defaults_to_t_and_rebinds() {
+        let km = Keymap::default();
+        assert!(km.tuning.unwrap().matches(&key(KeyCode::Char('t'), false)));
+        assert_eq!(
+            km.action_for(&key(KeyCode::Char('t'), false)),
+            Some(InputAction::Tuning)
+        );
+        // The config name round-trips like every other action.
+        assert_eq!(InputAction::parse("tuning"), Some(InputAction::Tuning));
+
+        // Rebinding moves it to a new key and frees the old one.
+        let mut km = Keymap::default();
+        km.rebind(
+            InputAction::Tuning,
+            Some(KeyChord::plain(KeyCode::Char('g'))),
+        );
+        assert_eq!(
+            km.action_for(&key(KeyCode::Char('g'), false)),
+            Some(InputAction::Tuning)
+        );
+        assert_eq!(km.action_for(&key(KeyCode::Char('t'), false)), None);
     }
 
     #[test]

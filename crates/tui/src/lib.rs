@@ -28,9 +28,11 @@ mod probe;
 mod render;
 mod sixel;
 mod stats;
+mod tuning;
 
 use std::fmt;
 use std::io::{self, Stdout, Write as _};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -46,7 +48,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
 use scia_core::{Activity, EngineStats, FeatureReader, FeatureSnapshot, StreamHealth};
-use scia_scenes::{Palette, Preset, ReloadEvent, builtin_preset, builtin_scenes};
+use scia_scenes::{Palette, Preset, ReloadEvent, builtin_preset, builtin_presets, builtin_scenes};
 
 pub use chrome::{ChromeMode, ChromeState, Fade};
 pub use keymap::{ChordParseError, InputAction, KeyChord, Keymap, parse_chord};
@@ -66,6 +68,9 @@ pub use probe::{
 };
 pub use render::{SceneNav, UiState, VERSION, draw, draw_help, draw_notice};
 pub use sixel::{SIXEL_REGISTERS, SixelEncoder, quantize as sixel_quantize};
+pub use tuning::{
+    TuningParam, TuningStrip, apply_params_edit, draw_tuning, write_back_export, write_back_file,
+};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
@@ -113,6 +118,15 @@ pub struct TuiOptions {
     /// The chrome personality to start in. Defaults to
     /// [`ChromeMode::Invisible`].
     pub chrome: ChromeMode,
+    /// The `--scene-file` path, when a preset was loaded from disk. The tuning
+    /// strip writes its adjustments back to this file, comment-preserving, when
+    /// set; otherwise it exports the running builtin preset under
+    /// [`config_dir`](Self::config_dir).
+    pub scene_file: Option<PathBuf>,
+    /// The base config directory (the one `config.toml` lives in), used as the
+    /// root of the tuning strip's builtin-export path
+    /// (`<config_dir>/presets/<name>.toml`). `None` disables export write-back.
+    pub config_dir: Option<PathBuf>,
 }
 
 impl Default for TuiOptions {
@@ -130,6 +144,8 @@ impl Default for TuiOptions {
             initial_notice: None,
             keymap: Keymap::default(),
             chrome: ChromeMode::Invisible,
+            scene_file: None,
+            config_dir: None,
         }
     }
 }
@@ -437,6 +453,29 @@ fn run_loop(
             notice_deadline = Some(frame_start + NOTICE_TTL);
         }
 
+        // Fulfil a tuning-strip open request: seed the strip from the presenter's
+        // first-layer manifest, current values and mappings. With no presenter
+        // (direct-bars) or no tunable parameters it stays shut.
+        if std::mem::take(&mut ui.tuning_open_pending) {
+            if let Some(p) = presenter.as_ref() {
+                let params = build_tuning_params(p);
+                ui.tuning.open(params);
+            }
+        }
+
+        // Fulfil a tuning-strip write request: write the adjusted values back to
+        // the `--scene-file` (comments intact) or export the running builtin
+        // preset under the config dir, leaving a status notice either way.
+        if std::mem::take(&mut ui.tuning_write_pending) {
+            ui.notice = Some(write_tuning(
+                presenter.as_ref(),
+                &ui.tuning,
+                &ui.scene_nav,
+                opts,
+            ));
+            notice_deadline = Some(frame_start + NOTICE_TTL);
+        }
+
         // Seam: keep the chrome's track line current from the metadata state.
         ui.track = ui
             .now_playing
@@ -552,6 +591,14 @@ fn run_loop(
                 terminal.draw(|frame| {
                     if let Some(body) = render::draw_chrome(frame, &snap, &ui) {
                         p.resize(body.width, body.height);
+                        // Push the tuning strip's working values into the layer-0
+                        // bag before the frame advances, so an unmapped
+                        // adjustment takes effect on this very frame.
+                        if ui.tuning.is_open() {
+                            for tp in ui.tuning.params() {
+                                p.set_param(tp.key, tp.value);
+                            }
+                        }
                         p.frame(&snap, scene_dt);
                         // In a pixel mode `draw` paints only the text runs; the
                         // image is written as a graphics-protocol frame, placed at
@@ -577,6 +624,11 @@ fn run_loop(
                                 &ui.now_playing,
                                 ui.palette_applied,
                             );
+                        }
+                        // The tuning strip paints over the body bottom, above the
+                        // scene and now-playing panel; help still layers on top.
+                        if ui.tuning.is_open() {
+                            tuning::draw_tuning(frame.buffer_mut(), body, &ui.tuning);
                         }
                         // The help overlay is the topmost body layer.
                         render::draw_help(frame.buffer_mut(), body, &ui);
@@ -740,6 +792,36 @@ fn handle_event(event: Event, ui: &mut UiState) -> Action {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 return Action::Quit;
             }
+            // While the tuning strip is open its keys take priority over scene
+            // cycling and the browser: tab cycles the parameter, the arrows
+            // adjust it, `w` writes back, and esc closes. Everything else (the
+            // tuning key itself, `?`, `d`, the other rebindable actions) falls
+            // through unchanged.
+            if ui.tuning.is_open() {
+                match key.code {
+                    KeyCode::Esc => {
+                        ui.tuning.close();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Tab => {
+                        ui.tuning.select_next();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Left => {
+                        ui.tuning.adjust_selected(-1);
+                        return Action::Redraw;
+                    }
+                    KeyCode::Right => {
+                        ui.tuning.adjust_selected(1);
+                        return Action::Redraw;
+                    }
+                    KeyCode::Char('w') => {
+                        ui.tuning_write_pending = true;
+                        return Action::Redraw;
+                    }
+                    _ => {}
+                }
+            }
             // Esc is structural and context-sensitive: it closes the browser
             // (restoring the original scene) while open, otherwise it quits.
             if key.code == KeyCode::Esc {
@@ -829,6 +911,17 @@ fn apply_action(action: InputAction, ui: &mut UiState, browsing: bool) -> Action
             ui.palette_pending = true;
             Action::Redraw
         }
+        // Toggle the tuning strip. Closing is immediate; opening is a one-shot
+        // request the loop fulfils against the presenter (which it seeds the
+        // strip from). Inert with no presenter or no tunable parameters.
+        InputAction::Tuning => {
+            if ui.tuning.is_open() {
+                ui.tuning.close();
+            } else {
+                ui.tuning_open_pending = true;
+            }
+            Action::Redraw
+        }
         // The browser/cycle guards fall through here when not in scene mode.
         InputAction::Browser | InputAction::SceneNext | InputAction::ScenePrev => Action::None,
     }
@@ -864,6 +957,77 @@ fn apply_palette_toggle(
     } else {
         ui.notice = Some("nothing playing".to_string());
     }
+}
+
+/// Build the tuning-strip parameter list from the presenter's first layer: every
+/// manifest key with its current bag value and whether a `[map]` entry drives it.
+/// The strip itself slices this to the first few keys.
+fn build_tuning_params(p: &ScenePresenter) -> Vec<TuningParam> {
+    p.layer0_specs()
+        .iter()
+        .map(|s| TuningParam {
+            key: s.key,
+            min: s.min,
+            max: s.max,
+            value: p.layer0_value(s.key),
+            mapped: p.layer0_mapped(s.key),
+        })
+        .collect()
+}
+
+/// Write the tuning strip's adjusted values back to the preset, returning the
+/// status notice to show. With a `--scene-file` it edits that file in place
+/// (comments intact); with a builtin preset it exports to
+/// `<config_dir>/presets/<name>.toml`, the running scene naming the file. Never
+/// panics — every failure is reported as a notice.
+fn write_tuning(
+    presenter: Option<&ScenePresenter>,
+    tuning: &TuningStrip,
+    nav: &SceneNav,
+    opts: &TuiOptions,
+) -> String {
+    let edits = tuning.dirty_edits();
+    if edits.is_empty() {
+        return "nothing to write".to_string();
+    }
+    // An existing scene file is edited in place, comments preserved.
+    if let Some(path) = &opts.scene_file {
+        return match tuning::write_back_file(path, edits) {
+            Ok(()) => format!("wrote {}", file_label(path)),
+            Err(err) => format!("write failed: {err}"),
+        };
+    }
+    // Otherwise export the running builtin preset under the config dir. The name
+    // is the currently running scene (cycling may have moved it off `--scene`).
+    let Some(base) = &opts.config_dir else {
+        return "no config dir for export".to_string();
+    };
+    let name = nav
+        .current_id()
+        .or(opts.scene.as_deref())
+        .or_else(|| presenter.and_then(ScenePresenter::layer0_scene_id));
+    let Some(name) = name else {
+        return "no preset to write".to_string();
+    };
+    let Some(src) = builtin_presets()
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, s)| *s)
+    else {
+        return format!("no builtin source for {name}");
+    };
+    match tuning::write_back_export(base, name, src, edits) {
+        Ok(path) => format!("wrote {}", path.display()),
+        Err(err) => format!("write failed: {err}"),
+    }
+}
+
+/// A short label for a written file: its file name, or the full path when it has
+/// none.
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 #[cfg(test)]
@@ -1217,6 +1381,82 @@ mod tests {
             p.frame(&scia_core::FeatureSnapshot::default(), 0.05);
         }
         assert_eq!(p.palette(), scene_palette, "reverts to the scene palette");
+    }
+
+    /// A scene-mode UiState with the tuning strip already open on two params, as
+    /// the loop would have seeded it from the presenter.
+    fn ui_with_open_strip() -> UiState {
+        let mut ui = UiState {
+            scene_mode: true,
+            ..UiState::default()
+        };
+        ui.tuning.open(vec![
+            TuningParam {
+                key: "gap",
+                min: 0.0,
+                max: 1.0,
+                value: 0.5,
+                mapped: false,
+            },
+            TuningParam {
+                key: "punch",
+                min: 0.0,
+                max: 2.0,
+                value: 0.3,
+                mapped: true,
+            },
+        ]);
+        ui
+    }
+
+    #[test]
+    fn t_requests_the_tuning_strip() {
+        let mut ui = UiState::default();
+        assert!(!ui.tuning_open_pending);
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('t')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(ui.tuning_open_pending, "t asks the loop to open the strip");
+    }
+
+    #[test]
+    fn t_closes_the_strip_when_open() {
+        let mut ui = ui_with_open_strip();
+        assert!(ui.tuning.is_open());
+        let _ = handle_event(press(KeyCode::Char('t')), &mut ui);
+        assert!(!ui.tuning.is_open(), "t closes an open strip");
+        assert!(
+            !ui.tuning_open_pending,
+            "closing does not re-request an open"
+        );
+    }
+
+    #[test]
+    fn tuning_keys_take_priority_over_scene_cycling_while_open() {
+        let mut ui = ui_with_open_strip();
+        // Tab cycles the selected parameter, it does not open the browser.
+        let _ = handle_event(press(KeyCode::Tab), &mut ui);
+        assert_eq!(ui.tuning.selected(), 1);
+        assert!(!ui.scene_nav.is_open(), "tab did not open the browser");
+        // Right adjusts the selected value; it does not cycle the scene.
+        let before = ui.tuning.params()[1].value;
+        let _ = handle_event(press(KeyCode::Right), &mut ui);
+        assert!(ui.tuning.params()[1].value >= before);
+        assert_eq!(
+            ui.scene_nav.take_pending(),
+            None,
+            "right did not cycle the scene"
+        );
+        // `w` raises a one-shot write request.
+        let _ = handle_event(press(KeyCode::Char('w')), &mut ui);
+        assert!(ui.tuning_write_pending, "w requests a write-back");
+        // Esc closes the strip rather than quitting.
+        assert!(matches!(
+            handle_event(press(KeyCode::Esc), &mut ui),
+            Action::Redraw
+        ));
+        assert!(!ui.tuning.is_open());
     }
 
     #[test]
