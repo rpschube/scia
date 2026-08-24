@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+mod chrome;
 mod keymap;
 mod mosaic;
 mod nowplaying;
@@ -43,6 +44,7 @@ use ratatui::backend::CrosstermBackend;
 use scia_core::{Activity, EngineStats, FeatureReader, FeatureSnapshot, StreamHealth};
 use scia_scenes::{Palette, Preset, ReloadEvent, builtin_preset, builtin_scenes};
 
+pub use chrome::{ChromeMode, ChromeState, Fade};
 pub use keymap::{ChordParseError, InputAction, KeyChord, Keymap, parse_chord};
 pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
 pub use nowplaying::{
@@ -96,6 +98,9 @@ pub struct TuiOptions {
     /// The active key bindings, built at startup from the built-in defaults plus
     /// any config overrides. The default is the built-in binding set.
     pub keymap: Keymap,
+    /// The chrome personality to start in. Defaults to
+    /// [`ChromeMode::Invisible`].
+    pub chrome: ChromeMode,
 }
 
 impl Default for TuiOptions {
@@ -111,6 +116,7 @@ impl Default for TuiOptions {
             preset: None,
             tier: None,
             keymap: Keymap::default(),
+            chrome: ChromeMode::Invisible,
         }
     }
 }
@@ -305,8 +311,13 @@ fn run_loop(
         scene_mode,
         scene_nav: SceneNav::new(initial_scene),
         keymap: opts.keymap,
+        chrome: ChromeState::new(opts.chrome),
         ..UiState::default()
     };
+    // Tracks the now-playing line so a track change can reset the invisible-mode
+    // fade. `track_line` is `None` until the metadata seam is wired, so this
+    // stays inert today but is ready for it.
+    let mut last_track: Option<String> = ui.track_line().map(str::to_owned);
     // Frame period fed to the scene presenter; seeded to the target period.
     let default_dt = 1.0 / opts.fps.max(1) as f32;
     // Holds the frozen snapshot while paused, so a paused scene renders an
@@ -394,6 +405,30 @@ fn run_loop(
             notice_deadline = Some(frame_start + NOTICE_TTL);
         }
 
+        // Seam: keep the chrome's track line current from the metadata state.
+        ui.track = ui
+            .now_playing
+            .current
+            .as_ref()
+            .map(|np| match (np.title.as_deref(), np.artist.as_deref()) {
+                (Some(t), Some(a)) => format!("{t} — {a}"),
+                (Some(t), None) => t.to_string(),
+                (None, Some(a)) => a.to_string(),
+                (None, None) => String::new(),
+            })
+            .filter(|s| !s.is_empty());
+
+        // Advance the chrome timers on the real frame period: the invisible-mode
+        // fade tracks time-since-input, not scene motion, so it keeps counting
+        // while the scene is paused. A track-line change resets the fade the same
+        // way a keypress does.
+        let cur_track = ui.track_line().map(str::to_owned);
+        if cur_track != last_track {
+            ui.chrome.on_track_change();
+            last_track = cur_track;
+        }
+        ui.chrome.tick(dt);
+
         // Refresh the engine counters first: activity feeds the idle downshift.
         ui.stats = stats();
         ui.fps_measured = fps_ema;
@@ -479,6 +514,9 @@ fn run_loop(
                         p.resize(body.width, body.height);
                         p.frame(&snap, scene_dt);
                         p.draw(frame.buffer_mut(), body);
+                        // The chrome personality paints over the scene, before
+                        // the debug and help overlays layered above it.
+                        chrome::render(frame.buffer_mut(), body, &snap, &ui);
                         // The overlay is drawn last, over the rasterized scene.
                         if ui.overlay {
                             render::render_overlay(frame.buffer_mut(), body, &snap, &ui);
@@ -605,6 +643,9 @@ impl PauseState {
 fn handle_event(event: Event, ui: &mut UiState) -> Action {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
+            // Any keypress resets the invisible-mode fade, whatever it goes on to
+            // do (including nothing).
+            ui.chrome.on_input();
             let browsing = ui.scene_mode && ui.scene_nav.is_open();
 
             // Ctrl-C is a structural, always-on quit, independent of the keymap.
@@ -683,6 +724,10 @@ fn apply_action(action: InputAction, ui: &mut UiState, browsing: bool) -> Action
         }
         InputAction::Pause => {
             ui.paused = !ui.paused;
+            Action::Redraw
+        }
+        InputAction::Chrome => {
+            ui.chrome.cycle();
             Action::Redraw
         }
         // Toggle the now-playing panel. Works in every mode, paused or not.
@@ -1133,6 +1178,63 @@ mod tests {
             Action::None
         ));
         assert_eq!(ui.scene_nav.take_pending(), None);
+    }
+
+    #[test]
+    fn chrome_key_cycles_the_mode_and_raises_a_toast() {
+        let mut ui = UiState::default();
+        assert_eq!(ui.chrome.mode(), ChromeMode::Invisible);
+        // The default chrome key `c` cycles to the next personality.
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('c')), &mut ui),
+            Action::Redraw
+        ));
+        assert_eq!(ui.chrome.mode(), ChromeMode::Instrument);
+        let toast = ui.chrome.toast_text().expect("cycling raises a toast");
+        assert!(
+            toast.contains("instrument"),
+            "toast names the new mode: {toast:?}"
+        );
+        // Cycling wraps back to invisible after all four.
+        let _ = handle_event(press(KeyCode::Char('c')), &mut ui);
+        let _ = handle_event(press(KeyCode::Char('c')), &mut ui);
+        assert_eq!(ui.chrome.mode(), ChromeMode::Utilitarian);
+        let _ = handle_event(press(KeyCode::Char('c')), &mut ui);
+        assert_eq!(ui.chrome.mode(), ChromeMode::Invisible);
+    }
+
+    #[test]
+    fn any_keypress_returns_the_faded_invisible_line() {
+        let mut ui = UiState::default();
+        // Drive the fade all the way out (as the loop would, on dt).
+        ui.chrome.tick(5.0);
+        assert_eq!(ui.chrome.fade(), Fade::Hidden);
+        // Any key — even an unbound one that does nothing else — returns it.
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('z')), &mut ui),
+            Action::None
+        ));
+        assert_eq!(ui.chrome.fade(), Fade::Full, "a keypress resets the fade");
+    }
+
+    #[test]
+    fn rebinding_chrome_drives_the_new_key() {
+        let mut ui = UiState {
+            keymap: Keymap {
+                chrome: Some(KeyChord::plain(KeyCode::Char('m'))),
+                ..Keymap::default()
+            },
+            ..UiState::default()
+        };
+        // The rebound key cycles chrome; the old `c` no longer does.
+        let _ = handle_event(press(KeyCode::Char('m')), &mut ui);
+        assert_eq!(ui.chrome.mode(), ChromeMode::Instrument);
+        let _ = handle_event(press(KeyCode::Char('c')), &mut ui);
+        assert_eq!(
+            ui.chrome.mode(),
+            ChromeMode::Instrument,
+            "the old chrome key is inert after a rebind"
+        );
     }
 
     #[test]

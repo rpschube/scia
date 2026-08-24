@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use serde::Deserialize;
 
-use scia_tui::{InputAction, Keymap, parse_chord};
+use scia_tui::{ChromeMode, InputAction, Keymap, parse_chord};
 
 use crate::PresenterTier;
 
@@ -42,6 +42,7 @@ struct RawDefaults {
     overlay: Option<bool>,
     perf_mode: Option<bool>,
     demo_bpm: Option<f32>,
+    chrome: Option<String>,
 }
 
 /// The config-file `[defaults]` after validation. Each is `None` when the file
@@ -58,6 +59,8 @@ pub struct FileDefaults {
     pub perf_mode: Option<bool>,
     /// Default demo tempo.
     pub demo_bpm: Option<f32>,
+    /// Default chrome personality.
+    pub chrome: Option<ChromeMode>,
 }
 
 /// The fully loaded config: validated defaults, the resolved keymap, and any
@@ -99,6 +102,8 @@ pub struct CliLayer {
     pub perf_mode: bool,
     /// `--demo-bpm N`.
     pub demo_bpm: Option<f32>,
+    /// `--chrome MODE`.
+    pub chrome: Option<ChromeMode>,
 }
 
 /// The resolved options after applying precedence: built-in defaults < config <
@@ -115,6 +120,8 @@ pub struct Resolved {
     pub perf_mode: bool,
     /// Demo tempo in BPM (still clamped by the caller).
     pub demo_bpm: f32,
+    /// The chrome personality to start in.
+    pub chrome: ChromeMode,
 }
 
 /// Merge the CLI layer over the file defaults over the built-in defaults.
@@ -131,6 +138,7 @@ pub fn resolve(cli: CliLayer, file: &FileDefaults) -> Resolved {
         overlay: cli.overlay || file.overlay.unwrap_or(false),
         perf_mode: cli.perf_mode || file.perf_mode.unwrap_or(false),
         demo_bpm: cli.demo_bpm.or(file.demo_bpm).unwrap_or(DEFAULT_DEMO_BPM),
+        chrome: cli.chrome.or(file.chrome).unwrap_or_default(),
     }
 }
 
@@ -189,12 +197,23 @@ pub fn parse(text: &str) -> Config {
         }
     });
 
+    // Validate the chrome personality against the same names the flag accepts.
+    let chrome = raw.defaults.chrome.as_deref().and_then(|name| {
+        ChromeMode::parse(name).or_else(|| {
+            warnings.push(format!(
+                "config: unknown chrome `{name}`; ignoring (valid: invisible, instrument, playful, utilitarian)"
+            ));
+            None
+        })
+    });
+
     let defaults = FileDefaults {
         scene: raw.defaults.scene,
         presenter,
         overlay: raw.defaults.overlay,
         perf_mode: raw.defaults.perf_mode,
         demo_bpm: raw.defaults.demo_bpm,
+        chrome,
     };
 
     // Apply the [keys] overrides on top of the built-in map.
@@ -349,6 +368,7 @@ mod tests {
             overlay: Some(true),
             perf_mode: Some(true),
             demo_bpm: Some(90.0),
+            chrome: Some(ChromeMode::Instrument),
         };
 
         // No flags: the config layer wins over the built-in defaults.
@@ -359,6 +379,7 @@ mod tests {
                 overlay: false,
                 perf_mode: false,
                 demo_bpm: None,
+                chrome: None,
             },
             &file,
         );
@@ -367,6 +388,7 @@ mod tests {
         assert!(from_config.overlay);
         assert!(from_config.perf_mode);
         assert_eq!(from_config.demo_bpm, 90.0);
+        assert_eq!(from_config.chrome, ChromeMode::Instrument);
 
         // Flags present: they beat the config layer.
         let from_flags = resolve(
@@ -376,12 +398,18 @@ mod tests {
                 overlay: true,
                 perf_mode: true,
                 demo_bpm: Some(140.0),
+                chrome: Some(ChromeMode::Playful),
             },
             &file,
         );
         assert_eq!(from_flags.scene.as_deref(), Some("starfall"));
         assert_eq!(from_flags.presenter, Some(PresenterTier::Octant));
         assert_eq!(from_flags.demo_bpm, 140.0);
+        assert_eq!(
+            from_flags.chrome,
+            ChromeMode::Playful,
+            "the flag beats the config"
+        );
 
         // Nothing anywhere: the built-in defaults.
         let bare = resolve(
@@ -391,6 +419,7 @@ mod tests {
                 overlay: false,
                 perf_mode: false,
                 demo_bpm: None,
+                chrome: None,
             },
             &FileDefaults::default(),
         );
@@ -399,5 +428,37 @@ mod tests {
         assert!(!bare.overlay);
         assert!(!bare.perf_mode);
         assert_eq!(bare.demo_bpm, DEFAULT_DEMO_BPM);
+        assert_eq!(
+            bare.chrome,
+            ChromeMode::Invisible,
+            "the built-in default is invisible"
+        );
+    }
+
+    #[test]
+    fn chrome_parses_each_mode() {
+        for (name, mode) in [
+            ("invisible", ChromeMode::Invisible),
+            ("instrument", ChromeMode::Instrument),
+            ("playful", ChromeMode::Playful),
+            ("utilitarian", ChromeMode::Utilitarian),
+        ] {
+            let cfg = parse(&format!("[defaults]\nchrome = \"{name}\"\n"));
+            assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+            assert_eq!(cfg.defaults.chrome, Some(mode));
+        }
+    }
+
+    #[test]
+    fn unknown_chrome_warns_and_drops() {
+        let cfg = parse(
+            r#"
+            [defaults]
+            chrome = "hologram"
+            "#,
+        );
+        assert_eq!(cfg.defaults.chrome, None);
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(cfg.warnings[0].contains("hologram"));
     }
 }

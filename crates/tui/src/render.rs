@@ -11,6 +11,7 @@ use ratatui::style::{Modifier, Style};
 use scia_core::{Activity, EngineStats, FeatureSnapshot};
 use scia_scenes::{SceneInfo, builtin_scenes};
 
+use crate::chrome::ChromeState;
 use crate::keymap::{InputAction, Keymap};
 use crate::nowplaying::{self, NowPlayingState};
 use crate::palette;
@@ -94,6 +95,28 @@ pub struct UiState {
     /// The now-playing metadata the loop keeps current from the backend event
     /// stream. Empty (nothing playing) by default.
     pub now_playing: NowPlayingState,
+    /// The now-playing track line, when the metadata backend has one. `None`
+    /// until the now-playing metadata seam is wired in; [`track_line`] is the one
+    /// accessor the chrome reads, so wiring the value here lights every chrome
+    /// mode at once.
+    ///
+    /// [`track_line`]: UiState::track_line
+    pub track: Option<String>,
+    /// The chrome-personality state: the active mode plus its fade / wave / toast
+    /// timers, advanced by the frame `dt`.
+    pub chrome: ChromeState,
+}
+
+impl UiState {
+    /// The now-playing track line, or `None` when the metadata backend has not
+    /// supplied one. The single track-line seam: it returns `None` today, and the
+    /// chrome falls back to the source label the header shows. When the metadata
+    /// branch sets [`track`](UiState::track), the real value flows through here
+    /// with no other change.
+    #[must_use]
+    pub fn track_line(&self) -> Option<&str> {
+        self.track.as_deref()
+    }
 }
 
 /// Compute the frame layout: the header row, the optional body area, and the
@@ -124,6 +147,9 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
     render_header(buf, header, snap, ui);
     if let Some(body) = body {
         render_body(buf, body, snap);
+        // The chrome personality paints over the scene body, before the debug
+        // and help overlays, which are separate surfaces layered above it.
+        crate::chrome::render(buf, body, snap, ui);
         if ui.overlay {
             render_overlay(buf, body, snap, ui);
         }
@@ -181,13 +207,13 @@ const TOAST_SECS: f32 = 2.0;
 /// primitive — the design reserves it for hot-reload confirmations too, but the
 /// scene-cycle confirmation is its only wiring today.
 #[derive(Clone, Debug)]
-pub struct Toast {
+pub(crate) struct Toast {
     text: String,
     remaining: f32,
 }
 
 impl Toast {
-    fn new(text: String) -> Self {
+    pub(crate) fn new(text: String) -> Self {
         Self {
             text,
             remaining: TOAST_SECS,
@@ -195,9 +221,14 @@ impl Toast {
     }
 
     /// Advance the toast by `dt` seconds; returns whether it is still alive.
-    fn tick(&mut self, dt: f32) -> bool {
+    pub(crate) fn tick(&mut self, dt: f32) -> bool {
         self.remaining -= dt.max(0.0);
         self.remaining > 0.0
+    }
+
+    /// The toast's text.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
     }
 }
 
@@ -269,6 +300,12 @@ impl SceneNav {
     #[must_use]
     pub fn current(&self) -> usize {
         self.current
+    }
+
+    /// The committed scene's id, if the registry is non-empty.
+    #[must_use]
+    pub fn current_id(&self) -> Option<&'static str> {
+        self.scenes.get(self.current).map(|s| s.id)
     }
 
     /// The highlight cursor index.

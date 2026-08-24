@@ -34,6 +34,8 @@ pub enum InputAction {
     Pause,
     /// Quit (default `q`).
     Quit,
+    /// Cycle the chrome personality (default `c`).
+    Chrome,
     /// Toggle the now-playing panel (default `n`).
     NowPlaying,
     /// Apply the current track's art palette to the live scene, toggling back to
@@ -44,13 +46,14 @@ pub enum InputAction {
 impl InputAction {
     /// Every action, in a stable order. [`Keymap::action_for`] scans this order,
     /// so an earlier action wins if two are ever bound to the same chord.
-    pub const ALL: [InputAction; 8] = [
+    pub const ALL: [InputAction; 9] = [
         InputAction::SceneNext,
         InputAction::ScenePrev,
         InputAction::Browser,
         InputAction::Overlay,
         InputAction::Pause,
         InputAction::Quit,
+        InputAction::Chrome,
         InputAction::NowPlaying,
         InputAction::Palette,
     ];
@@ -65,6 +68,7 @@ impl InputAction {
             InputAction::Overlay => "overlay",
             InputAction::Pause => "pause",
             InputAction::Quit => "quit",
+            InputAction::Chrome => "chrome",
             InputAction::NowPlaying => "now_playing",
             InputAction::Palette => "palette",
         }
@@ -80,6 +84,7 @@ impl InputAction {
             InputAction::Overlay => "debug overlay",
             InputAction::Pause => "pause",
             InputAction::Quit => "quit",
+            InputAction::Chrome => "chrome mode",
             InputAction::NowPlaying => "now playing",
             InputAction::Palette => "apply palette",
         }
@@ -230,6 +235,8 @@ pub struct Keymap {
     pub pause: Option<KeyChord>,
     /// Quit.
     pub quit: Option<KeyChord>,
+    /// Cycle the chrome personality.
+    pub chrome: Option<KeyChord>,
     /// Toggle the now-playing panel.
     pub now_playing: Option<KeyChord>,
     /// Apply / revert the current track's art palette.
@@ -245,6 +252,7 @@ impl Default for Keymap {
             overlay: Some(KeyChord::plain(KeyCode::Char('`'))),
             pause: Some(KeyChord::plain(KeyCode::Char(' '))),
             quit: Some(KeyChord::plain(KeyCode::Char('q'))),
+            chrome: Some(KeyChord::plain(KeyCode::Char('c'))),
             now_playing: Some(KeyChord::plain(KeyCode::Char('n'))),
             palette: Some(KeyChord::plain(KeyCode::Char('p'))),
         }
@@ -262,6 +270,7 @@ impl Keymap {
             InputAction::Overlay => self.overlay,
             InputAction::Pause => self.pause,
             InputAction::Quit => self.quit,
+            InputAction::Chrome => self.chrome,
             InputAction::NowPlaying => self.now_playing,
             InputAction::Palette => self.palette,
         }
@@ -276,6 +285,7 @@ impl Keymap {
             InputAction::Overlay => &mut self.overlay,
             InputAction::Pause => &mut self.pause,
             InputAction::Quit => &mut self.quit,
+            InputAction::Chrome => &mut self.chrome,
             InputAction::NowPlaying => &mut self.now_playing,
             InputAction::Palette => &mut self.palette,
         };
