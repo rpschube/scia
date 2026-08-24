@@ -1,8 +1,9 @@
-# gate-windows — capture-relevant checks on Windows.
-# Runs only when core or bridge code (the capture path) changes, so most PRs
-# skip it; it is therefore NOT a required check. The justfile's bash/flock/
-# ionice wrappers are Linux-only, so on Windows the plain cargo commands are
-# the mirror of the gate's check + test steps.
+# gate-windows — Windows-only checks for the platform-specific code paths.
+# Runs only when Windows-relevant code changes (the core/bridge capture path or
+# the meta now-playing SMTC backend), so most PRs skip it; it is therefore NOT a
+# required check. The justfile's bash/flock/ionice wrappers are Linux-only, so
+# on Windows the plain cargo commands are the mirror of the gate's check + test
+# steps.
 name: gate-windows
 
 on:
@@ -10,6 +11,7 @@ on:
     paths:
       - crates/core/**
       - crates/bridge/**
+      - crates/meta/**
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/gate-windows.yml
