@@ -156,7 +156,10 @@ impl CpalBackend {
     fn resolve(&self) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CaptureError> {
         // Prefer the PipeWire sink monitor (the real system mix) when asked and
         // available. This whole branch only compiles with the feature; the
-        // fallback below is the plain-ALSA default-input path.
+        // fallback below is the plain-ALSA default-input path. The undocumented
+        // cpal behaviour this relies on (a sink opened as an input becomes a
+        // capture of the sink monitor) is pinned and verified by the `pipewire`
+        // CI job — see docs/probes/p2-pipewire-pin.md.
         #[cfg(feature = "capture-pipewire")]
         if self.prefer_pipewire && cpal::available_hosts().contains(&cpal::HostId::PipeWire) {
             if let Ok(host) = cpal::host_from_id(cpal::HostId::PipeWire) {
