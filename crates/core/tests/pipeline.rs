@@ -54,6 +54,8 @@ fn sine_rms_matches_theory() {
         pacing: Pacing::Unpaced {
             total_frames: 48_000,
         },
+
+        emit_log: None,
     };
     let (engine, mut reader) =
         Engine::start(Box::new(backend), EngineConfig::default()).expect("engine start");
@@ -107,6 +109,8 @@ fn starvation_synthesizes_silence() {
             amp: 0.5,
         },
         pacing: Pacing::Unpaced { total_frames: 2048 },
+
+        emit_log: None,
     };
     let (engine, mut reader) =
         Engine::start(Box::new(backend), EngineConfig::default()).expect("engine start");
@@ -173,6 +177,8 @@ fn engine_stops_cleanly() {
         format: STEREO_48K,
         signal: Signal::Silence,
         pacing: Pacing::Realtime,
+
+        emit_log: None,
     };
     let started = Instant::now();
     let (engine, _reader) =
