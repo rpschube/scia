@@ -93,9 +93,12 @@ Every cargo invocation the wrappers run is protected the same way:
 `cargo check` is the inner loop; run full builds only when you actually need
 artifacts. Release builds are CI's job — never build a release locally.
 
-All worktrees share the main checkout's `target/` directory, which the
-justfile derives automatically. Extra worktrees therefore do not mean extra
-cold builds, and you never manage a per-worktree target yourself.
+Every branch builds into its own subdirectory of the main checkout's
+`target/` (the justfile derives it from the branch name). Worktrees never
+share build output: two checkouts of the same package would write the same
+artifact paths and cargo can serve one branch's stale build to another. A new
+worktree therefore costs one cold build; `just sweep` and `just wt-rm` reclaim
+the space.
 
 Worktree and cleanup recipes:
 
