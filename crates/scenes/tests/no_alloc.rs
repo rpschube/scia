@@ -9,7 +9,7 @@ mod support {
 
 use scia_core::FeatureSnapshot;
 use scia_scenes::{
-    Canvas, Curve, Feature, Mapping, MappingSet, Params, SceneCtx, Style, create_builtin,
+    Canvas, Curve, Feature, Mapping, MappingSet, Palette, Params, SceneCtx, Style, create_builtin,
     parse_preset,
 };
 use support::alloc_watch::{CountingAllocator, watch};
@@ -442,6 +442,102 @@ fn sonar_update_render_does_not_allocate() {
     assert!(
         stray_count == 0,
         "sonar update/render allocated {} time(s) across 500 frames:\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
+
+/// The `ember-drift` scene must not allocate per frame once warmed: its ember
+/// pool is fixed at init, spawns reuse a dead slot in place, and the canvas
+/// retains capacity. The pool is driven to saturation (a high spawn rate at full
+/// loudness) so the canvas reaches its steady peak primitive count during warm-up
+/// — the field is sparse by design, so a lazily-growing canvas is warmed to the
+/// pool's ceiling rather than to a fluctuating sparse count.
+#[test]
+fn ember_drift_update_render_does_not_allocate() {
+    let mut params = Params::new();
+    params.set("embers", 64.0);
+    params.set("spawn", 40.0);
+    let mut scene = create_builtin("ember-drift").expect("ember-drift exists");
+    scene.init(&SceneCtx::new(16.0 / 9.0, Palette::default_dark(), params));
+    let mut canvas = Canvas::new(16.0 / 9.0);
+
+    // Full loudness with a toggled onset so the pool saturates and the onset
+    // brightness lift runs. `activity` defaults to Active.
+    let mut f = FeatureSnapshot {
+        rms: 1.0,
+        onset: false,
+        onset_age_ms: 100.0,
+        ..FeatureSnapshot::default()
+    };
+    f.bands = [1.2, 1.0, 0.8];
+
+    // Warm up: saturate the pool and grow the canvas to its ceiling capacity.
+    for i in 0..300 {
+        f.onset = i % 2 == 0;
+        f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+        scene.update(&f, 0.03);
+        canvas.clear();
+        scene.render(&mut canvas);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for i in 0..500 {
+            f.onset = i % 7 == 0;
+            f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+            scene.update(&f, 0.03);
+            canvas.clear();
+            scene.render(&mut canvas);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "ember-drift update/render allocated {} time(s) across 500 frames:\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
+
+/// The `bloom` scene must not allocate per frame: it holds no buffers and emits
+/// a fixed budget of pure geometry every frame, so the canvas retains capacity
+/// and nothing else moves the allocator.
+#[test]
+fn bloom_update_render_does_not_allocate() {
+    let mut scene = create_builtin("bloom").expect("bloom exists");
+    scene.init(&SceneCtx::default());
+    let mut canvas = Canvas::new(16.0 / 9.0);
+
+    let mut f = FeatureSnapshot {
+        rms: 0.6,
+        onset: false,
+        onset_age_ms: 100.0,
+        ..FeatureSnapshot::default()
+    };
+    f.bands = [1.0, 1.4, 1.0];
+
+    // Warm up: settle the envelopes and grow the canvas to steady capacity.
+    for i in 0..16 {
+        f.onset = i % 2 == 0;
+        f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+        scene.update(&f, 0.016);
+        canvas.clear();
+        scene.render(&mut canvas);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for i in 0..500 {
+            f.onset = i % 7 == 0;
+            f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+            scene.update(&f, 0.016);
+            canvas.clear();
+            scene.render(&mut canvas);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "bloom update/render allocated {} time(s) across 500 frames:\n{}",
         stray_count,
         strays.join("\n---\n")
     );

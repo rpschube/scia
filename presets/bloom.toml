@@ -1,0 +1,71 @@
+# bloom — the six-fold kaleidoscope-mandala preset.
+#
+# This is a copy-and-edit template: every table and key the preset format
+# understands appears here, either set or shown in a comment. See
+# docs/presets.md for the full reference (types, ranges, the feature
+# vocabulary, curve formulas, envelope semantics and the error format).
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric).
+name = "bloom"
+# Required. A registered scene id. `bloom` is the kaleidoscope mandala.
+scene = "bloom"
+# Optional. A one-line human description.
+description = "A six-fold kaleidoscope mandala breathing with the mids; onsets flash a bright core."
+# Optional. A one-word mood; defaults to the scene's own mood ("maximal").
+mood = "maximal"
+
+# Typed parameters for the preset's scene. Every key must exist in the scene's
+# parameter manifest; every value is a number within the stated range. Omitted
+# keys keep their manifest default.
+[params]
+# rotate   0.05   range 0.0..=0.5    global rotation speed (revolutions/second) while active
+rotate = 0.05
+# radius   0.6    range 0.1..=1.0    base overall radius (fraction of the canvas half-height)
+radius = 0.6
+# swell    0.4    range 0.0..=1.0    loudness-to-radius gain: how much loudness opens the mandala
+swell = 0.4
+# breathe  0.5    range 0.0..=1.0    mid-band gain on petal radius and thickness (the breath)
+breathe = 0.5
+# flash    0.8    range 0.0..=1.0    onset core-flash gain
+flash = 0.8
+# size     1.0    range 0.3..=3.0    point size multiplier
+size = 1.0
+
+# Optional layer stack. With no [[layer]] tables the preset is exactly one
+# layer: [preset].scene with [params]. Each layer names its own scene, an
+# optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0); [layer.params] is typed against THAT layer's scene manifest and
+# merges over its defaults. When layers are present, [map] targets the FIRST
+# layer's scene.
+#
+# [[layer]]
+# scene = "bloom"
+# blend = "over"
+# intensity = 1.0
+# [layer.params]
+# rotate = 0.1
+
+# Feature -> parameter mappings. Each key is a parameter of the mapped scene;
+# each value is either a table naming a feature and a response, or a string
+# expression over the feature vocabulary (evaluated per frame).
+#
+# feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
+# curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+[map]
+# Deepen the mid breath with the mid band directly, on a gentle envelope, so the
+# petals bulge with the body of the mix. Stays inside breathe's 0.0..=1.0 range
+# (offset 0.3, plus up to scale 0.6).
+breathe = { feature = "mid", curve = "linear", attack_ms = 80, decay_ms = 350, scale = 0.6, offset = 0.3 }
+
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries; only meaningful with a
+# static source. Omit to use the host default palette. Slot 1 is the inner arm
+# (teal), slot 2 the mid arm (cyan), slot 3 the rim (amber) and slot 7 the bright
+# flashing core, so this ramp keeps those roles.
+slots = ["#0a0f14", "#1f8f8f", "#3fd0d0", "#ffb020", "#ff6b5b", "#0a0c12", "#8a8f9c", "#ffffff"]

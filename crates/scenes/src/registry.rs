@@ -2,8 +2,8 @@
 //! and construct one by id.
 
 use crate::builtin::{
-    Aurora, Lattice, Phosphor, Sonar, Spectra, Starfall, Tide, Verso, aurora, lattice, phosphor,
-    sonar, spectra, starfall, tide, verso,
+    Aurora, Bloom, EmberDrift, Lattice, Phosphor, Sonar, Spectra, Starfall, Tide, Verso, aurora,
+    bloom, ember_drift, lattice, phosphor, sonar, spectra, starfall, tide, verso,
 };
 use crate::scene::{ParamSpec, Scene};
 
@@ -76,6 +76,18 @@ static BUILTINS: &[SceneInfo] = &[
         summary: "A sweep arm circling at the track tempo; onsets flare contacts that fade with the phosphor.",
         params: sonar::PARAMS,
     },
+    SceneInfo {
+        id: "ember-drift",
+        mood: "organic",
+        summary: "Sparse embers rise and cool from a near-black field; at silence it settles into a single breathing ember.",
+        params: ember_drift::PARAMS,
+    },
+    SceneInfo {
+        id: "bloom",
+        mood: "maximal",
+        summary: "A six-fold kaleidoscope mandala breathing with the mids; onsets flash a bright core.",
+        params: bloom::PARAMS,
+    },
 ];
 
 /// The catalog of built-in scenes.
@@ -102,6 +114,8 @@ pub fn create_builtin(id: &str) -> Option<Box<dyn Scene>> {
         "verso" => Some(Box::new(Verso::new())),
         "phosphor" => Some(Box::new(Phosphor::new())),
         "sonar" => Some(Box::new(Sonar::new())),
+        "ember-drift" => Some(Box::new(EmberDrift::new())),
+        "bloom" => Some(Box::new(Bloom::new())),
         _ => None,
     }
 }

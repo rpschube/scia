@@ -1,0 +1,70 @@
+# ember-drift — the rising-ember preset.
+#
+# This is a copy-and-edit template: every table and key the preset format
+# understands appears here, either set or shown in a comment. See
+# docs/presets.md for the full reference (types, ranges, the feature
+# vocabulary, curve formulas, envelope semantics and the error format).
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric).
+name = "ember-drift"
+# Required. A registered scene id. `ember-drift` is the rising-ember field.
+scene = "ember-drift"
+# Optional. A one-line human description.
+description = "Sparse embers rise and cool from a near-black field; at silence it settles into a single breathing ember."
+# Optional. A one-word mood; defaults to the scene's own mood ("organic").
+mood = "organic"
+
+# Typed parameters for the preset's scene. Every key must exist in the scene's
+# parameter manifest; every value is a number within the stated range. Omitted
+# keys keep their manifest default.
+[params]
+# embers  64     range 16.0..=256.0   ember pool size, preallocated at init
+embers = 64
+# spawn   7.0    range 0.0..=40.0     spawn rate (embers/second) at full loudness while active
+spawn = 7.0
+# rise    0.16   range 0.03..=1.0     rise/cool rate (inverse lifetime, per second) an ember climbs at
+rise = 0.16
+# drift   0.04   range 0.0..=0.2      horizontal sway amplitude (fraction of canvas width)
+drift = 0.04
+# size    1.0    range 0.3..=3.0      ember size multiplier
+size = 1.0
+
+# Optional layer stack. With no [[layer]] tables the preset is exactly one
+# layer: [preset].scene with [params]. Each layer names its own scene, an
+# optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0); [layer.params] is typed against THAT layer's scene manifest and
+# merges over its defaults. When layers are present, [map] targets the FIRST
+# layer's scene.
+#
+# [[layer]]
+# scene = "ember-drift"
+# blend = "over"
+# intensity = 1.0
+# [layer.params]
+# spawn = 10.0
+
+# Feature -> parameter mappings. Each key is a parameter of the mapped scene;
+# each value is either a table naming a feature and a response, or a string
+# expression over the feature vocabulary (evaluated per frame).
+#
+# feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
+# curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+[map]
+# Lift the spawn rate with the bass: a heavier low end throws off more embers, on
+# a gentle envelope. Stays inside spawn's 0.0..=40.0 range (offset 4, plus up to
+# scale 20).
+spawn = { feature = "bass", curve = "linear", attack_ms = 120, decay_ms = 500, scale = 20.0, offset = 4.0 }
+
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries; only meaningful with a
+# static source. Omit to use the host default palette. Slot 3 is the hot ember,
+# slot 4 the cooling ember and slot 5 the spent near-black the scene ramps
+# through, so this ramp keeps those roles: near-black ground, two dim warms, hot
+# amber, cooling coral, a spent near-black, then two neutrals.
+slots = ["#050302", "#100a06", "#3a1e08", "#ffb020", "#ff6b5b", "#1a0d06", "#8a8f9c", "#e6e8ee"]
