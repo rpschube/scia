@@ -274,9 +274,15 @@ fn overlay_panel_shows_every_signal() {
     assert!(panel.contains("onset"), "overlay missing onset: {panel:?}");
     assert!(panel.contains('●'), "onset lamp should be lit: {panel:?}");
     assert!(panel.contains("beat"), "overlay missing beat: {panel:?}");
+    // Locked form: `beat 128bpm · conf 0.66` — the tempo and confidence are
+    // labelled distinctly so the confidence can't be misread as the BPM.
     assert!(
-        panel.contains("128"),
-        "overlay missing tempo bpm: {panel:?}"
+        panel.contains("128bpm"),
+        "overlay missing locked tempo bpm: {panel:?}"
+    );
+    assert!(
+        panel.contains("conf 0.66"),
+        "overlay missing beat confidence: {panel:?}"
     );
     assert!(
         panel.contains("tier octants"),
@@ -290,6 +296,33 @@ fn overlay_panel_shows_every_signal() {
     assert!(
         panel.contains('█') || panel.contains('▇') || panel.contains('▁'),
         "overlay missing spectrum strip: {panel:?}"
+    );
+}
+
+#[test]
+fn overlay_beat_unlocked_reads_dash_not_zero_bpm() {
+    // Unlocked: `tempo_bpm == 0.0`. The beat segment must read `beat — · conf X`,
+    // never `beat 0 bpm 0.43`, so the confidence is not mistaken for the BPM.
+    let mut snap = overlay_snapshot();
+    snap.tempo_bpm = 0.0;
+    snap.beat_confidence = 0.43;
+    let ui = UiState {
+        overlay: true,
+        ..UiState::default()
+    };
+    let buf = render(120, 40, &snap, &ui);
+    let panel = rows(&buf, 35, 40, 120);
+    assert!(
+        panel.contains("beat —"),
+        "unlocked beat should read an em dash, not a bpm: {panel:?}"
+    );
+    assert!(
+        panel.contains("conf 0.43"),
+        "unlocked beat should still show confidence: {panel:?}"
+    );
+    assert!(
+        !panel.contains("beat 0bpm") && !panel.contains("0 bpm"),
+        "unlocked beat must not present a zero bpm: {panel:?}"
     );
 }
 

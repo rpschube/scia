@@ -51,6 +51,7 @@ jobs:
         run: |
           cargo build -p scia-core --example capture_probe
           cargo build -p scia-core --example latency_probe
+          cargo build -p scia-core --example beat_probe
           cargo build --bin scia
 
       - name: Collect
@@ -60,6 +61,7 @@ jobs:
           mkdir -p out
           cp target/debug/examples/capture_probe* out/ 2>/dev/null || true
           cp target/debug/examples/latency_probe* out/ 2>/dev/null || true
+          cp target/debug/examples/beat_probe* out/ 2>/dev/null || true
           cp target/debug/scia* out/ 2>/dev/null || true
           rm -f out/*.d out/*.pdb
           ls -la out

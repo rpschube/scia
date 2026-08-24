@@ -761,9 +761,20 @@ fn render_overlay_panel(buf: &mut Buffer, panel: Rect, snap: &FeatureSnapshot, u
     } else {
         LAMP_OFF
     };
+    // The beat segment reads unambiguously: `tempo_bpm == 0.0` means the tracker
+    // is unlocked, shown as an em dash, so the confidence can never be mistaken
+    // for the BPM. Locked shows the tempo and confidence side by side.
+    let beat = if snap.tempo_bpm == 0.0 {
+        format!("beat — · conf {:.2}", snap.beat_confidence)
+    } else {
+        format!(
+            "beat {:.0}bpm · conf {:.2}",
+            snap.tempo_bpm, snap.beat_confidence
+        )
+    };
     let l3 = format!(
         "rms {:.2} peak {:.2} · bass/mid/treb {:.2}/{:.2}/{:.2} · width {:.2} · flux {:.2} · \
-         onset {} · beat {:.0} bpm {:.2}",
+         onset {} · {}",
         snap.rms,
         snap.peak,
         snap.bands[0],
@@ -772,8 +783,7 @@ fn render_overlay_panel(buf: &mut Buffer, panel: Rect, snap: &FeatureSnapshot, u
         snap.mid_side_ratio,
         snap.flux,
         lamp,
-        snap.tempo_bpm,
-        snap.beat_confidence,
+        beat,
     );
     buf.set_stringn(inner_x, panel.y + 2, &l3, inner_w, fill);
 
