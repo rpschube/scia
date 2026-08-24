@@ -9,7 +9,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 
 use scia_core::{Activity, EngineStats, FeatureSnapshot};
-use scia_tui::{SceneNav, UiState, draw};
+use scia_tui::{ChromeMode, ChromeState, SceneNav, UiState, draw};
 
 /// Render one frame at `w`×`h` and return the resulting buffer.
 fn render(w: u16, h: u16, snap: &FeatureSnapshot, ui: &UiState) -> Buffer {
@@ -523,6 +523,109 @@ fn interleaved_draw_ms(
     }
     let to_ms = |s: f64| s * 1000.0 / f64::from(n);
     (to_ms(sum_off), to_ms(sum_on))
+}
+
+#[test]
+fn chrome_instrument_rail_draws_over_the_scene_body() {
+    // The instrument rail lands on the body's bottom row with its VU meters and
+    // fps, over the direct-bars body.
+    let snap = overlay_snapshot();
+    let ui = UiState {
+        source: "48000 Hz 2 ch".to_string(),
+        fps_measured: 60.0,
+        chrome: ChromeState::new(ChromeMode::Instrument),
+        ..UiState::default()
+    };
+    let buf = render(120, 20, &snap, &ui);
+    // Body rows are y = 1..=19; the rail is on the bottom body row (y = 19).
+    let rail = row(&buf, 19, 120);
+    assert!(rail.contains("vu"), "instrument rail missing VU: {rail:?}");
+    assert!(
+        rail.contains("fps"),
+        "instrument rail missing fps: {rail:?}"
+    );
+}
+
+#[test]
+fn chrome_yields_to_the_debug_overlay_when_both_are_visible() {
+    // With the instrument rail AND the debug overlay both on, the debug overlay
+    // is a separate surface layered above the chrome: its claimed rows carry the
+    // overlay's fields, never the chrome rail. The rail (its "vu" marker) must
+    // not survive anywhere the overlay claimed.
+    let snap = overlay_snapshot();
+    let ui = UiState {
+        source: "48000 Hz 2 ch".to_string(),
+        overlay: true,
+        tier: Some("octants"),
+        fps_measured: 60.0,
+        chrome: ChromeState::new(ChromeMode::Instrument),
+        ..UiState::default()
+    };
+    // 120x40: header + 39-row body; the overlay panel covers body rows 35..=39.
+    let buf = render(120, 40, &snap, &ui);
+    let panel = rows(&buf, 35, 40, 120);
+    assert!(
+        panel.contains("bass") && panel.contains("schema v1"),
+        "the debug overlay owns its claimed rows: {panel:?}"
+    );
+    // The instrument rail's VU marker must not appear anywhere — the overlay
+    // covers the bottom row it would have drawn on, and it claims no other row.
+    let whole: String = (1..40).map(|y| row(&buf, y, 120)).collect();
+    assert!(
+        !whole.contains("vu "),
+        "chrome must not draw over the debug overlay's rows"
+    );
+}
+
+#[test]
+fn chrome_utilitarian_coexists_with_the_debug_line() {
+    // The debug line (the `d` toggle) reserves the frame's bottom row through the
+    // layout; the utilitarian chrome row sits on the body's own bottom row just
+    // above it. Both are legible, neither overwrites the other.
+    let mut snap = overlay_snapshot();
+    snap.tempo_bpm = 120.0;
+    let ui = UiState {
+        source: "48000 Hz 2 ch".to_string(),
+        debug: true,
+        tier: Some("octants"),
+        fps_measured: 60.0,
+        chrome: ChromeState::new(ChromeMode::Utilitarian),
+        ..UiState::default()
+    };
+    // 120x12: header (y=0), body y=1..=10, debug line y=11.
+    let buf = render(120, 12, &snap, &ui);
+    let debug_line = row(&buf, 11, 120);
+    assert!(
+        debug_line.contains("p99"),
+        "the debug line keeps its reserved bottom row: {debug_line:?}"
+    );
+    let status = row(&buf, 10, 120);
+    assert!(
+        status.contains("octants") && status.contains("120bpm"),
+        "the utilitarian row draws on the body bottom, above the debug line: {status:?}"
+    );
+}
+
+#[test]
+fn chrome_invisible_default_leaves_the_bars_body_untouched() {
+    // The default (invisible) chrome with nothing playing must not perturb the
+    // direct-bars body: a default UiState renders exactly as an explicit
+    // invisible one with no track.
+    let snap = overlay_snapshot();
+    let base = render(120, 20, &snap, &UiState::default());
+    let explicit = render(
+        120,
+        20,
+        &snap,
+        &UiState {
+            chrome: ChromeState::new(ChromeMode::Invisible),
+            ..UiState::default()
+        },
+    );
+    assert_eq!(
+        base, explicit,
+        "invisible chrome with no track draws nothing"
+    );
 }
 
 #[test]

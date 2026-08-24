@@ -21,6 +21,10 @@ pub const DEBUG: Color = Color::Rgb(150, 150, 160);
 pub const OVERLAY_BG: Color = Color::Rgb(16, 16, 22);
 /// Foreground of the overlay panel's text.
 pub const OVERLAY_FG: Color = Color::Rgb(200, 200, 210);
+/// The chrome now-playing line at full brightness.
+pub const CHROME_FG: Color = Color::Rgb(150, 150, 160);
+/// The chrome now-playing line one dim step down, just before it vanishes.
+pub const CHROME_DIM: Color = Color::Rgb(90, 90, 100);
 
 /// The three-stop bar gradient, low to high.
 const STOP_LOW: (u8, u8, u8) = (20, 180, 170); // teal

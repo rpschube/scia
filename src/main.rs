@@ -29,7 +29,7 @@ use scia_core::{
     list_devices,
 };
 use scia_scenes::{Preset, PresetWatcher, ReloadEvent, load_preset};
-use scia_tui::{Keymap, RunError, Tier, TuiOptions, run};
+use scia_tui::{ChromeMode, Keymap, RunError, Tier, TuiOptions, run};
 
 use config::Resolved;
 
@@ -41,9 +41,12 @@ CONFIG:
   missing file is not an error.
     Unix:     $XDG_CONFIG_HOME/scia/config.toml  (else ~/.config/scia/config.toml)
     Windows:  %APPDATA%\\scia\\config.toml
-  [defaults]  scene, presenter, overlay, perf_mode, demo_bpm
+  [defaults]  scene, presenter, overlay, perf_mode, demo_bpm, chrome
+              (chrome = invisible | instrument | playful | utilitarian;
+              overridden by --chrome)
   [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
-              quit, now_playing, palette. A value is a single character, a named
+              quit, chrome, now_playing, palette. A value is a single
+              character, a named
               key (tab, esc, left, right, up, down, enter, space, backtick), or
               ctrl+<key>. Unknown actions or unparseable keys warn and are
               ignored.
@@ -52,7 +55,8 @@ KEYS (defaults, all rebindable; press ? in-app for the active map):
   right/left  next / prev scene      tab    scene browser
   `           debug overlay          space  pause         q  quit
   n           now-playing panel      p      apply palette
-  esc         back (browser) / quit  ?      toggle help
+  c           cycle chrome           esc    back (browser) / quit
+  ?           toggle help
 
 EXIT CODES:
   0  success            1  runtime error         2  usage / unsupported
@@ -161,6 +165,12 @@ struct Cli {
     #[arg(long, value_enum, value_name = "TIER")]
     presenter: Option<PresenterTier>,
 
+    /// Chrome personality: the now-playing / status chrome drawn over the scene.
+    /// Cycle it at runtime with the chrome key (default `c`). Overrides the
+    /// config `[defaults] chrome`; the built-in default is `invisible`.
+    #[arg(long, value_enum, value_name = "MODE")]
+    chrome: Option<ChromeArg>,
+
     /// List every registered scene and built-in preset, then exit.
     #[arg(long)]
     list_scenes: bool,
@@ -195,6 +205,33 @@ impl PresenterTier {
             PresenterTier::Sextant => Tier::Sextant,
             PresenterTier::Quadrant => Tier::Quadrant,
             PresenterTier::Half => Tier::Half,
+        }
+    }
+}
+
+/// The chrome personalities selectable with `--chrome` (or the config
+/// `[defaults] chrome`). Mirrors [`scia_tui::ChromeMode`] so clap owns the flag
+/// parsing without the TUI crate taking a clap dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ChromeArg {
+    /// A single dim now-playing line that fades after ~4 s of no input.
+    Invisible,
+    /// A persistent one-row instrument rail.
+    Instrument,
+    /// The now-playing text rides the beat.
+    Playful,
+    /// A dense, always-visible status row.
+    Utilitarian,
+}
+
+impl ChromeArg {
+    /// The [`ChromeMode`] this flag value selects.
+    fn mode(self) -> ChromeMode {
+        match self {
+            ChromeArg::Invisible => ChromeMode::Invisible,
+            ChromeArg::Instrument => ChromeMode::Instrument,
+            ChromeArg::Playful => ChromeMode::Playful,
+            ChromeArg::Utilitarian => ChromeMode::Utilitarian,
         }
     }
 }
@@ -261,6 +298,7 @@ fn main() -> ExitCode {
             overlay: cli.overlay,
             perf_mode: cli.perf_mode,
             demo_bpm: cli.demo_bpm,
+            chrome: cli.chrome.map(ChromeArg::mode),
         },
         &cfg.defaults,
     );
@@ -373,6 +411,7 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         preset,
         tier: Some(select_tier(resolved)),
         keymap,
+        chrome: resolved.chrome,
     };
 
     let outcome = run(
@@ -485,6 +524,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         preset,
         tier: Some(select_tier(resolved)),
         keymap,
+        chrome: resolved.chrome,
     };
 
     let outcome = run(
