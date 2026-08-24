@@ -15,8 +15,10 @@
 
 #![forbid(unsafe_code)]
 
+mod mosaic;
 mod pacing;
 mod palette;
+mod presenter;
 mod render;
 mod stats;
 
@@ -35,6 +37,8 @@ use ratatui::backend::CrosstermBackend;
 
 use scia_core::{Activity, EngineStats, FeatureReader, StreamHealth};
 
+pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
+pub use presenter::ScenePresenter;
 pub use render::{UiState, VERSION, draw};
 
 /// The crate name, resolved at compile time from Cargo metadata.

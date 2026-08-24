@@ -44,6 +44,10 @@ pub struct UiState {
     pub p99_frame_ms: f32,
     /// Latest engine counters for the debug line.
     pub stats: EngineStats,
+    /// The active mosaic tier label (e.g. `"octants"`), shown in the debug line
+    /// when a scene presenter is driving the body. `None` for the direct-bars
+    /// renderer, which leaves the debug line unchanged.
+    pub tier: Option<&'static str>,
 }
 
 /// Paint one frame: header row, spectrum body, and (when enabled) the debug
@@ -192,7 +196,7 @@ fn render_body(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot) {
 /// Debug line: measured fps, frame percentiles, and the engine counters.
 fn render_debug(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiState) {
     let s = &ui.stats;
-    let line = format!(
+    let mut line = format!(
         "fps {:.1}  frame p50 {:.2}ms p99 {:.2}ms  gen {}  hops {}/{}  dropped {}  agc {:.2}  \
          act {}  push {}  gap {:.1}ms",
         ui.fps_measured,
@@ -207,6 +211,12 @@ fn render_debug(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiSta
         s.pushes,
         s.max_gap_ms,
     );
+    // A scene presenter surfaces its active tier so the ladder rung is visible
+    // at a glance; the direct-bars renderer leaves `tier` unset.
+    if let Some(tier) = ui.tier {
+        line.push_str(" · tier ");
+        line.push_str(tier);
+    }
     buf.set_stringn(
         rect.x,
         rect.y,
