@@ -1268,6 +1268,12 @@ static PHOSPHOR_PRESET: &str = include_str!("../../../../presets/phosphor.toml")
 /// The `sonar` built-in preset template.
 static SONAR_PRESET: &str = include_str!("../../../../presets/sonar.toml");
 
+/// The `ember-drift` built-in preset template.
+static EMBER_DRIFT_PRESET: &str = include_str!("../../../../presets/ember-drift.toml");
+
+/// The `bloom` built-in preset template.
+static BLOOM_PRESET: &str = include_str!("../../../../presets/bloom.toml");
+
 /// The built-in preset files compiled into the crate, as `(name, source)`.
 static BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("spectra", SPECTRA_PRESET),
@@ -1278,6 +1284,8 @@ static BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("verso", VERSO_PRESET),
     ("phosphor", PHOSPHOR_PRESET),
     ("sonar", SONAR_PRESET),
+    ("ember-drift", EMBER_DRIFT_PRESET),
+    ("bloom", BLOOM_PRESET),
 ];
 
 /// The built-in preset files compiled into the crate, as `(name, source)`.

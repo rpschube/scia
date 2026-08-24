@@ -59,3 +59,52 @@ fn registry_lists_sonar() {
     assert_eq!(scene.id(), "sonar");
     assert_eq!(scene.mood(), sonar.mood, "info mood matches the scene");
 }
+
+#[test]
+fn registry_lists_ember_drift() {
+    let infos = builtin_scenes();
+    let ember = infos
+        .iter()
+        .find(|i| i.id == "ember-drift")
+        .expect("ember-drift is listed");
+    assert!(!ember.mood.is_empty(), "mood is set");
+    assert!(!ember.summary.is_empty(), "summary is set");
+    assert!(
+        !ember.params.is_empty(),
+        "ember-drift exposes a parameter manifest"
+    );
+
+    let scene = create_builtin("ember-drift").expect("ember-drift constructs");
+    assert_eq!(scene.id(), "ember-drift");
+    assert_eq!(scene.mood(), ember.mood, "info mood matches the scene");
+}
+
+#[test]
+fn registry_lists_bloom() {
+    let infos = builtin_scenes();
+    let bloom = infos
+        .iter()
+        .find(|i| i.id == "bloom")
+        .expect("bloom is listed");
+    assert!(!bloom.mood.is_empty(), "mood is set");
+    assert!(!bloom.summary.is_empty(), "summary is set");
+    assert!(
+        !bloom.params.is_empty(),
+        "bloom exposes a parameter manifest"
+    );
+
+    let scene = create_builtin("bloom").expect("bloom constructs");
+    assert_eq!(scene.id(), "bloom");
+    assert_eq!(scene.mood(), bloom.mood, "info mood matches the scene");
+}
+
+#[test]
+fn ember_drift_and_bloom_are_last_in_registry_order() {
+    let ids: Vec<&str> = builtin_scenes().iter().map(|i| i.id).collect();
+    let n = ids.len();
+    assert_eq!(
+        &ids[n - 2..],
+        &["ember-drift", "bloom"],
+        "the two new scenes are appended at the end, ember-drift then bloom"
+    );
+}
