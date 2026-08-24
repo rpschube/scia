@@ -1,10 +1,13 @@
 //! A counting global allocator for "this path must not allocate" tests.
 //!
-//! Besides counting, it records a backtrace and the thread name for every
-//! allocation that happens while a watch window is open, so a failure names
-//! its source instead of just reporting a number. The recording itself
-//! allocates; a thread-local re-entrancy guard keeps those allocations out of
-//! the count and out of the records.
+//! Only the thread that opened the watch window is counted: the libtest
+//! harness keeps bookkeeping on the main thread (a `HashMap` of running
+//! tests) while a test body runs on its own thread, and on a slow machine
+//! that bookkeeping lands inside the measured window. Besides counting, the
+//! allocator records a backtrace and the thread name for every allocation in
+//! the window, so a failure names its source instead of just reporting a
+//! number. The recording itself allocates; a thread-local re-entrancy guard
+//! keeps those allocations out of the count and out of the records.
 #![allow(dead_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -13,13 +16,18 @@ use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// Every allocation in the process (all threads).
 pub static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+/// Allocations made by the watching thread inside the current window.
+static WATCHED_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static WATCHING: AtomicBool = AtomicBool::new(false);
 static STRAYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 const MAX_STRAYS: usize = 8;
 
 thread_local! {
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+    /// True only on the thread that opened the current watch window.
+    static WATCHED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub struct CountingAllocator;
@@ -37,7 +45,8 @@ impl CountingAllocator {
             return; // an allocation made by the recorder itself
         }
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        if WATCHING.load(Ordering::Relaxed) {
+        if WATCHING.load(Ordering::Relaxed) && WATCHED.with(Cell::get) {
+            WATCHED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             let name = std::thread::current()
                 .name()
                 .map(str::to_owned)
@@ -72,16 +81,18 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 /// Runs `f` inside a watch window and returns its result, the number of
-/// allocations observed, and the recorded stray descriptions.
+/// allocations the calling thread made, and the recorded stray descriptions.
 pub fn watch<T>(f: impl FnOnce() -> T) -> (T, usize, Vec<String>) {
     if let Ok(mut v) = STRAYS.lock() {
         v.clear();
     }
-    let before = ALLOCATIONS.load(Ordering::SeqCst);
+    WATCHED.with(|w| w.set(true));
+    let before = WATCHED_ALLOCATIONS.load(Ordering::SeqCst);
     WATCHING.store(true, Ordering::SeqCst);
     let out = f();
     WATCHING.store(false, Ordering::SeqCst);
-    let after = ALLOCATIONS.load(Ordering::SeqCst);
+    WATCHED.with(|w| w.set(false));
+    let after = WATCHED_ALLOCATIONS.load(Ordering::SeqCst);
     let strays = STRAYS.lock().map(|v| v.clone()).unwrap_or_default();
     (out, after - before, strays)
 }
