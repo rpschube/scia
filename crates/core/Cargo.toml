@@ -34,7 +34,14 @@ thiserror = "2"
 triple_buffer = "9"
 
 [dependencies.cpal]
-version = "0.18"
+# Pinned exactly. The Linux system-mix baseline relies on cpal's PipeWire host
+# exposing an `Audio/Sink` as a duplex (input-capable) device and, when an input
+# stream is opened on it, setting `PW_KEY_STREAM_CAPTURE_SINK=true` so the stream
+# captures the sink monitor. That is specified only in cpal's source
+# (`host/pipewire/device.rs`), not its public contract, so the exact version is
+# pinned and the behaviour is continuously verified by the `pipewire` CI job and
+# `crates/core/tests/pipewire.rs`. See `docs/probes/p2-pipewire-pin.md`.
+version = "=0.18.2"
 optional = true
 
 # Perf mode's raw WASAPI COM backend. Windows-only (the crate itself is
