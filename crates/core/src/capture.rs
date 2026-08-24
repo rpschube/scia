@@ -109,6 +109,12 @@ impl SinkStats {
     pub(crate) fn set_channels(&self, channels: u16) {
         self.channels.store(channels, Ordering::Relaxed);
     }
+
+    /// Test hook: pin the frame-accounting channel count without an engine.
+    #[doc(hidden)]
+    pub fn set_channels_for_test(&self, channels: u16) {
+        self.set_channels(channels);
+    }
 }
 
 /// The only object a capture callback touches: it copies interleaved samples
@@ -136,7 +142,10 @@ impl SampleSink {
 
         let channels = self.stats.accounting_channels();
         let available = self.producer.slots();
-        let to_write = interleaved.len().min(available);
+        // Never split a frame: writing a partial frame would misalign every
+        // channel in the ring for the rest of the stream. Whole frames only;
+        // a trailing partial frame in the input is discarded.
+        let to_write = (interleaved.len().min(available) / channels) * channels;
 
         if to_write > 0 {
             // `write_chunk` yields default-initialised slices (f32: Copy +

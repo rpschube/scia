@@ -184,3 +184,34 @@ fn engine_stops_cleanly() {
         "start+stop took too long"
     );
 }
+
+#[test]
+fn push_never_splits_frames() {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Stereo ring: pushes that do not fit whole must never write a partial
+    // frame, or every later hop would read L/R swapped.
+    let (mut sink, consumer) = scia_core::sample_ring(std::time::Instant::now());
+    sink.stats().set_channels_for_test(2);
+    let capacity = sink.free_samples();
+    sink.push(&vec![0.25f32; capacity - 4]);
+    assert_eq!(sink.free_samples(), 4);
+
+    // 3 samples = one whole frame + a trailing partial frame: the partial is discarded.
+    sink.push(&[1.0, 2.0, 3.0]);
+    assert_eq!(sink.free_samples(), 2, "only the whole frame was written");
+    assert_eq!(
+        sink.stats().dropped_frames.load(Relaxed),
+        0,
+        "a partial frame is not a dropped frame"
+    );
+
+    // 4 samples into 2 free: one frame written, one whole frame dropped.
+    sink.push(&[5.0, 6.0, 7.0, 8.0]);
+    assert_eq!(sink.free_samples(), 0);
+    assert_eq!(sink.stats().dropped_frames.load(Relaxed), 1);
+    assert_eq!(
+        sink.stats().pushed_frames.load(Relaxed) as usize,
+        capacity / 2
+    );
+    assert_eq!(consumer.buffered_samples(), capacity);
+}
