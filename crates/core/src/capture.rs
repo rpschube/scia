@@ -277,7 +277,18 @@ impl SampleConsumer {
 /// eventual stream width.
 #[must_use]
 pub fn sample_ring(epoch: Instant) -> (SampleSink, SampleConsumer) {
-    let stats = Arc::new(SinkStats::new(epoch));
+    sample_ring_with_stats(Arc::new(SinkStats::new(epoch)))
+}
+
+/// Create a fresh sample ring that reuses an existing [`SinkStats`] block, so
+/// its epoch and cumulative counters carry across a reopen. When the engine
+/// tears down and rebuilds a capture stream it hands the new sink the same
+/// stats the old one fed, so `pushed_frames`, `dropped_frames`, the callback
+/// cadence and the monotonic epoch all continue uninterrupted. Only the
+/// producer/consumer halves are new (a brand-new lock-free ring); the shared
+/// statistics survive. Engine-internal: a reopen is a cold-path operation.
+#[must_use]
+pub(crate) fn sample_ring_with_stats(stats: Arc<SinkStats>) -> (SampleSink, SampleConsumer) {
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(RING_SLOTS);
     (
         SampleSink {
@@ -330,4 +341,18 @@ pub trait CaptureBackend: Send {
         target: CaptureTarget,
         sink: SampleSink,
     ) -> Result<Box<dyn CaptureStream>, CaptureError>;
+
+    /// A stable identity of the device the next [`open`](CaptureBackend::open)
+    /// would bind to *right now* for the last-opened target (the device name is
+    /// a fine identity). The engine's route watcher polls this to notice that
+    /// the OS default output route has moved to a different device and trigger a
+    /// reopen. `None` means the backend cannot tell which device it would pick
+    /// (the synthetic source, an enumeration failure); the watcher then relies
+    /// only on stream-health errors, never on a route-id change.
+    ///
+    /// Called from a low-priority thread every few hundred milliseconds: it may
+    /// enumerate devices, but must never block for long.
+    fn route_id(&self) -> Option<String> {
+        None
+    }
 }
