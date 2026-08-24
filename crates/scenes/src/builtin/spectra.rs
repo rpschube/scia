@@ -24,10 +24,43 @@
 //! worth of history is not worth serializing.
 
 use crate::canvas::{Canvas, Style};
-use crate::scene::{Scene, SceneCtx, SceneState};
+use crate::scene::{ParamSpec, Scene, SceneCtx, SceneState};
 
 /// The fraction of bars, from the low end, that ride the onset envelope.
 const LOW_FRACTION: f32 = 0.25;
+
+/// `spectra`'s parameter manifest: the keys a preset may set, with the
+/// defaults, ranges and docs from the module table above.
+pub static PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        key: "release",
+        default: 0.15,
+        min: 0.01,
+        max: 2.0,
+        doc: "extra release time constant (seconds)",
+    },
+    ParamSpec {
+        key: "punch_decay",
+        default: 0.25,
+        min: 0.01,
+        max: 2.0,
+        doc: "onset-envelope decay time constant (seconds)",
+    },
+    ParamSpec {
+        key: "punch",
+        default: 0.35,
+        min: 0.0,
+        max: 2.0,
+        doc: "how much the envelope lifts the low bars",
+    },
+    ParamSpec {
+        key: "gap",
+        default: 0.15,
+        min: 0.0,
+        max: 0.9,
+        doc: "gap between bars, as a fraction of a column",
+    },
+];
 
 /// The canonical spectrum analyzer scene.
 #[derive(Clone, Debug)]
