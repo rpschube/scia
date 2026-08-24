@@ -9,10 +9,13 @@ rust-version.workspace = true
 
 [dependencies]
 scia-core = { path = "../core", version = "0.0.0" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 
-# Probe-only (P5): the production scenes crate carries no normal dependency yet.
-# These exist solely for benches/tests that measure a Luau scene tick against
-# the real FeatureSnapshot shapes. See docs/probes/p5-luau-tick.md.
+# The scenes crate now carries serde + toml for the preset format. The mlua and
+# criterion dev-dependencies below remain probe-only (P5): they exist solely for
+# benches/tests that measure a Luau scene tick against the real FeatureSnapshot
+# shapes. See docs/probes/p5-luau-tick.md.
 [dev-dependencies]
 scia-core = { path = "../core", version = "0.0.0" }
 mlua = { version = "0.11", features = ["luau", "vendored"] }

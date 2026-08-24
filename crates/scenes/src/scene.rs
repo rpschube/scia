@@ -16,6 +16,27 @@
 use crate::canvas::Canvas;
 use crate::palette::Palette;
 
+/// One tunable parameter a scene exposes, with its default and valid range.
+///
+/// A scene's parameters form a `&'static [ParamSpec]` manifest on its
+/// [`crate::SceneInfo`]. Presets are typed against this manifest: a `[params]`
+/// key must be one of these `key`s, its value must be a number, and that number
+/// must lie within `[min, max]`. `doc` is the one-line description surfaced in
+/// the preset reference and the built-in preset template.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamSpec {
+    /// The parameter name, e.g. `"release"`.
+    pub key: &'static str,
+    /// The value used when a preset does not set the key.
+    pub default: f32,
+    /// Inclusive lower bound.
+    pub min: f32,
+    /// Inclusive upper bound.
+    pub max: f32,
+    /// A one-line human description.
+    pub doc: &'static str,
+}
+
 /// The context handed to a scene at [`Scene::init`]: the drawing aspect ratio,
 /// the host palette and the scene's typed parameters.
 #[derive(Clone, Debug)]

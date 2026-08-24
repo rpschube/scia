@@ -18,13 +18,18 @@
 pub mod builtin;
 pub mod canvas;
 pub mod palette;
+pub mod preset;
 pub mod registry;
 pub mod scene;
 
 pub use canvas::{Canvas, PALETTE_SLOTS, Primitive, Slot, Style};
 pub use palette::{Palette, Rgb};
-pub use registry::{SceneInfo, builtin_scenes, create_builtin};
-pub use scene::{Params, Scene, SceneCtx, SceneState};
+pub use preset::{
+    Blend, Curve, Feature, Layer, LayerInstance, Mapping, MappingSet, PaletteSource, Preset,
+    PresetError, PresetErrorKind, builtin_preset, builtin_presets, load_preset, parse_preset,
+};
+pub use registry::{SceneInfo, builtin_scenes, create_builtin, scene_info};
+pub use scene::{ParamSpec, Params, Scene, SceneCtx, SceneState};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");

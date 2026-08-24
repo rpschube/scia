@@ -1,0 +1,63 @@
+# spectra — the canonical analyzer preset.
+#
+# This is a copy-and-edit template: every table and key the preset format
+# understands appears here, either set or shown in a comment. See
+# docs/presets.md for the full reference (types, ranges, the feature
+# vocabulary, curve formulas, envelope semantics and the error format).
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric).
+name = "spectra"
+# Required. A registered scene id. `spectra` is the canonical analyzer.
+scene = "spectra"
+# Optional. A one-line human description.
+description = "The canonical analyzer: log-spaced bars whose low end punches on the onset."
+# Optional. A one-word mood; defaults to the scene's own mood ("kinetic").
+mood = "kinetic"
+
+# Typed parameters for the preset's scene. Every key must exist in the scene's
+# parameter manifest; every value is a number within the stated range. Omitted
+# keys keep their manifest default.
+[params]
+# release     0.15   range 0.01..=2.0   extra release time constant (seconds)
+release = 0.15
+# punch_decay 0.25   range 0.01..=2.0   onset-envelope decay time constant (seconds)
+punch_decay = 0.25
+# punch       0.35   range 0.0..=2.0    how much the envelope lifts the low bars
+punch = 0.35
+# gap         0.15   range 0.0..=0.9    gap between bars, as a fraction of a column
+gap = 0.15
+
+# Optional layer stack. With no [[layer]] tables the preset is exactly one
+# layer: [preset].scene with [params]. Each layer names its own scene, an
+# optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0); [layer.params] is typed against THAT layer's scene manifest and
+# merges over its defaults. When layers are present, [map] targets the FIRST
+# layer's scene.
+#
+# [[layer]]
+# scene = "spectra"
+# blend = "over"
+# intensity = 1.0
+# [layer.params]
+# gap = 0.2
+
+# Feature -> parameter mappings. Each key is a parameter of the mapped scene;
+# each value is a table naming a feature and a response. A string value here is
+# reserved for the expression VM (a later card) and is rejected today.
+#
+# feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
+# curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+[map]
+# Lift the low-end punch on every onset: a fast attack, a quarter-second decay.
+punch = { feature = "onset", curve = "linear", attack_ms = 0, decay_ms = 250, scale = 0.9, offset = 0.0 }
+
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries; only meaningful with a
+# static source. Omit to use the host default palette.
+slots = ["#0d3b3b", "#1f8f8f", "#3fd0d0", "#ffb020", "#ff6b5b", "#14161c", "#8a8f9c", "#e6e8ee"]
