@@ -29,7 +29,7 @@ use scia_core::{
     list_devices,
 };
 use scia_scenes::{Preset, PresetWatcher, ReloadEvent, load_preset};
-use scia_tui::{ChromeMode, Keymap, RunError, Tier, TuiOptions, run};
+use scia_tui::{ChromeMode, Keymap, PresenterMode, RunError, Tier, TuiOptions, run};
 
 use config::Resolved;
 
@@ -42,8 +42,9 @@ CONFIG:
     Unix:     $XDG_CONFIG_HOME/scia/config.toml  (else ~/.config/scia/config.toml)
     Windows:  %APPDATA%\\scia\\config.toml
   [defaults]  scene, presenter, overlay, perf_mode, demo_bpm, chrome
-              (chrome = invisible | instrument | playful | utilitarian;
-              overridden by --chrome)
+              (presenter = octant | sextant | quadrant | half | kitty;
+              chrome = invisible | instrument | playful | utilitarian;
+              both overridden by their flags)
   [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
               quit, chrome, now_playing, palette. A value is a single
               character, a named
@@ -160,9 +161,11 @@ struct Cli {
     #[arg(long, value_name = "PATH", conflicts_with = "scene")]
     scene_file: Option<PathBuf>,
 
-    /// Force the mosaic tier and skip capability probing (for testing). Without
-    /// it the tier is chosen by probing the terminal.
-    #[arg(long, value_enum, value_name = "TIER")]
+    /// Force the presenter: a mosaic tier (octant|sextant|quadrant|half, which
+    /// skips capability probing), or `kitty` for the kitty graphics presenter
+    /// (probes for support and falls back to mosaic when absent). Without it the
+    /// mosaic tier is chosen by probing the terminal.
+    #[arg(long, value_enum, value_name = "PRESENTER")]
     presenter: Option<PresenterTier>,
 
     /// Chrome personality: the now-playing / status chrome drawn over the scene.
@@ -184,8 +187,9 @@ enum Command {
     ListScenes,
 }
 
-/// The mosaic tiers selectable with `--presenter` (or the config
-/// `[defaults] presenter`).
+/// The presenters selectable with `--presenter` (or the config
+/// `[defaults] presenter`): the four mosaic tiers, plus the kitty graphics
+/// presenter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum PresenterTier {
     /// `2×4` block octants.
@@ -196,15 +200,21 @@ enum PresenterTier {
     Quadrant,
     /// `1×2` half blocks (the universally safe rung).
     Half,
+    /// Kitty graphics protocol (ghostty/kitty). Falls back to the mosaic default
+    /// tier when the terminal does not support it.
+    Kitty,
 }
 
 impl PresenterTier {
-    fn tier(self) -> Tier {
+    /// The mosaic [`Tier`] this value selects, or `None` for the kitty presenter
+    /// (which is not a mosaic tier).
+    fn as_tier(self) -> Option<Tier> {
         match self {
-            PresenterTier::Octant => Tier::Octant,
-            PresenterTier::Sextant => Tier::Sextant,
-            PresenterTier::Quadrant => Tier::Quadrant,
-            PresenterTier::Half => Tier::Half,
+            PresenterTier::Octant => Some(Tier::Octant),
+            PresenterTier::Sextant => Some(Tier::Sextant),
+            PresenterTier::Quadrant => Some(Tier::Quadrant),
+            PresenterTier::Half => Some(Tier::Half),
+            PresenterTier::Kitty => None,
         }
     }
 }
@@ -323,19 +333,48 @@ fn print_scene_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Choose the mosaic tier for a TUI run: the forced `--presenter` tier (which
-/// skips probing), otherwise the default tier from a capability probe. Prints
+/// Choose the presenter mode for a TUI run, plus an optional one-shot startup
+/// notice.
+///
+/// A forced mosaic `--presenter` tier skips probing (as before). A forced
+/// `--presenter kitty` probes the terminal for graphics support and cell size: on
+/// support it uses the kitty presenter; otherwise it falls back to the probed
+/// default mosaic tier and returns a notice explaining the fallback. With no
+/// force, the terminal is probed and the default mosaic tier is used —
+/// auto-selection is deliberately unchanged, so kitty is only ever opt-in. Prints
 /// the capability one-liner to stderr when probing a real terminal. Called only
 /// on the TUI path (never headless).
-fn select_tier(resolved: &Resolved) -> Tier {
-    if let Some(forced) = resolved.presenter {
-        return forced.tier();
+fn select_presenter(resolved: &Resolved) -> (PresenterMode, Option<String>) {
+    match resolved.presenter {
+        Some(PresenterTier::Kitty) => {
+            let report = scia_tui::probe(PROBE_TIMEOUT);
+            if io::stdout().is_terminal() {
+                eprintln!("{report}");
+            }
+            if report.kitty_graphics {
+                let cell_px = report.cell_px.unwrap_or(scia_tui::FALLBACK_CELL_PX);
+                (PresenterMode::Kitty { cell_px }, None)
+            } else {
+                let tier = scia_tui::default_tier(&report);
+                (
+                    PresenterMode::Mosaic(tier),
+                    Some("kitty graphics unavailable; using mosaic".to_string()),
+                )
+            }
+        }
+        Some(forced) => {
+            // A forced mosaic tier skips probing entirely, as before.
+            let tier = forced.as_tier().unwrap_or_default();
+            (PresenterMode::Mosaic(tier), None)
+        }
+        None => {
+            let report = scia_tui::probe(PROBE_TIMEOUT);
+            if io::stdout().is_terminal() {
+                eprintln!("{report}");
+            }
+            (PresenterMode::Mosaic(scia_tui::default_tier(&report)), None)
+        }
     }
-    let report = scia_tui::probe(PROBE_TIMEOUT);
-    if io::stdout().is_terminal() {
-        eprintln!("{report}");
-    }
-    scia_tui::default_tier(&report)
 }
 
 /// Print every device on every cpal host and exit 0. Enumeration failure is a
@@ -400,6 +439,7 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         }
     };
 
+    let (presenter_mode, initial_notice) = select_presenter(resolved);
     let opts = TuiOptions {
         fps: cli.fps,
         label: Some("DEMO — synthetic feed".to_string()),
@@ -409,7 +449,8 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         overlay: resolved.overlay,
         scene: resolved.scene.clone(),
         preset,
-        tier: Some(select_tier(resolved)),
+        presenter_mode,
+        initial_notice,
         keymap,
         chrome: resolved.chrome,
     };
@@ -513,6 +554,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     if matches!(perf_state, PerfModeState::Active { .. }) {
         source.push_str(" · perf");
     }
+    let (presenter_mode, initial_notice) = select_presenter(resolved);
     let opts = TuiOptions {
         fps: cli.fps,
         label: None,
@@ -522,7 +564,8 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         overlay: resolved.overlay,
         scene: resolved.scene.clone(),
         preset,
-        tier: Some(select_tier(resolved)),
+        presenter_mode,
+        initial_notice,
         keymap,
         chrome: resolved.chrome,
     };
@@ -682,4 +725,33 @@ fn loudest_bar(spectrum: &[f32]) -> (usize, f32) {
         }
     }
     (best, best_val)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presenter_kitty_flag_parses() {
+        let cli = Cli::try_parse_from(["scia", "--presenter", "kitty"]).expect("parses");
+        assert_eq!(cli.presenter, Some(PresenterTier::Kitty));
+    }
+
+    #[test]
+    fn presenter_mosaic_flags_still_parse() {
+        for (arg, expected) in [
+            ("octant", PresenterTier::Octant),
+            ("sextant", PresenterTier::Sextant),
+            ("quadrant", PresenterTier::Quadrant),
+            ("half", PresenterTier::Half),
+        ] {
+            let cli = Cli::try_parse_from(["scia", "--presenter", arg]).expect("parses");
+            assert_eq!(cli.presenter, Some(expected));
+        }
+    }
+
+    #[test]
+    fn unknown_presenter_flag_is_rejected() {
+        assert!(Cli::try_parse_from(["scia", "--presenter", "sixel"]).is_err());
+    }
 }

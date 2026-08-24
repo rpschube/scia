@@ -190,7 +190,7 @@ pub fn parse(text: &str) -> Config {
             Ok(tier) => Some(tier),
             Err(_) => {
                 warnings.push(format!(
-                    "config: unknown presenter `{name}`; ignoring (valid: octant, sextant, quadrant, half)"
+                    "config: unknown presenter `{name}`; ignoring (valid: octant, sextant, quadrant, half, kitty)"
                 ));
                 None
             }
@@ -358,6 +358,33 @@ mod tests {
         );
         assert_eq!(cfg.defaults.presenter, Some(PresenterTier::Quadrant));
         assert!(cfg.warnings.is_empty());
+    }
+
+    #[test]
+    fn kitty_presenter_parses() {
+        // The kitty presenter value validates like the mosaic tiers do.
+        let cfg = parse(
+            r#"
+            [defaults]
+            presenter = "kitty"
+            "#,
+        );
+        assert_eq!(cfg.defaults.presenter, Some(PresenterTier::Kitty));
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+    }
+
+    #[test]
+    fn every_mosaic_tier_still_validates() {
+        for (name, tier) in [
+            ("octant", PresenterTier::Octant),
+            ("sextant", PresenterTier::Sextant),
+            ("quadrant", PresenterTier::Quadrant),
+            ("half", PresenterTier::Half),
+        ] {
+            let cfg = parse(&format!("[defaults]\npresenter = \"{name}\"\n"));
+            assert_eq!(cfg.defaults.presenter, Some(tier));
+            assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        }
     }
 
     #[test]
