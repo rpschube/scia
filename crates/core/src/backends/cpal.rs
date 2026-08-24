@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -80,6 +80,8 @@ impl Default for CpalBackend {
 struct StreamErrorState {
     /// Set once the error callback has fired at least once.
     errored: AtomicBool,
+    /// Transient buffer under/overruns reported by the backend (not fatal).
+    xruns: AtomicU64,
     /// The most recent error message. The error callback may lock — it does not
     /// run on the data path.
     last: Mutex<Option<String>>,
@@ -96,6 +98,10 @@ struct CpalStream {
 impl CaptureStream for CpalStream {
     fn format(&self) -> StreamFormat {
         self.format
+    }
+
+    fn xruns(&self) -> u64 {
+        self.error_state.xruns.load(Ordering::Relaxed)
     }
 
     fn health(&self) -> StreamHealth {
@@ -250,6 +256,13 @@ fn build_stream(
     let err_state = Arc::clone(&error_state);
     let error_callback = move |err: cpal::Error| {
         // Off the data path: locking here is allowed.
+        // A buffer under/overrun is a transient glitch (the engine dropped or
+        // repeated a packet); it is counted, never fatal. Anything else — the
+        // device going away, a backend failure — marks the stream errored.
+        if matches!(err.kind(), cpal::ErrorKind::Xrun) {
+            err_state.xruns.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if let Ok(mut slot) = err_state.last.lock() {
             *slot = Some(err.to_string());
         }

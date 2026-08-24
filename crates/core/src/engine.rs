@@ -61,6 +61,8 @@ pub struct EngineStats {
     /// `Active`, and at the (much lower) idle poll rate once `Idle` — the
     /// meter-free way to observe the downshift.
     pub dsp_wakes: u64,
+    /// Transient capture buffer under/overruns (counted, not fatal).
+    pub xruns: u64,
 }
 
 /// Why the engine could not start.
@@ -160,6 +162,7 @@ impl Engine {
                 _ => Activity::Active,
             },
             dsp_wakes: self.counters.dsp_wakes.load(Ordering::Relaxed),
+            xruns: self.stream.as_ref().map_or(0, |s| s.xruns()),
         }
     }
 
