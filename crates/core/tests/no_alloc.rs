@@ -74,6 +74,51 @@ fn hot_path_does_not_allocate() {
 }
 
 #[test]
+fn idle_path_does_not_allocate() {
+    // The cheap idle path (rms/peak plus release decay, no FFT) must also be
+    // allocation-free. Feed silence so `process_idle` takes its decay branch.
+    let format = StreamFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    };
+    let hop = 256usize;
+    let channels = 2usize;
+    // Below the −60 dBFS quiet threshold: the silence hops stay on the cheap path.
+    let resume_rms = 0.001f32;
+
+    let (mut sink, mut consumer) = sample_ring(Instant::now());
+    let mut processor = HopProcessor::new(hop, 2, 48_000);
+    let tone = vec![0.3f32; hop * channels];
+    let silence = vec![0.0f32; hop * channels];
+
+    // Warm up: run a real tone through the full path (allocating FFT scratch is
+    // done in `new`, but prime the smoothing state), then a few idle hops.
+    for _ in 0..5 {
+        sink.push(&tone);
+        let _ = processor.try_process(&mut consumer, format, 0, 0);
+    }
+    for _ in 0..5 {
+        sink.push(&silence);
+        let _ = processor.process_idle(&mut consumer, format, 0, 0, resume_rms);
+    }
+
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..200 {
+        sink.push(&silence);
+        let snapshot = processor.process_idle(&mut consumer, format, 0, 0, resume_rms);
+        assert!(snapshot.is_some());
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+
+    assert_eq!(
+        after,
+        before,
+        "idle path allocated {} time(s)",
+        after - before
+    );
+}
+
+#[test]
 fn full_hop_path_does_not_allocate() {
     // Like `hot_path_does_not_allocate` but with a time-varying click train, so
     // the band splitter's averages move and the onset detector actually fires
