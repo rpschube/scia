@@ -175,3 +175,48 @@ fn lattice_update_render_does_not_allocate() {
         strays.join("\n---\n")
     );
 }
+
+/// The `starfall` scene must not allocate per frame once warmed: its star pool
+/// is fixed at init, respawns reuse the slot in place, and the canvas retains
+/// capacity.
+#[test]
+fn starfall_update_render_does_not_allocate() {
+    let mut scene = create_builtin("starfall").expect("starfall exists");
+    scene.init(&SceneCtx::default());
+    let mut canvas = Canvas::new(16.0 / 9.0);
+
+    // A driving snapshot with loudness and a toggled onset, so both the point and
+    // streak render paths run and stars keep respawning.
+    let mut f = FeatureSnapshot {
+        rms: 0.6,
+        onset: false,
+        onset_age_ms: 100.0,
+        ..FeatureSnapshot::default()
+    };
+
+    // Warm up: grow the canvas to steady capacity and cycle stars through respawn.
+    for i in 0..16 {
+        f.onset = i % 2 == 0;
+        f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+        scene.update(&f, 0.05);
+        canvas.clear();
+        scene.render(&mut canvas);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for i in 0..500 {
+            f.onset = i % 7 == 0;
+            f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+            scene.update(&f, 0.05);
+            canvas.clear();
+            scene.render(&mut canvas);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "starfall update/render allocated {} time(s) across 500 frames:\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
