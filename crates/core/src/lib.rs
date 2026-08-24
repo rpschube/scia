@@ -1,9 +1,35 @@
-//! Engine core for scia: system-audio capture, the lock-free sample ring,
-//! the DSP stages that turn samples into spectra and onsets, and the feature
-//! bus that fans those features out to consumers. This crate is the headless
-//! heart of the project and carries no user-interface dependencies of any
-//! kind — no terminal, GPU, windowing or scripting crates — so it can back a
-//! TUI today and a GPU window or wallpaper mode later without change.
+//! Engine core for scia: the headless pipeline that turns captured system
+//! audio into a stream of feature snapshots.
+//!
+//! The pipeline is a single in-process chain: a capture backend copies
+//! interleaved `f32` samples into a wait-free SPSC ring ([`SampleSink`] →
+//! [`SampleConsumer`]); a DSP thread drains the ring on a fixed 256-frame hop
+//! grid and computes per-hop features; each hop is published to a
+//! triple-buffered [`FeatureSnapshot`] bus ([`FeatureWriter`] →
+//! [`FeatureReader`]) that consumers read without ever blocking the DSP thread.
+//! When capture stalls the grid keeps advancing with synthesized silence. A
+//! [`SyntheticBackend`] drives the whole chain with no audio hardware, and
+//! [`Engine`] wires a backend to the DSP thread. This crate carries no
+//! user-interface dependency of any kind.
+
+#![forbid(unsafe_code)]
+
+pub mod bus;
+pub mod capture;
+pub mod dsp;
+pub mod engine;
+pub mod features;
+pub mod synthetic;
+
+pub use bus::{FeatureReader, FeatureWriter, feature_bus};
+pub use capture::{
+    CaptureBackend, CaptureError, CaptureStream, CaptureTarget, RING_FRAMES, SampleConsumer,
+    SampleSink, SinkStats, StreamFormat, sample_ring,
+};
+pub use dsp::{DspConfig, HopProcessor};
+pub use engine::{Engine, EngineConfig, EngineError, EngineStats};
+pub use features::{FEATURE_SCHEMA_VERSION, FeatureSnapshot, SPECTRUM_BINS};
+pub use synthetic::{Pacing, Signal, SyntheticBackend};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
