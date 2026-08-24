@@ -6,3 +6,6 @@
 fn main() {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
+
+#[cfg(test)]
+mod bite_tests { #[test] fn must_fail() { assert_eq!(1, 2); } }
