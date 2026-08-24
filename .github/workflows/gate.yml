@@ -1,0 +1,90 @@
+# gate — the pull-request merge gate for Linux.
+# The gate has ONE definition: the justfile. CI installs the pinned tools and
+# calls the same `just` recipes a contributor runs locally, one step each so a
+# failure is visible per recipe. The privacy pass is a separate workflow
+# (privacy.yml); together gate.yml and privacy.yml cover exactly `just gate`.
+# A second job lints the pull-request title as a Conventional Commit.
+name: gate
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [master]
+
+concurrency:
+  group: gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install --profile minimal
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install gate tools (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.46.0,cargo-nextest@0.9.140,cargo-deny@0.20.2
+
+      - name: fmt-check
+        run: just fmt-check
+
+      - name: clippy
+        run: just clippy
+
+      - name: deny
+        run: just deny
+
+      - name: core-deps
+        run: just core-deps
+
+      - name: test
+        run: just test
+
+  pr-title:
+    name: pr-title
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Lint the pull-request title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          rule='^(feat|fix|perf|refactor|test|docs|chore|ci|build|revert)(\([a-z0-9._/-]+\))?!?: [^ ].+$'
+          ok=1
+          if [ "${#TITLE}" -gt 72 ]; then
+            ok=0
+          fi
+          if ! printf '%s' "$TITLE" | grep -Eq "$rule"; then
+            ok=0
+          fi
+          if [ "$ok" -ne 1 ]; then
+            echo "Pull-request title does not meet the Conventional Commit rule."
+            echo
+            echo "  title:    $TITLE"
+            echo "  length:   ${#TITLE} (must be <= 72)"
+            echo "  rule:     type(scope)?!?: summary — type in"
+            echo "            feat|fix|perf|refactor|test|docs|chore|ci|build|revert,"
+            echo "            optional lowercase scope, ': ' then a non-empty summary."
+            echo
+            echo "  examples: feat(core): add capture ring buffer"
+            echo "            ci: pin gate tool versions"
+            exit 1
+          fi
+          echo "Pull-request title OK: $TITLE"
