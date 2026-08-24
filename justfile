@@ -146,3 +146,11 @@ lock-status:
 # Wind a session down: sweep, report the lock, list worktrees.
 session-end: sweep lock-status
     git worktree list
+
+# Regenerate the whole changelog for a release tag (release time only).
+changelog tag:
+    git-cliff --tag {{tag}} -o CHANGELOG.md
+
+# Show what a release would build (cargo-dist plan; no compilation).
+dist-plan:
+    dist plan
