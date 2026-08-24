@@ -21,7 +21,7 @@ fn sink_push_and_hop_drain() {
     let (mut sink, mut consumer) = sample_ring(Instant::now());
     let hop = 256usize;
     let channels = 2usize;
-    let mut processor = HopProcessor::new(hop, 2);
+    let mut processor = HopProcessor::new(hop, 2, 48_000);
 
     for expected_gen in 1..=3 {
         let pattern = vec![0.25f32; hop * channels];
