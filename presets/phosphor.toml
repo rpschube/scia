@@ -1,0 +1,72 @@
+# phosphor — the Lissajous phosphor-screen preset.
+#
+# This is a copy-and-edit template: every table and key the preset format
+# understands appears here, either set or shown in a comment. See
+# docs/presets.md for the full reference (types, ranges, the feature
+# vocabulary, curve formulas, envelope semantics and the error format).
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric).
+name = "phosphor"
+# Required. A registered scene id. `phosphor` is the Lissajous phosphor screen.
+scene = "phosphor"
+# Optional. A one-line human description.
+description = "A Lissajous trace burned onto a decaying phosphor screen; the figure precesses and onsets bloom its amplitude."
+# Optional. A one-word mood; defaults to the scene's own mood ("retro").
+mood = "retro"
+
+# Typed parameters for the preset's scene. Every key must exist in the scene's
+# parameter manifest; every value is a number within the stated range. Omitted
+# keys keep their manifest default.
+[params]
+# freq_a      3.0    range 1.0..=8.0    horizontal base frequency of the Lissajous figure
+freq_a = 3.0
+# freq_b      2.0    range 1.0..=8.0    vertical base frequency of the Lissajous figure
+freq_b = 2.0
+# decay       0.5    range 0.05..=3.0   phosphor persistence time constant (seconds)
+decay = 0.5
+# precession  0.6    range 0.0..=4.0    precession speed: how fast the phase offset drifts (rad/s)
+precession = 0.6
+# swell       0.5    range 0.0..=1.0    loudness-to-amplitude gain: how much loudness opens the figure
+swell = 0.5
+# open        0.45   range 0.0..=1.0    onset amplitude opening: extra figure amplitude on a transient
+open = 0.45
+
+# Optional layer stack. With no [[layer]] tables the preset is exactly one
+# layer: [preset].scene with [params]. Each layer names its own scene, an
+# optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0); [layer.params] is typed against THAT layer's scene manifest and
+# merges over its defaults. When layers are present, [map] targets the FIRST
+# layer's scene.
+#
+# [[layer]]
+# scene = "phosphor"
+# blend = "over"
+# intensity = 1.0
+# [layer.params]
+# decay = 1.0
+
+# Feature -> parameter mappings. Each key is a parameter of the mapped scene;
+# each value is either a table naming a feature and a response, or a string
+# expression over the feature vocabulary (evaluated per frame).
+#
+# feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
+# curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+[map]
+# Precess faster through busy passages: spectral flux drives the drift speed on a
+# slow envelope, so the figure wanders more when the music is active and settles
+# back when it calms. Stays inside precession's 0.0..=4.0 range (offset 0.6, plus
+# up to scale 1.5).
+precession = { feature = "flux", curve = "linear", attack_ms = 200, decay_ms = 800, scale = 1.5, offset = 0.6 }
+
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries; only meaningful with a
+# static source. Omit to use the host default palette. A single-hue green CRT
+# ramp: near-black through dim and bright phosphor green to a white-green beam,
+# then three neutrals.
+slots = ["#04160a", "#1f7a3a", "#4dff7a", "#a9ff5b", "#eaffea", "#080a08", "#6f8a72", "#e6ffe6"]
