@@ -7,9 +7,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::bands::{BandConfig, BandSplitter};
 use crate::bus::FeatureWriter;
 use crate::capture::{SampleConsumer, SinkStats, StreamFormat};
 use crate::features::{FEATURE_SCHEMA_VERSION, FeatureSnapshot};
+use crate::onset::{OnsetConfig, OnsetDetector};
 use crate::spectrum::{SpectrumAnalyzer, SpectrumConfig};
 
 /// Tuning for the DSP thread.
@@ -27,6 +29,10 @@ pub struct DspConfig {
     pub starved_poll_interval: Duration,
     /// Display-spectrum tuning (bars, FFT sizes, AGC, smoothing).
     pub spectrum: SpectrumConfig,
+    /// Crossover band-split tuning (bass/mid crossovers, averaging).
+    pub bands: BandConfig,
+    /// Onset-detector tuning (threshold, min IOI, flux normalization).
+    pub onset: OnsetConfig,
 }
 
 impl Default for DspConfig {
@@ -37,6 +43,8 @@ impl Default for DspConfig {
             gap_timeout: Duration::from_millis(100),
             starved_poll_interval: Duration::from_millis(50),
             spectrum: SpectrumConfig::default(),
+            bands: BandConfig::default(),
+            onset: OnsetConfig::default(),
         }
     }
 }
@@ -68,18 +76,31 @@ pub struct HopProcessor {
     right: Vec<f32>,
     analyzer: SpectrumAnalyzer,
     spectrum_out: Vec<f32>,
+    band_splitter: BandSplitter,
+    onset_detector: OnsetDetector,
+    bands_out: [f32; 3],
+    flux: f32,
+    onset: bool,
+    onset_age_ms: f32,
 }
 
 impl HopProcessor {
     /// Allocate scratch for `hop_frames` frames of `channels`-wide audio,
-    /// using the default display-spectrum configuration.
+    /// using the default display-spectrum, band and onset configurations.
     #[must_use]
     pub fn new(hop_frames: usize, channels: u16, sample_rate: u32) -> Self {
-        Self::with_spectrum_config(hop_frames, channels, sample_rate, SpectrumConfig::default())
+        Self::with_configs(
+            hop_frames,
+            channels,
+            sample_rate,
+            SpectrumConfig::default(),
+            BandConfig::default(),
+            OnsetConfig::default(),
+        )
     }
 
     /// Like [`HopProcessor::new`] but with an explicit display-spectrum
-    /// configuration. Allocates every buffer (including the FFT plans) once.
+    /// configuration (band and onset detectors keep their defaults).
     #[must_use]
     pub fn with_spectrum_config(
         hop_frames: usize,
@@ -87,9 +108,34 @@ impl HopProcessor {
         sample_rate: u32,
         spectrum: SpectrumConfig,
     ) -> Self {
+        Self::with_configs(
+            hop_frames,
+            channels,
+            sample_rate,
+            spectrum,
+            BandConfig::default(),
+            OnsetConfig::default(),
+        )
+    }
+
+    /// Full constructor: spectrum, band-split and onset configs. Allocates every
+    /// buffer (including the FFT plans and detector state) once.
+    #[must_use]
+    pub fn with_configs(
+        hop_frames: usize,
+        channels: u16,
+        sample_rate: u32,
+        spectrum: SpectrumConfig,
+        bands: BandConfig,
+        onset: OnsetConfig,
+    ) -> Self {
         let channels = channels.max(1) as usize;
         let analyzer = SpectrumAnalyzer::new(spectrum, sample_rate);
         let bars = analyzer.bars();
+        let fft_main = analyzer.config().fft_main;
+        let fft_bass = analyzer.config().fft_bass;
+        let band_splitter = BandSplitter::new(bands, sample_rate, fft_main, fft_bass);
+        let onset_detector = OnsetDetector::new(onset, sample_rate, fft_main);
         Self {
             hop_frames,
             channels,
@@ -101,6 +147,12 @@ impl HopProcessor {
             right: vec![0.0; hop_frames],
             analyzer,
             spectrum_out: vec![0.0; bars],
+            band_splitter,
+            onset_detector,
+            bands_out: [0.0; 3],
+            flux: 0.0,
+            onset: false,
+            onset_age_ms: 0.0,
         }
     }
 
@@ -108,6 +160,22 @@ impl HopProcessor {
     #[must_use]
     pub fn spectrum_gain(&self) -> f32 {
         self.analyzer.gain()
+    }
+
+    /// Instantaneous linear band energies (bass, mid, treble) from the last
+    /// processed hop. Unlike the ratio-normalized [`FeatureSnapshot::bands`],
+    /// these raw energies directly show which band a signal's power sits in —
+    /// handy for an overlay or a test.
+    #[must_use]
+    pub fn band_levels(&self) -> [f32; 3] {
+        self.band_splitter.levels()
+    }
+
+    /// Per-band long-term averages (bass, mid, treble) — the reference levels
+    /// the ratio normalization divides by.
+    #[must_use]
+    pub fn band_averages(&self) -> [f32; 3] {
+        self.band_splitter.averages()
     }
 
     /// Current hop generation (last published, or 0 before the first hop).
@@ -159,9 +227,23 @@ impl HopProcessor {
 
         self.analyzer
             .process_hop(&self.mono, self.dt_seconds, &mut self.spectrum_out);
+        self.run_bands_and_onset();
 
         self.generation += 1;
         Some(self.snapshot(format, timestamp_ns, dropped_frames, false, rms, peak))
+    }
+
+    /// Feed the freshest spectra into the band splitter and onset detector and
+    /// cache their outputs for the next snapshot. Allocation-free.
+    fn run_bands_and_onset(&mut self) {
+        let mag_main = self.analyzer.mag_main();
+        let mag_bass = self.analyzer.mag_bass();
+        self.band_splitter
+            .process_hop(mag_main, mag_bass, self.dt_seconds, &mut self.bands_out);
+        let (flux, onset) = self.onset_detector.process_hop(mag_main, self.dt_seconds);
+        self.flux = flux;
+        self.onset = onset;
+        self.onset_age_ms = self.onset_detector.onset_age_ms();
     }
 
     /// Emit a silent hop (rms/peak 0, `starved = true`), incrementing the
@@ -180,6 +262,10 @@ impl HopProcessor {
         // release time constant instead of snapping to zero.
         self.analyzer
             .process_hop(&self.mono, self.dt_seconds, &mut self.spectrum_out);
+        // Run the band splitter and onset detector on the silent spectra too, so
+        // their averages relax and the onset-age clock keeps advancing while
+        // capture is stalled.
+        self.run_bands_and_onset();
         self.generation += 1;
         self.snapshot(format, timestamp_ns, dropped_frames, true, 0.0, 0.0)
     }
@@ -208,6 +294,10 @@ impl HopProcessor {
         let bars = self.analyzer.bars();
         snapshot.spectrum[..bars].copy_from_slice(&self.spectrum_out[..bars]);
         snapshot.spectrum_len = bars as u16;
+        snapshot.bands = self.bands_out;
+        snapshot.flux = self.flux;
+        snapshot.onset = self.onset;
+        snapshot.onset_age_ms = self.onset_age_ms;
         snapshot
     }
 }
@@ -240,11 +330,13 @@ pub(crate) fn run(mut thread: DspThread) {
         thread.config.hop_frames as f64 / f64::from(thread.format.sample_rate.max(1)),
     );
 
-    let mut processor = HopProcessor::with_spectrum_config(
+    let mut processor = HopProcessor::with_configs(
         thread.config.hop_frames,
         thread.format.channels,
         thread.format.sample_rate,
         thread.config.spectrum,
+        thread.config.bands,
+        thread.config.onset,
     );
     let mut silent_deadline: Option<Instant> = None;
 

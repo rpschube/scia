@@ -17,14 +17,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bands;
 pub mod bus;
 pub mod capture;
 pub mod dsp;
 pub mod engine;
 pub mod features;
+pub mod onset;
 pub mod spectrum;
 pub mod synthetic;
 
+pub use bands::{BandConfig, BandSplitter};
 pub use bus::{FeatureReader, FeatureWriter, feature_bus};
 pub use capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, RING_FRAMES, SampleConsumer,
@@ -33,6 +36,7 @@ pub use capture::{
 pub use dsp::{DspConfig, HopProcessor};
 pub use engine::{Engine, EngineConfig, EngineError, EngineStats};
 pub use features::{FEATURE_SCHEMA_VERSION, FeatureSnapshot, SPECTRUM_BINS};
+pub use onset::{OnsetConfig, OnsetDetector};
 pub use spectrum::{SpectrumAnalyzer, SpectrumConfig};
 pub use synthetic::{Pacing, Signal, SyntheticBackend};
 
