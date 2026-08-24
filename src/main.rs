@@ -15,7 +15,8 @@ use clap::{Parser, ValueEnum};
 
 use scia_core::{
     Activity, CaptureError, CpalBackend, DeviceKind, DeviceSelector, Engine, EngineConfig,
-    EngineError, FeatureReader, Pacing, Signal, StreamHealth, SyntheticBackend, list_devices,
+    EngineError, FeatureReader, Pacing, PerfModeState, Signal, StreamHealth, SyntheticBackend,
+    list_devices,
 };
 use scia_tui::{TuiOptions, run};
 
@@ -58,6 +59,14 @@ struct Cli {
     /// recovery). The watcher is on by default.
     #[arg(long)]
     no_route_watch: bool,
+
+    /// Windows only: opt in to perf mode. When the default render endpoint
+    /// advertises an engine period below its default, hold a companion silent
+    /// render stream that pulls the endpoint — and the loopback capture — down
+    /// to that faster period. Reports its state on start; no effect on --demo or
+    /// off Windows.
+    #[arg(long)]
+    perf_mode: bool,
 
     /// With --headless, exit after N seconds. `0` (the default) runs until the
     /// process is killed.
@@ -190,6 +199,7 @@ fn run_live(cli: &Cli) -> ExitCode {
 
     let config = EngineConfig {
         route_watch: !cli.no_route_watch,
+        perf_mode: cli.perf_mode,
         ..EngineConfig::default()
     };
     let (engine, reader) = match Engine::start(Box::new(backend), config) {
@@ -222,14 +232,37 @@ fn run_live(cli: &Cli) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Report perf-mode state (one line, only when it was requested — Off prints
+    // nothing). Common to headless and TUI.
+    let perf_state = engine.perf_mode_state();
+    match &perf_state {
+        PerfModeState::Active {
+            period_frames,
+            sample_rate,
+        } => {
+            let ms = f64::from(*period_frames) * 1000.0 / f64::from((*sample_rate).max(1));
+            eprintln!("perf mode: active — {period_frames}-frame engine period ({ms:.2} ms)");
+        }
+        PerfModeState::Unavailable { reason } => {
+            eprintln!("perf mode: unavailable — {reason}");
+        }
+        PerfModeState::Off => {}
+    }
+
     if cli.headless {
         return run_headless(engine, reader, cli.seconds);
     }
 
+    // The source line gets a ` · perf` marker only when perf mode is actually
+    // active.
+    let mut source = format!("{} Hz {} ch", format.sample_rate, format.channels);
+    if matches!(perf_state, PerfModeState::Active { .. }) {
+        source.push_str(" · perf");
+    }
     let opts = TuiOptions {
         fps: cli.fps,
         label: None,
-        source: format!("{} Hz {} ch", format.sample_rate, format.channels),
+        source,
         frames: cli.frames,
         debug: cli.debug,
     };

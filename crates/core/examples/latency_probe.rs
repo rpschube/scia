@@ -44,10 +44,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use scia_core::{
     CaptureError, ClickDetector, CpalBackend, Detection, DeviceKind, DeviceSelector, Emission,
     EmitLog, Engine, EngineConfig, EngineError, FeatureReader, LatencyStats, Matcher, Pacing,
-    Signal, StreamHealth, SyntheticBackend, list_devices,
+    PerfModeState, Signal, StreamHealth, SyntheticBackend, list_devices,
 };
-#[cfg(feature = "perf-mode")]
-use scia_core::{PerfModeConfig, PerfModeStream};
 
 /// Frames per hop the pipeline runs on — fixed at 256 across the codebase.
 const HOP_FRAMES: u32 = 256;
@@ -243,20 +241,6 @@ fn run_live(
     output_device: Option<String>,
     perf_mode: bool,
 ) -> ExitCode {
-    // Perf-mode companion stream first (Windows only), so the endpoint is at its
-    // fast period before the loopback capture starts. Held for the whole run.
-    #[cfg(feature = "perf-mode")]
-    let (_perf_guard, perf_status) = open_perf_mode(perf_mode);
-    #[cfg(not(feature = "perf-mode"))]
-    let perf_status = {
-        if perf_mode {
-            eprintln!("perf mode: this build was compiled without the perf-mode feature");
-            "unavailable"
-        } else {
-            "off"
-        }
-    };
-
     let selector = device
         .clone()
         .map_or(DeviceSelector::Default, DeviceSelector::Named);
@@ -264,7 +248,13 @@ fn run_live(
         device: selector,
         prefer_pipewire: true,
     };
-    let (engine, mut reader) = match Engine::start(Box::new(backend), EngineConfig::default()) {
+    // The engine capability-detects and opens the perf-mode companion stream
+    // itself when `perf_mode` is set, and holds it for the run.
+    let config = EngineConfig {
+        perf_mode,
+        ..EngineConfig::default()
+    };
+    let (engine, mut reader) = match Engine::start(Box::new(backend), config) {
         Ok(pair) => pair,
         Err(EngineError::Capture(CaptureError::NoDevice)) => {
             eprintln!(
@@ -287,6 +277,24 @@ fn run_live(
     if let StreamHealth::Errored(msg) = engine.health() {
         eprintln!("warning: capture stream reported an error at open: {msg}");
     }
+
+    // The engine has already capability-detected perf mode and (when available)
+    // opened the companion stream. Report its state for the summary line.
+    let perf_status = match engine.perf_mode_state() {
+        PerfModeState::Active {
+            period_frames,
+            sample_rate,
+        } => {
+            let ms = f64::from(period_frames) * 1000.0 / f64::from(sample_rate.max(1));
+            println!("perf mode: on — {period_frames}-frame engine period ({ms:.3} ms)");
+            "on"
+        }
+        PerfModeState::Unavailable { reason } => {
+            eprintln!("perf mode: unavailable — {reason}");
+            "unavailable"
+        }
+        PerfModeState::Off => "off",
+    };
 
     // Open the click player on the chosen output device.
     let emit_log = Arc::new(EmitLog::new());
@@ -445,34 +453,6 @@ fn open_click_player(
             _ => PlayerError::Backend(e.to_string()),
         })?;
     Ok((stream, label))
-}
-
-/// Open the perf-mode companion render stream and report its periods (Windows
-/// only). Returns the live stream (held for the run) and the report status.
-#[cfg(feature = "perf-mode")]
-fn open_perf_mode(perf_mode: bool) -> (Option<PerfModeStream>, &'static str) {
-    if !perf_mode {
-        return (None, "off");
-    }
-    match PerfModeStream::open(&PerfModeConfig::default()) {
-        Ok(stream) => {
-            let info = stream.info();
-            let hz = f64::from(info.sample_rate.max(1));
-            let ms = |frames: u32| f64::from(frames) * 1000.0 / hz;
-            println!(
-                "perf mode: endpoint {} Hz, {} ch — chosen engine period {} ({:.3} ms)",
-                info.sample_rate,
-                info.channels,
-                info.chosen_period_frames,
-                ms(info.chosen_period_frames),
-            );
-            (Some(stream), "on")
-        }
-        Err(e) => {
-            eprintln!("perf mode unavailable: {e}");
-            (None, "unavailable")
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

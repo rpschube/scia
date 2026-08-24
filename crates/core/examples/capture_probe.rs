@@ -32,10 +32,8 @@ use std::time::Duration;
 
 use scia_core::{
     CaptureError, CpalBackend, DeviceKind, DeviceSelector, Engine, EngineConfig, EngineError,
-    EngineStats, StreamHealth, list_devices,
+    EngineStats, PerfModeState, StreamHealth, list_devices,
 };
-#[cfg(feature = "perf-mode")]
-use scia_core::{PerfModeConfig, PerfModeStream};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -124,16 +122,6 @@ fn list() -> ExitCode {
 /// companion perf-mode render stream is opened before the engine starts and
 /// held for the whole run (Windows only; a no-op with a note elsewhere).
 fn probe(device: Option<String>, seconds: u64, perf_mode: bool) -> ExitCode {
-    // Open the perf-mode companion stream first, so the endpoint is already at
-    // its minimum engine period before the loopback capture starts. The guard
-    // is dropped at the end of this function, after the engine has stopped.
-    #[cfg(feature = "perf-mode")]
-    let _perf_guard = open_perf_mode(perf_mode);
-    #[cfg(not(feature = "perf-mode"))]
-    if perf_mode {
-        eprintln!("perf mode: this build was compiled without the perf-mode feature");
-    }
-
     let selector = device
         .clone()
         .map_or(DeviceSelector::Default, DeviceSelector::Named);
@@ -142,7 +130,14 @@ fn probe(device: Option<String>, seconds: u64, perf_mode: bool) -> ExitCode {
         prefer_pipewire: true,
     };
 
-    let (engine, mut reader) = match Engine::start(Box::new(backend), EngineConfig::default()) {
+    // The engine capability-detects and opens the perf-mode companion stream
+    // itself when `perf_mode` is set; it holds the stream for the engine's life
+    // and re-evaluates it on a device switch.
+    let config = EngineConfig {
+        perf_mode,
+        ..EngineConfig::default()
+    };
+    let (engine, mut reader) = match Engine::start(Box::new(backend), config) {
         Ok(pair) => pair,
         Err(EngineError::Capture(CaptureError::NoDevice)) => {
             eprintln!(
@@ -168,6 +163,9 @@ fn probe(device: Option<String>, seconds: u64, perf_mode: bool) -> ExitCode {
         "negotiated stream: {} Hz, {} channel(s)",
         format.sample_rate, format.channels
     );
+    if perf_mode {
+        report_perf_mode(&engine);
+    }
     if let StreamHealth::Errored(msg) = engine.health() {
         eprintln!("warning: stream reported an error at open: {msg}");
     }
@@ -230,52 +228,23 @@ fn probe(device: Option<String>, seconds: u64, perf_mode: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Open the perf-mode companion stream on the default render endpoint and print
-/// its endpoint periods. Returns the live stream (kept alive by the caller for
-/// the run), or `None` when perf mode was not requested or is unavailable.
-#[cfg(feature = "perf-mode")]
-fn open_perf_mode(perf_mode: bool) -> Option<PerfModeStream> {
-    if !perf_mode {
-        return None;
-    }
-    match PerfModeStream::open(&PerfModeConfig::default()) {
-        Ok(stream) => {
-            let info = stream.info();
-            let hz = f64::from(info.sample_rate.max(1));
-            let ms = |frames: u32| f64::from(frames) * 1000.0 / hz;
-            println!(
-                "perf mode: endpoint {} Hz, {} ch — engine periods (frames / ms):",
-                info.sample_rate, info.channels
-            );
-            println!(
-                "  default={:>5} ({:>6.3} ms)  fundamental={:>5} ({:>6.3} ms)  \
-                 min={:>5} ({:>6.3} ms)  max={:>5} ({:>6.3} ms)  chosen={:>5} ({:>6.3} ms)",
-                info.default_period_frames,
-                ms(info.default_period_frames),
-                info.fundamental_period_frames,
-                ms(info.fundamental_period_frames),
-                info.min_period_frames,
-                ms(info.min_period_frames),
-                info.max_period_frames,
-                ms(info.max_period_frames),
-                info.chosen_period_frames,
-                ms(info.chosen_period_frames),
-            );
-            if info.chosen_period_frames == info.default_period_frames
-                && info.min_period_frames > 0
-                && info.min_period_frames < info.default_period_frames
-            {
-                println!(
-                    "perf mode: the endpoint refused the fast period; running at the default \
-                     period (loopback still works, without the speed-up)"
-                );
-            }
-            Some(stream)
+/// Print the engine's perf-mode state: `perf-mode on` with the chosen engine
+/// period when a companion stream is holding the endpoint fast,
+/// `perf-mode unavailable` with the reason otherwise (a driver-locked endpoint,
+/// no endpoint, or a non-Windows build).
+fn report_perf_mode(engine: &Engine) {
+    match engine.perf_mode_state() {
+        PerfModeState::Active {
+            period_frames,
+            sample_rate,
+        } => {
+            let ms = f64::from(period_frames) * 1000.0 / f64::from(sample_rate.max(1));
+            println!("perf-mode on: {period_frames}-frame engine period ({ms:.3} ms)");
         }
-        Err(e) => {
-            eprintln!("perf mode unavailable: {e}");
-            None
+        PerfModeState::Unavailable { reason } => {
+            println!("perf-mode unavailable: {reason}");
         }
+        PerfModeState::Off => println!("perf-mode off"),
     }
 }
 
