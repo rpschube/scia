@@ -58,11 +58,31 @@ pub fn image_dims(cols: u16, rows: u16, cell_px: (u16, u16), budget: u32) -> (u1
     if w == 0 || h == 0 || budget == 0 {
         return (0, 0);
     }
+    let k = image_downscale(cols, rows, cell_px, budget);
+    ((w / k).max(1) as u16, (h / k).max(1) as u16)
+}
+
+/// The integer downscale factor `k ≥ 1` [`image_dims`] applies for a
+/// `cols × rows` cell area at `cell_px` under `budget`: the smallest `k` for
+/// which `(cols·cell_w / k) × (rows·cell_h / k)` fits `budget`.
+///
+/// The kitty path leaves the terminal to scale the downscaled image back up via
+/// its `c`/`r` placement keys; the sixel path has no such scaling, so it
+/// pixel-repeats the budgeted image `×k` on emit to cover the full cell area.
+/// Returns `1` for an empty area or a zero budget.
+#[must_use]
+pub fn image_downscale(cols: u16, rows: u16, cell_px: (u16, u16), budget: u32) -> u32 {
+    let (cell_h, cell_w) = cell_px;
+    let w = u32::from(cols) * u32::from(cell_w);
+    let h = u32::from(rows) * u32::from(cell_h);
+    if w == 0 || h == 0 || budget == 0 {
+        return 1;
+    }
     let mut k = 1u32;
     while u64::from(w / k) * u64::from(h / k) > u64::from(budget) {
         k += 1;
     }
-    ((w / k).max(1) as u16, (h / k).max(1) as u16)
+    k
 }
 
 /// A preallocated RGB pixel grid plus the text runs collected from the last
