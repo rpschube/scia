@@ -14,7 +14,7 @@ to grow a GPU window and a desktop-wallpaper mode later.
 - Zero-config capture of any system audio on Windows and Linux (macOS best-effort)
 - Sub-frame reactivity: ≤ 33 ms audio-to-visual by default, an opt-in low-latency mode
 - Tear-free 60 fps rendering, near-zero CPU when nothing is playing
-- A real scene engine: TOML presets, expressions, sandboxed scripts
+- A real scene engine: [TOML presets](docs/presets.md), expressions, sandboxed scripts
 - Now-playing metadata and album-art palettes from any player
 - A single small binary, permissively licensed
 
