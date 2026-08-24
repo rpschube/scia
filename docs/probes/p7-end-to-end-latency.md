@@ -71,6 +71,17 @@ whole number of click spacings, so a short mid-gap flush tail is added after it
 before the log is drained; this keeps the last click's hop observed and the
 missed/spurious counts honest.
 
+A synthetic click clears the detector's threshold for only a single hop
+(~5.3 ms at 256 frames / 48 kHz), so whether the CI regression test observes a
+click at all depends on the observer sampling that one hop. When the platform
+coalesces the observer's short poll sleeps into a coarser timer, the observer
+samples only a fraction of the hops and sees a matching fraction of the clicks —
+a sampling-granularity artifact, not a pipeline dropping clicks. The test
+therefore calibrates its missed-click allowance from the observer's measured
+sampling coverage (observed hops over the generation span they cover) rather
+than a fixed count: at full coverage the allowance is the old small slack, so a
+pipeline genuinely dropping clicks while every hop is sampled still fails.
+
 ## The three intervals and their quantization
 
 Each interval is reported as nearest-rank percentiles (min / median / p95 / max)
