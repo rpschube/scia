@@ -8,21 +8,25 @@
 //! terminal cells. It is the only place in the crate that bridges the UI-free
 //! [`crate::mosaic`] rasterizer to `ratatui`.
 
+use std::fmt;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
-use scia_scenes::{Canvas, LayerInstance, Palette, Params, Preset, Rgb};
+use scia_scenes::{
+    Canvas, LayerInstance, Palette, Params, Preset, Rgb, builtin_preset, builtin_presets,
+};
 
 use crate::mosaic::{CellGrid, FrameBuffer, Tier};
 use scia_core::FeatureSnapshot;
 
 /// Renders a preset's scene layers into terminal cells on a mosaic [`Tier`].
 ///
-/// Build one with [`ScenePresenter::from_preset`], call [`resize`] whenever the
-/// target area or tier changes, then [`frame`] once per frame and [`draw`] to
-/// paint. The tier is a parameter here; runtime capability probing and
-/// auto-selection arrive with a later card.
+/// Build one with [`ScenePresenter::from_preset`] (or the name-resolving
+/// [`build_scene_presenter`]), call [`resize`] whenever the target area or tier
+/// changes, then [`frame`] once per frame and [`draw`] to paint. The tier is a
+/// parameter here; [`crate::default_tier`] picks it from a capability probe.
 ///
 /// [`resize`]: ScenePresenter::resize
 /// [`frame`]: ScenePresenter::frame
@@ -160,4 +164,47 @@ impl ScenePresenter {
 #[inline]
 fn to_color((r, g, b): (u8, u8, u8)) -> Color {
     Color::Rgb(r, g, b)
+}
+
+/// A failure to build a [`ScenePresenter`] from a `--scene` name: the preset was
+/// unknown, or it existed but failed validation. The [`Display`] is a
+/// user-facing message; for an unknown name it lists the available presets.
+#[derive(Clone, Debug)]
+pub struct SceneError {
+    message: String,
+}
+
+impl fmt::Display for SceneError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SceneError {}
+
+/// Build a scene presenter for a built-in preset `name` at `tier`.
+///
+/// This is the seam the CLI (and the tests) drive: an unknown name yields a
+/// [`SceneError`] naming the available presets, and a present-but-invalid preset
+/// yields a [`SceneError`] carrying the validator's message. Neither panics.
+///
+/// # Errors
+/// [`SceneError`] when `name` is not a built-in preset, or when it is one but
+/// fails to parse/validate.
+pub fn build_scene_presenter(name: &str, tier: Tier) -> Result<ScenePresenter, SceneError> {
+    match builtin_preset(name) {
+        Some(Ok(preset)) => Ok(ScenePresenter::from_preset(&preset, tier)),
+        Some(Err(err)) => Err(SceneError {
+            message: format!("invalid scene preset '{name}': {err}"),
+        }),
+        None => {
+            let names: Vec<&str> = builtin_presets().iter().map(|(n, _)| *n).collect();
+            Err(SceneError {
+                message: format!(
+                    "unknown scene preset '{name}'; available presets: {}",
+                    names.join(", ")
+                ),
+            })
+        }
+    }
 }

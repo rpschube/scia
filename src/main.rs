@@ -7,6 +7,7 @@
 //! the device table and exits. Exit codes: `0` success, `1` runtime error, `2`
 //! usage / unsupported, `3` no capture device.
 
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::Duration;
@@ -18,7 +19,11 @@ use scia_core::{
     EngineError, FeatureReader, Pacing, PerfModeState, Signal, StreamHealth, SyntheticBackend,
     list_devices,
 };
-use scia_tui::{TuiOptions, run};
+use scia_tui::{RunError, Tier, TuiOptions, run};
+
+/// Per-query timeout for capability probing; the four queries stay well under
+/// ~600 ms total.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// A live, terminal audio spectrum.
 #[derive(Parser, Debug)]
@@ -84,6 +89,45 @@ struct Cli {
     /// Start with the debug line visible.
     #[arg(long)]
     debug: bool,
+
+    /// Render a built-in scene preset (from --list-scenes) instead of the plain
+    /// spectrum bars. Invalid names exit 2 listing the available presets. Not
+    /// valid with --headless.
+    #[arg(long, value_name = "NAME")]
+    scene: Option<String>,
+
+    /// Force the mosaic tier and skip capability probing (for testing). Without
+    /// it the tier is chosen by probing the terminal.
+    #[arg(long, value_enum, value_name = "TIER")]
+    presenter: Option<PresenterTier>,
+
+    /// List every registered scene and built-in preset, then exit.
+    #[arg(long)]
+    list_scenes: bool,
+}
+
+/// The mosaic tiers selectable with `--presenter`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PresenterTier {
+    /// `2×4` block octants.
+    Octant,
+    /// `2×3` block sextants.
+    Sextant,
+    /// `2×2` quadrant blocks.
+    Quadrant,
+    /// `1×2` half blocks (the universally safe rung).
+    Half,
+}
+
+impl PresenterTier {
+    fn tier(self) -> Tier {
+        match self {
+            PresenterTier::Octant => Tier::Octant,
+            PresenterTier::Sextant => Tier::Sextant,
+            PresenterTier::Quadrant => Tier::Quadrant,
+            PresenterTier::Half => Tier::Half,
+        }
+    }
 }
 
 /// The synthetic waveform choices for `--demo`.
@@ -117,11 +161,50 @@ fn main() -> ExitCode {
         return print_device_table();
     }
 
+    if cli.list_scenes {
+        return print_scene_list();
+    }
+
+    // A scene needs the TUI body; there is nothing to render in the headless
+    // status loop.
+    if cli.headless && cli.scene.is_some() {
+        eprintln!("--scene cannot be combined with --headless");
+        return ExitCode::from(2);
+    }
+
     if cli.demo {
         run_demo(&cli)
     } else {
         run_live(&cli)
     }
+}
+
+/// Print the registered scenes and the built-in preset names, then exit 0.
+fn print_scene_list() -> ExitCode {
+    println!("{:<12}  {:<10}  summary", "scene", "mood");
+    for info in scia_scenes::builtin_scenes() {
+        println!("{:<12}  {:<10}  {}", info.id, info.mood, info.summary);
+    }
+    println!("\npresets:");
+    for (name, _) in scia_scenes::builtin_presets() {
+        println!("  {name}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Choose the mosaic tier for a TUI run: the forced `--presenter` tier (which
+/// skips probing), otherwise the default tier from a capability probe. Prints
+/// the capability one-liner to stderr when probing a real terminal. Called only
+/// on the TUI path (never headless).
+fn select_tier(cli: &Cli) -> Tier {
+    if let Some(forced) = cli.presenter {
+        return forced.tier();
+    }
+    let report = scia_tui::probe(PROBE_TIMEOUT);
+    if io::stdout().is_terminal() {
+        eprintln!("{report}");
+    }
+    scia_tui::default_tier(&report)
 }
 
 /// Print every device on every cpal host and exit 0. Enumeration failure is a
@@ -175,6 +258,8 @@ fn run_demo(cli: &Cli) -> ExitCode {
         source: String::new(),
         frames: cli.frames,
         debug: cli.debug,
+        scene: cli.scene.clone(),
+        tier: Some(select_tier(cli)),
     };
 
     let outcome = run(reader, || engine.stats(), || engine.health(), opts);
@@ -265,6 +350,8 @@ fn run_live(cli: &Cli) -> ExitCode {
         source,
         frames: cli.frames,
         debug: cli.debug,
+        scene: cli.scene.clone(),
+        tier: Some(select_tier(cli)),
     };
 
     let outcome = run(reader, || engine.stats(), || engine.health(), opts);
@@ -273,8 +360,9 @@ fn run_live(cli: &Cli) -> ExitCode {
 }
 
 /// Report a completed TUI run: the timing summary on success, the stream error
-/// (exit 1) when the loop aborted, or the I/O error (exit 1).
-fn report_tui_outcome(outcome: std::io::Result<scia_tui::RunSummary>) -> ExitCode {
+/// (exit 1) when the loop aborted, an invalid `--scene` (exit 2 with the
+/// available presets), or an I/O error (exit 1).
+fn report_tui_outcome(outcome: Result<scia_tui::RunSummary, RunError>) -> ExitCode {
     match outcome {
         Ok(summary) => {
             eprintln!(
@@ -287,7 +375,11 @@ fn report_tui_outcome(outcome: std::io::Result<scia_tui::RunSummary>) -> ExitCod
             }
             ExitCode::SUCCESS
         }
-        Err(err) => {
+        Err(RunError::Scene(err)) => {
+            eprintln!("{err}");
+            ExitCode::from(2)
+        }
+        Err(RunError::Io(err)) => {
             eprintln!("runtime error: {err}");
             ExitCode::from(1)
         }
