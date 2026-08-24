@@ -6,6 +6,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use scia_core::spectrum::{SpectrumAnalyzer, SpectrumConfig};
 use scia_core::{HopProcessor, StreamFormat, sample_ring};
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -46,7 +47,7 @@ fn hot_path_does_not_allocate() {
     let channels = 2usize;
 
     let (mut sink, mut consumer) = sample_ring(Instant::now());
-    let mut processor = HopProcessor::new(hop, 2);
+    let mut processor = HopProcessor::new(hop, 2, 48_000);
     let chunk = vec![0.3f32; hop * channels];
 
     // Warm up: prime the ring and the processor.
@@ -67,6 +68,37 @@ fn hot_path_does_not_allocate() {
         after,
         before,
         "hot path allocated {} time(s)",
+        after - before
+    );
+}
+
+#[test]
+fn spectrum_analyzer_hot_path_does_not_allocate() {
+    let sr = 48_000u32;
+    let hop = 256usize;
+    let dt = hop as f32 / sr as f32;
+    let mut analyzer = SpectrumAnalyzer::new(SpectrumConfig::default(), sr);
+    let mut out = vec![0.0f32; analyzer.bars()];
+    let mut mono = vec![0.0f32; hop];
+    for (k, m) in mono.iter_mut().enumerate() {
+        *m = (k as f32 * 0.01).sin() * 0.5;
+    }
+
+    // Warm up the FFT plans and the smoothing state.
+    for _ in 0..5 {
+        analyzer.process_hop(&mono, dt, &mut out);
+    }
+
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..200 {
+        analyzer.process_hop(&mono, dt, &mut out);
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+
+    assert_eq!(
+        after,
+        before,
+        "spectrum analyzer allocated {} time(s)",
         after - before
     );
 }

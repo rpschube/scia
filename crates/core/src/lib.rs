@@ -7,7 +7,10 @@
 //! grid and computes per-hop features; each hop is published to a
 //! triple-buffered [`FeatureSnapshot`] bus ([`FeatureWriter`] →
 //! [`FeatureReader`]) that consumers read without ever blocking the DSP thread.
-//! When capture stalls the grid keeps advancing with synthesized silence. A
+//! Alongside the hop-grid features the DSP thread also computes a **display
+//! spectrum** ([`SpectrumAnalyzer`]) — the log-spaced, auto-ranged, smoothed
+//! bar graph a renderer draws — and folds it into the same snapshot. When
+//! capture stalls the grid keeps advancing with synthesized silence. A
 //! [`SyntheticBackend`] drives the whole chain with no audio hardware, and
 //! [`Engine`] wires a backend to the DSP thread. This crate carries no
 //! user-interface dependency of any kind.
@@ -19,6 +22,7 @@ pub mod capture;
 pub mod dsp;
 pub mod engine;
 pub mod features;
+pub mod spectrum;
 pub mod synthetic;
 
 pub use bus::{FeatureReader, FeatureWriter, feature_bus};
@@ -29,6 +33,7 @@ pub use capture::{
 pub use dsp::{DspConfig, HopProcessor};
 pub use engine::{Engine, EngineConfig, EngineError, EngineStats};
 pub use features::{FEATURE_SCHEMA_VERSION, FeatureSnapshot, SPECTRUM_BINS};
+pub use spectrum::{SpectrumAnalyzer, SpectrumConfig};
 pub use synthetic::{Pacing, Signal, SyntheticBackend};
 
 /// The crate name, resolved at compile time from Cargo metadata.

@@ -12,8 +12,8 @@
 /// detect a mismatch.
 pub const FEATURE_SCHEMA_VERSION: u32 = 1;
 
-/// Number of spectrum bins reserved in every snapshot. The FFT card fills up
-/// to this many and sets [`FeatureSnapshot::spectrum_len`].
+/// Number of display-spectrum bars reserved in every snapshot. The analyzer
+/// fills up to this many and sets [`FeatureSnapshot::spectrum_len`].
 pub const SPECTRUM_BINS: usize = 256;
 
 /// A single hop's worth of analysis, published on the feature bus.
@@ -47,12 +47,14 @@ pub struct FeatureSnapshot {
     pub peak: f32,
     /// Momentary loudness (LUFS). Reserved, 0 in schema 1.
     pub lufs_momentary: f32,
-    /// Magnitude spectrum bins; only the first [`spectrum_len`] are valid.
-    /// Reserved (all 0) in schema 1.
+    /// Display spectrum: log-spaced bars in `0.0..=1.0` spanning the
+    /// configured `low_hz..high_hz`, normalized, auto-ranged and smoothed for
+    /// rendering. Only the first [`spectrum_len`] entries are valid.
     ///
     /// [`spectrum_len`]: FeatureSnapshot::spectrum_len
     pub spectrum: [f32; SPECTRUM_BINS],
-    /// Number of valid entries in [`spectrum`]. `0` until the FFT card lands.
+    /// Number of valid bars in [`spectrum`]. `0` on a default snapshot; the DSP
+    /// thread sets it to the analyzer's bar count on every published hop.
     ///
     /// [`spectrum`]: FeatureSnapshot::spectrum
     pub spectrum_len: u16,

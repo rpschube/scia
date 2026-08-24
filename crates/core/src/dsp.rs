@@ -4,12 +4,13 @@
 //! render side always has a fresh, real-time snapshot.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::bus::FeatureWriter;
 use crate::capture::{SampleConsumer, SinkStats, StreamFormat};
 use crate::features::{FEATURE_SCHEMA_VERSION, FeatureSnapshot};
+use crate::spectrum::{SpectrumAnalyzer, SpectrumConfig};
 
 /// Tuning for the DSP thread.
 #[derive(Clone, Copy, Debug)]
@@ -24,6 +25,8 @@ pub struct DspConfig {
     /// How long to sleep between ring checks while starved. Longer than
     /// `poll_interval`; the idle-downshift card extends this hook further.
     pub starved_poll_interval: Duration,
+    /// Display-spectrum tuning (bars, FFT sizes, AGC, smoothing).
+    pub spectrum: SpectrumConfig,
 }
 
 impl Default for DspConfig {
@@ -33,6 +36,7 @@ impl Default for DspConfig {
             poll_interval: Duration::from_millis(1),
             gap_timeout: Duration::from_millis(100),
             starved_poll_interval: Duration::from_millis(50),
+            spectrum: SpectrumConfig::default(),
         }
     }
 }
@@ -44,6 +48,9 @@ pub(crate) struct DspCounters {
     pub hops_processed: AtomicU64,
     /// Hops synthesized as silence during starvation.
     pub hops_synthesized: AtomicU64,
+    /// Latest display-spectrum AGC gain, stored as the bit pattern of an `f32`
+    /// (the snapshot schema is frozen, so the gain rides here instead).
+    pub agc_gain_bits: AtomicU32,
 }
 
 /// Owns the preallocated scratch buffers and the hop counter, and turns one
@@ -54,26 +61,53 @@ pub struct HopProcessor {
     hop_frames: usize,
     channels: usize,
     generation: u64,
+    dt_seconds: f32,
     interleaved: Vec<f32>,
     mono: Vec<f32>,
     left: Vec<f32>,
     right: Vec<f32>,
+    analyzer: SpectrumAnalyzer,
+    spectrum_out: Vec<f32>,
 }
 
 impl HopProcessor {
-    /// Allocate scratch for `hop_frames` frames of `channels`-wide audio.
+    /// Allocate scratch for `hop_frames` frames of `channels`-wide audio,
+    /// using the default display-spectrum configuration.
     #[must_use]
-    pub fn new(hop_frames: usize, channels: u16) -> Self {
+    pub fn new(hop_frames: usize, channels: u16, sample_rate: u32) -> Self {
+        Self::with_spectrum_config(hop_frames, channels, sample_rate, SpectrumConfig::default())
+    }
+
+    /// Like [`HopProcessor::new`] but with an explicit display-spectrum
+    /// configuration. Allocates every buffer (including the FFT plans) once.
+    #[must_use]
+    pub fn with_spectrum_config(
+        hop_frames: usize,
+        channels: u16,
+        sample_rate: u32,
+        spectrum: SpectrumConfig,
+    ) -> Self {
         let channels = channels.max(1) as usize;
+        let analyzer = SpectrumAnalyzer::new(spectrum, sample_rate);
+        let bars = analyzer.bars();
         Self {
             hop_frames,
             channels,
             generation: 0,
+            dt_seconds: hop_frames as f32 / sample_rate.max(1) as f32,
             interleaved: vec![0.0; hop_frames * channels],
             mono: vec![0.0; hop_frames],
             left: vec![0.0; hop_frames],
             right: vec![0.0; hop_frames],
+            analyzer,
+            spectrum_out: vec![0.0; bars],
         }
+    }
+
+    /// The current display-spectrum AGC gain.
+    #[must_use]
+    pub fn spectrum_gain(&self) -> f32 {
+        self.analyzer.gain()
     }
 
     /// Current hop generation (last published, or 0 before the first hop).
@@ -123,6 +157,9 @@ impl HopProcessor {
         }
         let rms = (sum_sq / self.hop_frames as f64).sqrt() as f32;
 
+        self.analyzer
+            .process_hop(&self.mono, self.dt_seconds, &mut self.spectrum_out);
+
         self.generation += 1;
         Some(self.snapshot(format, timestamp_ns, dropped_frames, false, rms, peak))
     }
@@ -139,6 +176,10 @@ impl HopProcessor {
         for value in &mut self.mono {
             *value = 0.0;
         }
+        // Still run the analyzer on the silent hop so the bars decay with the
+        // release time constant instead of snapping to zero.
+        self.analyzer
+            .process_hop(&self.mono, self.dt_seconds, &mut self.spectrum_out);
         self.generation += 1;
         self.snapshot(format, timestamp_ns, dropped_frames, true, 0.0, 0.0)
     }
@@ -152,7 +193,7 @@ impl HopProcessor {
         rms: f32,
         peak: f32,
     ) -> FeatureSnapshot {
-        FeatureSnapshot {
+        let mut snapshot = FeatureSnapshot {
             schema_version: FEATURE_SCHEMA_VERSION,
             generation: self.generation,
             timestamp_ns,
@@ -163,7 +204,11 @@ impl HopProcessor {
             rms,
             peak,
             ..FeatureSnapshot::default()
-        }
+        };
+        let bars = self.analyzer.bars();
+        snapshot.spectrum[..bars].copy_from_slice(&self.spectrum_out[..bars]);
+        snapshot.spectrum_len = bars as u16;
+        snapshot
     }
 }
 
@@ -195,7 +240,12 @@ pub(crate) fn run(mut thread: DspThread) {
         thread.config.hop_frames as f64 / f64::from(thread.format.sample_rate.max(1)),
     );
 
-    let mut processor = HopProcessor::new(thread.config.hop_frames, thread.format.channels);
+    let mut processor = HopProcessor::with_spectrum_config(
+        thread.config.hop_frames,
+        thread.format.channels,
+        thread.format.sample_rate,
+        thread.config.spectrum,
+    );
     let mut silent_deadline: Option<Instant> = None;
 
     loop {
@@ -215,6 +265,10 @@ pub(crate) fn run(mut thread: DspThread) {
                     .counters
                     .hops_processed
                     .fetch_add(1, Ordering::Relaxed);
+                thread
+                    .counters
+                    .agc_gain_bits
+                    .store(processor.spectrum_gain().to_bits(), Ordering::Relaxed);
             }
             silent_deadline = None;
             continue;
@@ -246,6 +300,10 @@ pub(crate) fn run(mut thread: DspThread) {
                     .counters
                     .hops_synthesized
                     .fetch_add(1, Ordering::Relaxed);
+                thread
+                    .counters
+                    .agc_gain_bits
+                    .store(processor.spectrum_gain().to_bits(), Ordering::Relaxed);
                 deadline += hop_period;
                 burst += 1;
             }
