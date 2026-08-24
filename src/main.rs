@@ -23,10 +23,11 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use scia_core::engine::EngineHealth;
 use scia_core::{
     Activity, CaptureError, CpalBackend, DeviceKind, DeviceSelector, Engine, EngineConfig,
-    EngineError, FeatureReader, Pacing, PerfModeState, Signal, StreamHealth, SyntheticBackend,
-    list_devices,
+    EngineError, EngineStats, FeatureReader, Pacing, PerfModeState, Signal, StreamHealth,
+    SyntheticBackend, list_devices,
 };
 use scia_scenes::{Preset, PresetWatcher, ReloadEvent, load_preset};
 use scia_tui::{ChromeMode, Keymap, PresenterMode, RunError, Tier, TuiOptions, run};
@@ -487,7 +488,7 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     let outcome = run(
         reader,
         || engine.stats(),
-        || engine.health(),
+        || engine.engine_health(),
         || engine.now_ns(),
         // The synthetic demo feed has no device to switch; the picker is inert.
         |_sel| {},
@@ -609,7 +610,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     let outcome = run(
         reader,
         || engine.stats(),
-        || engine.health(),
+        || engine.engine_health(),
         || engine.now_ns(),
         |sel| {
             // Record the new selector and drive the route watcher to reopen on
@@ -691,7 +692,9 @@ fn report_tui_outcome(outcome: Result<scia_tui::RunSummary, RunError>) -> ExitCo
 
 /// Headless status loop: one line per second on stderr with the same numbers
 /// the TUI debug line reports. Runs `seconds` seconds, or until killed when
-/// `seconds` is `0`. Returns exit 1 if the stream faults.
+/// `seconds` is `0`. A device switch or fault is ridden out as a `reconnecting…`
+/// state; the loop exits 1 only once capture has failed past the reconnect
+/// deadline ([`EngineHealth::Failed`]).
 fn run_headless(engine: Engine, mut reader: FeatureReader, seconds: u64) -> ExitCode {
     let mut t: u64 = 0;
     loop {
@@ -701,28 +704,24 @@ fn run_headless(engine: Engine, mut reader: FeatureReader, seconds: u64) -> Exit
         let stats = engine.stats();
         let snap = *reader.latest();
         let (bar, val) = loudest_bar(&snap.spectrum[..snap.spectrum_len as usize]);
-        let reopens = if stats.reopens > 0 {
-            format!("  reopens {}", stats.reopens)
-        } else {
-            String::new()
-        };
+        let health = engine.engine_health();
+        let last_err = engine.last_reopen_error();
         eprintln!(
-            "act {}  gen {}  rms {:.4}  peak {:.4}  loudest {}({:.3})  push {}  gap {:.1}ms  \
-             dropped {}{}",
-            activity_label(stats.activity),
-            snap.generation,
-            snap.rms,
-            snap.peak,
-            bar,
-            val,
-            stats.pushes,
-            stats.max_gap_ms,
-            stats.dropped_frames,
-            reopens,
+            "{}",
+            format_status_line(
+                &stats,
+                snap.generation,
+                snap.rms,
+                snap.peak,
+                bar,
+                val,
+                &health,
+                last_err.as_deref()
+            )
         );
 
-        if let StreamHealth::Errored(msg) = engine.health() {
-            eprintln!("capture stream error: {msg}");
+        if let EngineHealth::Failed { error } = &health {
+            eprintln!("capture stream error: {error}");
             engine.stop();
             return ExitCode::from(1);
         }
@@ -733,6 +732,62 @@ fn run_headless(engine: Engine, mut reader: FeatureReader, seconds: u64) -> Exit
     }
     engine.stop();
     ExitCode::SUCCESS
+}
+
+/// Format one headless status line. Pure (no engine handle) so the formatting —
+/// the reopen counters, the reconnecting/failed suffix, and the last reopen
+/// error — is unit-tested directly.
+///
+/// `reopens N fail M` is appended whenever either counter is nonzero;
+/// `reconnecting… <ms>ms attempt <n>` while [`EngineHealth::Reconnecting`],
+/// `FAILED: <err>` on [`EngineHealth::Failed`]; and the last reopen error text
+/// is appended as `last-err "<msg>"` whenever a reopen has failed.
+#[allow(clippy::too_many_arguments)]
+fn format_status_line(
+    stats: &EngineStats,
+    generation: u64,
+    rms: f32,
+    peak: f32,
+    bar: usize,
+    val: f32,
+    health: &EngineHealth,
+    last_reopen_error: Option<&str>,
+) -> String {
+    let mut suffix = String::new();
+    if stats.reopens > 0 || stats.reopen_failures > 0 {
+        suffix.push_str(&format!(
+            "  reopens {} fail {}",
+            stats.reopens, stats.reopen_failures
+        ));
+    }
+    match health {
+        EngineHealth::Reconnecting { since_ms, attempts } => {
+            suffix.push_str(&format!("  reconnecting… {since_ms}ms attempt {attempts}"));
+        }
+        EngineHealth::Failed { error } => {
+            suffix.push_str(&format!("  FAILED: {error}"));
+        }
+        EngineHealth::Ok => {}
+    }
+    if stats.reopen_failures > 0 {
+        if let Some(err) = last_reopen_error {
+            suffix.push_str(&format!("  last-err {err:?}"));
+        }
+    }
+    format!(
+        "act {}  gen {}  rms {:.4}  peak {:.4}  loudest {}({:.3})  push {}  gap {:.1}ms  \
+         dropped {}{}",
+        activity_label(stats.activity),
+        generation,
+        rms,
+        peak,
+        bar,
+        val,
+        stats.pushes,
+        stats.max_gap_ms,
+        stats.dropped_frames,
+        suffix,
+    )
 }
 
 /// Best-effort host name for the capture device. Known for a named device (its
@@ -801,5 +856,71 @@ mod tests {
     #[test]
     fn unknown_presenter_flag_is_rejected() {
         assert!(Cli::try_parse_from(["scia", "--presenter", "megatier"]).is_err());
+    }
+
+    #[test]
+    fn status_line_hides_reopen_counters_when_zero() {
+        let stats = EngineStats::default();
+        let line = format_status_line(&stats, 7, 0.1, 0.2, 3, 0.5, &EngineHealth::Ok, None);
+        assert!(line.contains("gen 7"));
+        assert!(
+            !line.contains("reopens"),
+            "no reopen suffix when both zero: {line}"
+        );
+        assert!(!line.contains("reconnecting"));
+    }
+
+    #[test]
+    fn status_line_shows_reopen_counters_and_reconnecting() {
+        let stats = EngineStats {
+            reopens: 2,
+            reopen_failures: 5,
+            ..EngineStats::default()
+        };
+        let line = format_status_line(
+            &stats,
+            9,
+            0.0,
+            0.0,
+            0,
+            0.0,
+            &EngineHealth::Reconnecting {
+                since_ms: 800,
+                attempts: 5,
+            },
+            Some("no capture device available"),
+        );
+        assert!(line.contains("reopens 2 fail 5"), "line: {line}");
+        assert!(
+            line.contains("reconnecting… 800ms attempt 5"),
+            "line: {line}"
+        );
+        assert!(
+            line.contains("last-err \"no capture device available\""),
+            "line: {line}"
+        );
+    }
+
+    #[test]
+    fn status_line_shows_failed() {
+        let stats = EngineStats {
+            reopens: 0,
+            reopen_failures: 40,
+            ..EngineStats::default()
+        };
+        let line = format_status_line(
+            &stats,
+            1,
+            0.0,
+            0.0,
+            0,
+            0.0,
+            &EngineHealth::Failed {
+                error: "device gone".to_string(),
+            },
+            Some("device gone"),
+        );
+        assert!(line.contains("reopens 0 fail 40"), "line: {line}");
+        assert!(line.contains("FAILED: device gone"), "line: {line}");
     }
 }

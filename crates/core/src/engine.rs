@@ -55,7 +55,23 @@ pub struct EngineConfig {
     /// notifier is unsupported (every non-Windows build) — polling still covers
     /// the function.
     pub route_notify: bool,
+    /// How long capture may stay down — the stream errored and the watcher still
+    /// failing to reopen — before [`Engine::engine_health`] reports
+    /// [`EngineHealth::Failed`] instead of [`EngineHealth::Reconnecting`]. The
+    /// grace window the UI loops render a calm "reconnecting" state through
+    /// instead of exiting on the first fault. Default
+    /// [`DEFAULT_RECONNECT_DEADLINE`] (10 s); a test shortens it to avoid a real
+    /// ten-second wait.
+    pub reconnect_deadline: Duration,
 }
+
+/// Default [`EngineConfig::reconnect_deadline`]: how long capture may stay down
+/// before the engine gives up and reports [`EngineHealth::Failed`]. Ten seconds
+/// is long enough to ride out a PipeWire default-sink switch (whose reopen may
+/// take a couple of enumeration cycles to settle) yet short enough that a truly
+/// dead device surfaces a clear error rather than hanging in "reconnecting"
+/// forever.
+pub const DEFAULT_RECONNECT_DEADLINE: Duration = Duration::from_secs(10);
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -66,8 +82,39 @@ impl Default for EngineConfig {
             route_poll: Duration::from_millis(250),
             perf_mode: false,
             route_notify: true,
+            reconnect_deadline: DEFAULT_RECONNECT_DEADLINE,
         }
     }
+}
+
+/// A consumer-facing view of capture health that models the grace window: while
+/// the stream is down and the `scia-route` watcher is still trying to reopen it,
+/// the engine reports [`EngineHealth::Reconnecting`] rather than a fatal error,
+/// so a UI loop can show a calm degraded notice and keep rendering. Only after
+/// reopen has failed continuously for [`EngineConfig::reconnect_deadline`] does
+/// it become [`EngineHealth::Failed`].
+///
+/// This is distinct from [`StreamHealth`], which is the raw per-stream fault
+/// flag; `EngineHealth` folds in the watcher's reopen progress and the deadline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineHealth {
+    /// Capture is live (or a brief blip recovered before any reopen failed).
+    Ok,
+    /// Capture is down and the watcher is retrying. Rendered as a degraded
+    /// notice; the loop keeps running.
+    Reconnecting {
+        /// Milliseconds since the reconnect episode began (the first failed
+        /// reopen).
+        since_ms: u32,
+        /// Failed reopen attempts so far in this episode.
+        attempts: u64,
+    },
+    /// Reopen has failed continuously past the deadline. The loops exit with
+    /// `error`.
+    Failed {
+        /// The most recent reopen failure's message.
+        error: String,
+    },
 }
 
 /// The runtime state of Windows perf mode, read with [`Engine::perf_mode_state`].
@@ -176,6 +223,19 @@ struct Shared {
     pending_device: Mutex<Option<crate::backends::cpal::DeviceSelector>>,
     reopens: AtomicU64,
     reopen_failures: AtomicU64,
+    /// How long capture may stay down before [`Shared::engine_health`] reports
+    /// [`EngineHealth::Failed`]. Copied from [`EngineConfig::reconnect_deadline`].
+    reconnect_deadline: Duration,
+    /// Monotonic ns (engine epoch) when the current reconnect episode began — the
+    /// first failed reopen after the stream went down. `0` when capture is
+    /// healthy; cleared the instant a reopen succeeds. Drives the grace-window
+    /// timing in [`Shared::engine_health`].
+    errored_since_ns: AtomicU64,
+    /// Failed reopen attempts in the current episode; reset to `0` on recovery.
+    episode_attempts: AtomicU64,
+    /// The most recent reopen failure's error text, for diagnostics and the
+    /// [`EngineHealth::Failed`] payload. `None` until a reopen has failed.
+    last_reopen_error: Mutex<Option<String>>,
     /// Whether perf mode was requested (`EngineConfig::perf_mode`). When set,
     /// start and every successful reopen re-evaluate perf mode on the current
     /// default render endpoint. Only read when the `perf-mode` feature is
@@ -205,17 +265,55 @@ impl Shared {
         // A brand-new ring that keeps feeding the same cumulative stats.
         let (sink, consumer) = sample_ring_with_stats(Arc::clone(&self.stats));
         let target = route.target;
+
+        // Is the current capture *down* — the stream errored, or already dropped
+        // by a previous down-path reopen that then failed to open a replacement?
+        // A down stream carries no audio to preserve, so we drop it *before*
+        // opening its replacement.
+        //
+        // This ordering is the CAP-2 Linux fix. On the cpal PipeWire host a
+        // `pactl set-default-sink` fires the stream error callback ("default
+        // device changed"); the reopen then re-enumerates and opens a fresh
+        // stream on the new default. Opening that replacement while the errored
+        // stream is still connected leaves two capture streams contending on the
+        // PipeWire graph across the switch, and the new stream does not settle —
+        // so capture never recovers and the app used to exit. Dropping the dead
+        // stream first (stopping its capture thread and clearing it off the
+        // graph) lets the fresh device enumeration settle and the replacement
+        // connect cleanly. The DSP thread synthesizes silence through the gap.
+        //
+        // A *healthy* reopen (a seamless route swap — e.g. the Windows
+        // default-endpoint notification flips the reopen request without erroring
+        // the stream) keeps the original open-before-drop ordering below, so there
+        // is never a gap in the live ring. This is why Windows behavior is
+        // unchanged: its device switch never errors the stream, so it never takes
+        // the down path.
+        let down = match route.stream.as_ref() {
+            Some(stream) => matches!(stream.health(), StreamHealth::Errored(_)),
+            None => true,
+        };
+        if down {
+            // Stop and join the dead capture thread before touching the backend.
+            drop(route.stream.take());
+        }
+
         match route.backend.open(target, sink) {
             Ok(new_stream) => {
                 let format = new_stream.format();
                 self.stats.set_channels(format.channels);
-                // Publish the new ring to the DSP thread *before* dropping the
-                // old stream, so there is never a window with no live ring.
+                // Publish the new ring to the DSP thread. On the healthy path the
+                // old stream is still live here, so this happens before it is
+                // dropped and there is never a window with no live ring; on the
+                // down path the old stream is already gone and the DSP thread has
+                // been synthesizing silence.
                 self.swap.publish(consumer, format);
                 let old = route.stream.replace(new_stream);
                 route.format = format;
                 route.route_id = route.backend.route_id();
                 self.reopens.fetch_add(1, Ordering::Relaxed);
+                // Recovery: end any reconnect episode.
+                self.errored_since_ns.store(0, Ordering::Release);
+                self.episode_attempts.store(0, Ordering::Relaxed);
                 // Re-evaluate perf mode on the (possibly new) endpoint: a device
                 // switch drops the old companion stream and re-detects on the new
                 // one. Still under the route lock, before the old stream is joined.
@@ -229,21 +327,80 @@ impl Shared {
                 Ok(format)
             }
             Err(err) => {
-                // Keep whatever stream exists (it may be errored); the DSP thread
-                // keeps synthesizing silence until a later attempt succeeds.
+                // The replacement did not open. On the down path the old stream is
+                // already gone (health reports Errored from the None arm below);
+                // on the healthy path the old stream is kept and still delivering.
+                // The DSP thread keeps synthesizing silence until a later attempt
+                // succeeds.
                 self.reopen_failures.fetch_add(1, Ordering::Relaxed);
+                *self
+                    .last_reopen_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
+                // Only a *down* capture is a reconnect episode: a failed seamless
+                // swap is not degraded (the old healthy stream plays on), so it
+                // must not start the grace-window clock.
+                if down {
+                    let now = self.stats.now_ns().max(1);
+                    let _ = self.errored_since_ns.compare_exchange(
+                        0,
+                        now,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    self.episode_attempts.fetch_add(1, Ordering::Relaxed);
+                }
                 Err(err)
             }
         }
     }
 
-    /// Health of the current stream.
+    /// Health of the current stream. A dropped stream (the down-path reopen
+    /// cleared it and has not yet re-opened) reports [`StreamHealth::Errored`]
+    /// with the last reopen error, since capture is genuinely down in that
+    /// window.
     fn health(&self) -> StreamHealth {
         let route = self.route.lock().unwrap_or_else(|e| e.into_inner());
-        route
-            .stream
-            .as_ref()
-            .map_or(StreamHealth::Ok, |s| s.health())
+        match route.stream.as_ref() {
+            Some(stream) => stream.health(),
+            None => {
+                let msg = self
+                    .last_reopen_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| "capture stream unavailable".to_string());
+                StreamHealth::Errored(msg)
+            }
+        }
+    }
+
+    /// The consumer-facing [`EngineHealth`], derived from the reconnect-episode
+    /// bookkeeping the watcher maintains through [`Shared::reopen`]. Reads only
+    /// atomics and the last-error mutex — never the route lock — so a UI loop can
+    /// poll it every frame without blocking on an in-flight reopen.
+    fn engine_health(&self) -> EngineHealth {
+        let since = self.errored_since_ns.load(Ordering::Acquire);
+        if since == 0 {
+            return EngineHealth::Ok;
+        }
+        let now = self.stats.now_ns();
+        let elapsed = now.saturating_sub(since);
+        let attempts = self.episode_attempts.load(Ordering::Relaxed);
+        if elapsed >= self.reconnect_deadline.as_nanos() as u64 {
+            let error = self
+                .last_reopen_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_else(|| "capture stream error".to_string());
+            EngineHealth::Failed { error }
+        } else {
+            EngineHealth::Reconnecting {
+                since_ms: (elapsed / 1_000_000) as u32,
+                attempts,
+            }
+        }
     }
 
     /// Whether the backend's current default route differs from the one the live
@@ -400,6 +557,10 @@ impl Engine {
             pending_device: Mutex::new(None),
             reopens: AtomicU64::new(0),
             reopen_failures: AtomicU64::new(0),
+            reconnect_deadline: config.reconnect_deadline,
+            errored_since_ns: AtomicU64::new(0),
+            episode_attempts: AtomicU64::new(0),
+            last_reopen_error: Mutex::new(None),
             perf_mode: config.perf_mode,
             perf_state: Mutex::new(PerfModeState::Off),
         });
@@ -538,10 +699,36 @@ impl Engine {
     }
 
     /// The capture stream's health: [`StreamHealth::Errored`] once the current
-    /// stream's error callback has fired, otherwise [`StreamHealth::Ok`].
+    /// stream's error callback has fired (or the stream was dropped mid-reconnect),
+    /// otherwise [`StreamHealth::Ok`]. This is the raw per-stream flag; UI loops
+    /// should prefer [`Engine::engine_health`], which folds in the reconnect grace
+    /// window.
     #[must_use]
     pub fn health(&self) -> StreamHealth {
         self.shared.health()
+    }
+
+    /// The consumer-facing capture health with the reconnect grace window applied
+    /// (see [`EngineHealth`]): [`EngineHealth::Ok`] while capture is live,
+    /// [`EngineHealth::Reconnecting`] while the stream is down and the watcher is
+    /// still retrying, and [`EngineHealth::Failed`] only once reopen has failed
+    /// continuously past [`EngineConfig::reconnect_deadline`]. Reads only atomics,
+    /// so it never blocks on an in-flight reopen.
+    #[must_use]
+    pub fn engine_health(&self) -> EngineHealth {
+        self.shared.engine_health()
+    }
+
+    /// The most recent reopen failure's error text, or `None` if no reopen has
+    /// ever failed. Diagnostic side channel for the headless status line and the
+    /// [`EngineHealth::Failed`] payload.
+    #[must_use]
+    pub fn last_reopen_error(&self) -> Option<String> {
+        self.shared
+            .last_reopen_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// A read-only snapshot of the in-thread beat tracker's internal state (see

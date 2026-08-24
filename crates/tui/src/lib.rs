@@ -49,9 +49,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
+use scia_core::engine::EngineHealth;
 use scia_core::{
-    Activity, DeviceInfo, DeviceSelector, EngineStats, FeatureReader, FeatureSnapshot,
-    StreamHealth, list_devices,
+    Activity, DeviceInfo, DeviceSelector, EngineStats, FeatureReader, FeatureSnapshot, list_devices,
 };
 use scia_scenes::{Palette, Preset, ReloadEvent, builtin_preset, builtin_presets, builtin_scenes};
 
@@ -194,12 +194,15 @@ pub struct RunSummary {
 ///
 /// `reader` is polled once per frame for the freshest snapshot; `stats` is
 /// called once per frame for the engine counters shown on the debug line;
-/// `health` is polled once per frame — when it reports
-/// [`StreamHealth::Errored`] the loop leaves the terminal cleanly and returns a
-/// [`RunSummary`] whose [`error`](RunSummary::error) carries the message; and
-/// `clock` is the engine's snapshot clock (monotonic ns since the ring epoch),
-/// sampled once per frame so the overlay can show the newest feature's age as
-/// `clock() - snap.timestamp_ns`.
+/// `health` is polled once per frame — while it reports
+/// [`EngineHealth::Reconnecting`] the loop shows a calm "reconnecting audio…"
+/// notice and keeps rendering (scenes animate on the silence the engine keeps
+/// publishing), clears the notice with "capture restored" on recovery, and only
+/// leaves the terminal (returning a [`RunSummary`] whose
+/// [`error`](RunSummary::error) carries the message) on
+/// [`EngineHealth::Failed`]; and `clock` is the engine's snapshot clock
+/// (monotonic ns since the ring epoch), sampled once per frame so the overlay
+/// can show the newest feature's age as `clock() - snap.timestamp_ns`.
 ///
 /// When `opts.scene` is `Some(name)`, the scene presenter is built from the
 /// built-in preset *before* the terminal is touched, so an unknown or invalid
@@ -213,7 +216,7 @@ pub struct RunSummary {
 pub fn run(
     reader: FeatureReader,
     stats: impl FnMut() -> EngineStats,
-    health: impl FnMut() -> StreamHealth,
+    health: impl FnMut() -> EngineHealth,
     clock: impl FnMut() -> u64,
     switch_device: impl FnMut(DeviceSelector),
     reload: Option<Receiver<ReloadEvent>>,
@@ -334,7 +337,7 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut reader: FeatureReader,
     mut stats: impl FnMut() -> EngineStats,
-    mut health: impl FnMut() -> StreamHealth,
+    mut health: impl FnMut() -> EngineHealth,
     mut clock: impl FnMut() -> u64,
     mut switch_device: impl FnMut(DeviceSelector),
     reload: Option<Receiver<ReloadEvent>>,
@@ -408,6 +411,9 @@ fn run_loop(
     if ui.notice.is_some() {
         notice_deadline = Some(Instant::now() + NOTICE_TTL);
     }
+    // Whether the loop is currently showing the "reconnecting audio…" degraded
+    // notice, so recovery can clear it once with "capture restored".
+    let mut reconnecting = false;
 
     // Kitty graphics state: the frame encoder, its reusable output buffer, and
     // the scene-body rect captured inside the draw closure so the image can be
@@ -641,16 +647,33 @@ fn run_loop(
             }
         }
 
-        // Abort cleanly if the capture stream faulted. The guard restores the
-        // terminal on return; the caller reports the message.
-        if let StreamHealth::Errored(msg) = health() {
-            let (p50, p99) = frame_times.percentiles();
-            return Ok(RunSummary {
-                frames,
-                p50_frame_ms: p50,
-                p99_frame_ms: p99,
-                error: Some(msg),
-            });
+        // Fold in capture health. A transient fault (a device switch the route
+        // watcher is recovering from) shows a calm degraded notice and the loop
+        // keeps rendering — scenes animate on the silence the engine keeps
+        // publishing. The loop leaves the terminal only once reopen has failed
+        // past the deadline (`EngineHealth::Failed`); the guard restores the
+        // terminal on return and the caller reports the message.
+        match health_transition(health(), &mut reconnecting) {
+            HealthReaction::Steady => {}
+            HealthReaction::Reconnecting => {
+                // A sticky notice: no TTL, so it stays up for the whole episode
+                // and is replaced on recovery or failure.
+                ui.notice = Some(RECONNECT_NOTICE.to_string());
+                notice_deadline = None;
+            }
+            HealthReaction::Restored => {
+                ui.notice = Some(RESTORED_NOTICE.to_string());
+                notice_deadline = Some(frame_start + NOTICE_TTL);
+            }
+            HealthReaction::Failed(msg) => {
+                let (p50, p99) = frame_times.percentiles();
+                return Ok(RunSummary {
+                    frames,
+                    p50_frame_ms: p50,
+                    p99_frame_ms: p99,
+                    error: Some(msg),
+                });
+            }
         }
 
         // Track continuous starvation for the idle downshift.
@@ -854,6 +877,52 @@ fn run_loop(
         p99_frame_ms: p99,
         error: None,
     })
+}
+
+/// The degraded-state notice shown while capture is reconnecting after a device
+/// switch or fault.
+const RECONNECT_NOTICE: &str = "reconnecting audio…";
+/// The one-shot notice shown when capture recovers from a reconnect.
+const RESTORED_NOTICE: &str = "capture restored";
+
+/// How the frame loop should react to an [`EngineHealth`] reading, decided by
+/// [`health_transition`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HealthReaction {
+    /// Capture is healthy and was already; leave the notice untouched.
+    Steady,
+    /// Capture is reconnecting; show the sticky degraded notice.
+    Reconnecting,
+    /// Capture just recovered; show the one-shot "restored" notice.
+    Restored,
+    /// Capture failed past the deadline; leave the loop with this error.
+    Failed(String),
+}
+
+/// Decide the loop's reaction to `health`, threading the "currently showing the
+/// reconnecting notice" flag so recovery is detected exactly once. Pure, so the
+/// loop's degraded-state behavior is unit-tested without a terminal:
+/// [`EngineHealth::Reconnecting`] never exits (it returns [`HealthReaction::Reconnecting`]),
+/// and only [`EngineHealth::Failed`] yields [`HealthReaction::Failed`].
+fn health_transition(health: EngineHealth, reconnecting: &mut bool) -> HealthReaction {
+    match health {
+        EngineHealth::Ok => {
+            if *reconnecting {
+                *reconnecting = false;
+                HealthReaction::Restored
+            } else {
+                HealthReaction::Steady
+            }
+        }
+        EngineHealth::Reconnecting { .. } => {
+            *reconnecting = true;
+            HealthReaction::Reconnecting
+        }
+        EngineHealth::Failed { error } => {
+            *reconnecting = false;
+            HealthReaction::Failed(error)
+        }
+    }
 }
 
 /// What an input event asks the loop to do.
@@ -2082,5 +2151,85 @@ mod tests {
         let (s, dt) = ps.resolve(false, b, 0.02);
         assert_eq!(s.generation, 2);
         assert_eq!(dt, 0.02);
+    }
+
+    #[test]
+    fn reconnecting_health_never_exits_the_loop() {
+        // A transient device switch must not tear the loop down: the reaction is
+        // Reconnecting, not Failed.
+        let mut reconnecting = false;
+        let r = health_transition(
+            EngineHealth::Reconnecting {
+                since_ms: 120,
+                attempts: 1,
+            },
+            &mut reconnecting,
+        );
+        assert_eq!(r, HealthReaction::Reconnecting);
+        assert!(reconnecting, "the reconnecting flag is now set");
+        // Still reconnecting on the next frame: still not an exit.
+        let r = health_transition(
+            EngineHealth::Reconnecting {
+                since_ms: 400,
+                attempts: 3,
+            },
+            &mut reconnecting,
+        );
+        assert_eq!(r, HealthReaction::Reconnecting);
+    }
+
+    #[test]
+    fn reconnect_then_recovery_shows_and_clears_the_notice() {
+        // Drive Ok → Reconnecting → Ok and apply the reactions to a UiState the
+        // way the loop does, checking the degraded notice appears then clears.
+        let mut ui = UiState::default();
+        let mut reconnecting = false;
+
+        // Healthy: nothing shown.
+        assert_eq!(
+            health_transition(EngineHealth::Ok, &mut reconnecting),
+            HealthReaction::Steady
+        );
+        assert_eq!(ui.notice, None);
+
+        // Reconnecting: the sticky degraded notice appears.
+        match health_transition(
+            EngineHealth::Reconnecting {
+                since_ms: 50,
+                attempts: 1,
+            },
+            &mut reconnecting,
+        ) {
+            HealthReaction::Reconnecting => ui.notice = Some(RECONNECT_NOTICE.to_string()),
+            other => panic!("expected Reconnecting, got {other:?}"),
+        }
+        assert_eq!(ui.notice.as_deref(), Some(RECONNECT_NOTICE));
+
+        // Recovery: the "restored" notice replaces it once.
+        match health_transition(EngineHealth::Ok, &mut reconnecting) {
+            HealthReaction::Restored => ui.notice = Some(RESTORED_NOTICE.to_string()),
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert_eq!(ui.notice.as_deref(), Some(RESTORED_NOTICE));
+
+        // Steady again afterward: the loop stops forcing a health notice, so a
+        // TTL (applied by the loop) can clear the "restored" line normally.
+        assert_eq!(
+            health_transition(EngineHealth::Ok, &mut reconnecting),
+            HealthReaction::Steady
+        );
+    }
+
+    #[test]
+    fn failed_health_exits_with_the_error() {
+        let mut reconnecting = true;
+        let r = health_transition(
+            EngineHealth::Failed {
+                error: "device gone".to_string(),
+            },
+            &mut reconnecting,
+        );
+        assert_eq!(r, HealthReaction::Failed("device gone".to_string()));
+        assert!(!reconnecting, "failing clears the reconnecting flag");
     }
 }
