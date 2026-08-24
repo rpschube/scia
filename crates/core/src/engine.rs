@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::backends::wasapi_route::RouteNotifier;
 use crate::bus::{FeatureReader, feature_bus};
 use crate::capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, SinkStats, StreamFormat,
@@ -46,6 +47,13 @@ pub struct EngineConfig {
     /// [`PerfModeState::Unavailable`] and captures unchanged. See
     /// [`Engine::perf_mode_state`].
     pub perf_mode: bool,
+    /// Register the platform event-driven route-change notifier (a Windows
+    /// `IMMNotificationClient`) that flips the reopen-request flag the instant
+    /// the default endpoint moves, so a switch is caught on the watcher's next
+    /// tick rather than a poll cycle later. Default `true`; a no-op wherever the
+    /// notifier is unsupported (every non-Windows build) — polling still covers
+    /// the function.
+    pub route_notify: bool,
 }
 
 impl Default for EngineConfig {
@@ -56,6 +64,7 @@ impl Default for EngineConfig {
             route_watch: true,
             route_poll: Duration::from_millis(250),
             perf_mode: false,
+            route_notify: true,
         }
     }
 }
@@ -300,6 +309,11 @@ pub struct Engine {
     stop: Arc<AtomicBool>,
     dsp_join: Option<JoinHandle<()>>,
     watch_join: Option<JoinHandle<()>>,
+    /// The event-driven route-change notifier, when one registered. `None` when
+    /// disabled by config or unsupported on the platform; the route watcher's
+    /// poll then covers route changes on its own. Dropped first at shutdown so
+    /// no callback can flip the reopen flag after the watcher is joined.
+    route_notifier: Option<RouteNotifier>,
     counters: Arc<DspCounters>,
 }
 
@@ -402,6 +416,21 @@ impl Engine {
             None
         };
 
+        // Register the event-driven route notifier. Its only job is to flip the
+        // same out-of-band reopen-request flag a poll would, the instant the OS
+        // reports a default-endpoint change — the watcher does the actual reopen
+        // on its next tick. Registration failure (or an unsupported platform) is
+        // non-fatal: `None` is kept and the 250 ms poll still covers the switch.
+        let route_notifier = if config.route_notify {
+            let shared = Arc::clone(&shared);
+            RouteNotifier::start(Box::new(move || {
+                shared.request.store(true, Ordering::Release);
+            }))
+            .ok()
+        } else {
+            None
+        };
+
         Ok((
             Engine {
                 shared,
@@ -409,6 +438,7 @@ impl Engine {
                 stop,
                 dsp_join: Some(dsp_join),
                 watch_join,
+                route_notifier,
                 counters,
             },
             reader,
@@ -511,6 +541,15 @@ impl Engine {
         self.shared.request.store(true, Ordering::Release);
     }
 
+    /// Whether an event-driven route-change notifier is registered and live.
+    /// `true` only on a platform/build that supports it (Windows `route-notify`)
+    /// with `route_notify` enabled and registration having succeeded; `false`
+    /// everywhere else, where the route watcher's poll covers route changes.
+    #[must_use]
+    pub fn route_notify_active(&self) -> bool {
+        self.route_notifier.is_some()
+    }
+
     /// Stop the watcher, the DSP thread, and capture, and join everything.
     pub fn stop(mut self) {
         self.shutdown();
@@ -518,7 +557,10 @@ impl Engine {
 
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
-        // Join the watcher first so no reopen can race the teardown, then the
+        // Drop the route notifier first: joining its thread unregisters the OS
+        // callback, so nothing can flip the reopen-request flag after this.
+        self.route_notifier.take();
+        // Join the watcher next so no reopen can race the teardown, then the
         // DSP thread, then drop the stream.
         if let Some(join) = self.watch_join.take() {
             let _ = join.join();

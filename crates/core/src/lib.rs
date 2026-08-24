@@ -15,11 +15,12 @@
 //! [`Engine`] wires a backend to the DSP thread. This crate carries no
 //! user-interface dependency of any kind.
 
-// The crate is unsafe-free everywhere except the audited Windows-only
-// `backends::wasapi_perf` module, which must call the raw WASAPI COM API. That
-// one module opts in with `#[allow(unsafe_code)]`; `deny` (rather than `forbid`)
-// makes that scoped opt-in possible while still rejecting any unannounced
-// `unsafe` anywhere else in the crate.
+// The crate is unsafe-free everywhere except two audited Windows-only backend
+// modules that must call the raw WASAPI COM API: `backends::wasapi_perf` (the
+// companion render stream) and `backends::wasapi_route` (the device-change
+// notifier). Each opts in with `#[allow(unsafe_code)]` on its Windows impl
+// module; `deny` (rather than `forbid`) makes that scoped opt-in possible while
+// still rejecting any unannounced `unsafe` anywhere else in the crate.
 #![deny(unsafe_code)]
 
 pub mod backends;
@@ -41,6 +42,7 @@ pub use backends::wasapi_perf::{
     PerfModeAvailability, PerfModeConfig, PerfModeInfo, PerfModeStream,
     availability as perf_mode_availability,
 };
+pub use backends::wasapi_route::RouteNotifier;
 pub use bands::{BandConfig, BandSplitter};
 pub use bus::{FeatureReader, FeatureWriter, feature_bus};
 pub use capture::{
