@@ -73,6 +73,61 @@ fn hot_path_does_not_allocate() {
 }
 
 #[test]
+fn full_hop_path_does_not_allocate() {
+    // Like `hot_path_does_not_allocate` but with a time-varying click train, so
+    // the band splitter's averages move and the onset detector actually fires
+    // (exercising every branch of the extended per-hop path), and asserts the
+    // whole thing stays allocation-free.
+    let format = StreamFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    };
+    let hop = 256usize;
+    let channels = 2usize;
+    let sr = 48_000u64;
+    let period = sr / 10; // a click every 100 ms
+
+    let (mut sink, mut consumer) = sample_ring(Instant::now());
+    let mut processor = HopProcessor::new(hop, 2, 48_000);
+    let mut chunk = vec![0.0f32; hop * channels];
+    let mut frame: u64 = 0;
+    let fill = |chunk: &mut [f32], frame: &mut u64| {
+        for f in 0..hop {
+            let s = if (*frame + f as u64) % period == 0 {
+                0.8
+            } else {
+                0.0
+            };
+            chunk[f * channels] = s;
+            chunk[f * channels + 1] = s;
+        }
+        *frame += hop as u64;
+    };
+
+    for _ in 0..10 {
+        fill(&mut chunk, &mut frame);
+        sink.push(&chunk);
+        let _ = processor.try_process(&mut consumer, format, 0, 0);
+    }
+
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..200 {
+        fill(&mut chunk, &mut frame);
+        sink.push(&chunk);
+        let snapshot = processor.try_process(&mut consumer, format, 0, 0);
+        assert!(snapshot.is_some());
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+
+    assert_eq!(
+        after,
+        before,
+        "full hop path allocated {} time(s)",
+        after - before
+    );
+}
+
+#[test]
 fn spectrum_analyzer_hot_path_does_not_allocate() {
     let sr = 48_000u32;
     let hop = 256usize;
