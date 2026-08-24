@@ -13,6 +13,7 @@ use crate::capture::{
     StreamHealth, sample_ring,
 };
 use crate::dsp::{DspConfig, DspCounters, DspThread};
+use crate::features::Activity;
 
 /// Configuration for [`Engine::start`].
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +55,12 @@ pub struct EngineStats {
     pub max_push_frames: u32,
     /// Largest interval between two consecutive pushes, in milliseconds.
     pub max_gap_ms: f32,
+    /// Latest activity state of the silence state machine.
+    pub activity: Activity,
+    /// Count of DSP-loop iterations so far. Climbs at the polling rate while
+    /// `Active`, and at the (much lower) idle poll rate once `Idle` — the
+    /// meter-free way to observe the downshift.
+    pub dsp_wakes: u64,
 }
 
 /// Why the engine could not start.
@@ -147,6 +154,12 @@ impl Engine {
             last_push_frames: self.stats.last_push_frames.load(Ordering::Relaxed),
             max_push_frames: self.stats.max_push_frames.load(Ordering::Relaxed),
             max_gap_ms: self.stats.max_gap_ns.load(Ordering::Relaxed) as f32 / 1.0e6,
+            activity: match self.counters.activity.load(Ordering::Relaxed) {
+                1 => Activity::Quiet,
+                2 => Activity::Idle,
+                _ => Activity::Active,
+            },
+            dsp_wakes: self.counters.dsp_wakes.load(Ordering::Relaxed),
         }
     }
 

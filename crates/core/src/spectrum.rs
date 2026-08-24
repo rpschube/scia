@@ -401,6 +401,31 @@ impl SpectrumAnalyzer {
             *out = *smoothed;
         }
     }
+
+    /// Advance the smoothed bars by `dt_seconds` of silence **without** running
+    /// the FFTs. Each bar releases toward zero with the same release time
+    /// constant [`process_hop`](Self::process_hop) uses on a silent hop, so the
+    /// cheap idle path decays the display exactly like the full path would while
+    /// doing none of the FFT work. The history and AGC gain are left untouched
+    /// (both are already settled to silence before idle begins). Allocation-free.
+    ///
+    /// # Panics
+    /// Panics if `out.len() < bars()`.
+    pub fn relax(&mut self, dt_seconds: f32, out: &mut [f32]) {
+        assert!(out.len() >= self.config.bars, "out too small");
+        // Silence maps to target 0, which is never above a (non-negative)
+        // smoothed value, so the release branch always applies.
+        let alpha = 1.0 - (-dt_seconds / self.dt_release_tau).exp();
+        for (raw, (smoothed, out)) in self
+            .raw
+            .iter_mut()
+            .zip(self.smoothed.iter_mut().zip(out.iter_mut()))
+        {
+            *raw = 0.0;
+            *smoothed += alpha * (0.0 - *smoothed);
+            *out = *smoothed;
+        }
+    }
 }
 
 /// A periodic Hann window of length `n`.

@@ -143,6 +143,19 @@ impl OnsetDetector {
         (flux_norm, onset)
     }
 
+    /// Cheap idle update for a silent hop: decay the normalization peak by
+    /// `dt_seconds`, advance the onset-age clock, and report zero flux with no
+    /// onset — exactly what [`process_hop`](Self::process_hop) yields on a
+    /// silent hop, without touching the per-bin flux sum. Returns `(flux_norm,
+    /// onset)`, always `(0.0, false)`. Allocation-free.
+    pub fn relax(&mut self, dt_seconds: f32) -> (f32, bool) {
+        let decay = (-dt_seconds / self.norm_tau_s).exp();
+        self.peak *= decay;
+        self.age_ms = (self.age_ms + dt_seconds * 1000.0).min(AGE_SATURATION_MS);
+        self.prev_flux_norm = 0.0;
+        (0.0, false)
+    }
+
     /// Milliseconds since the last onset, saturating at 60 000. Counts up from
     /// engine start; a value at (or approaching) the cap means no recent onset.
     #[must_use]
