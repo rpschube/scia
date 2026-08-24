@@ -1,0 +1,69 @@
+# probe-build — on-demand builds of the headless probe binaries for real
+# machines (no scheduled runs; never part of the PR gate). Produces the
+# `capture_probe` example and the `scia` binary for one target as an artifact,
+# so a probe can be run on hardware that has no Rust toolchain.
+name: probe-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Runner OS to build on
+        type: choice
+        options: [windows-latest, ubuntu-latest, macos-latest]
+        default: windows-latest
+      ref:
+        description: Git ref to build (branch, tag or SHA)
+        type: string
+        default: master
+
+concurrency:
+  group: probe-build-${{ github.workflow }}-${{ inputs.target }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.target }}
+    runs-on: ${{ inputs.target }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install system audio headers (Linux only; cpal → alsa-sys)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libasound2-dev
+
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup toolchain install --profile minimal
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build probes (debug profile, no LTO — these are diagnostics)
+        run: |
+          cargo build -p scia-core --example capture_probe
+          cargo build --bin scia
+
+      - name: Collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp target/debug/examples/capture_probe* out/ 2>/dev/null || true
+          cp target/debug/scia* out/ 2>/dev/null || true
+          rm -f out/*.d out/*.pdb
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probes-${{ inputs.target }}-${{ github.sha }}
+          path: out/
+          retention-days: 7
