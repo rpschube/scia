@@ -88,9 +88,11 @@ fi
 
 if git rev-parse -q --verify HEAD >/dev/null 2>&1; then
   say "author / committer identity ($RANGE)"
+  # Never echo a disallowed identity: this output may land in a public CI log.
+  mask() { local s="$1"; printf '%s…%s (%d chars)' "${s:0:1}" "${s: -1}" "${#s}"; }
   while IFS=$'\t' read -r name email; do
-    [[ "$name" =~ $ALLOWED_AUTHOR_NAMES ]] || bad "author/committer name not allowed: $name"
-    [[ "$email" =~ $ALLOWED_AUTHOR_EMAILS ]] || bad "author/committer e-mail not allowed: $email"
+    [[ "$name" =~ $ALLOWED_AUTHOR_NAMES ]] || bad "author/committer name not allowed: $(mask "$name")"
+    [[ "$email" =~ $ALLOWED_AUTHOR_EMAILS ]] || bad "author/committer e-mail not allowed: $(mask "$email") — commits must use the public identity; on GitHub, enable 'Keep my email addresses private' so merges use the noreply address"
   done < <(git log --format='%an%x09%ae%n%cn%x09%ce' "$RANGE" -- | sort -u)
 fi
 
