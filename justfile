@@ -1,8 +1,13 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# Shared build target: every worktree builds into the main checkout's target/,
-# derived from the git common dir so parallel worktrees never duplicate it.
-target_dir := `realpath -m "$(git rev-parse --path-format=absolute --git-common-dir)/../target"`
+# Build target: under the main checkout's target/, ONE SUBDIRECTORY PER BRANCH.
+# Worktrees must not share a target directory: two checkouts of the same
+# package id write the same artifact and fingerprint paths, and cargo will
+# happily serve one branch's stale build to another. Per-branch dirs cost a
+# cold build per worktree; `just sweep` and `just wt-rm` reclaim them.
+target_root := `realpath -m "$(git rev-parse --path-format=absolute --git-common-dir)/../target"`
+branch_slug := `git rev-parse --abbrev-ref HEAD | tr '/' '-'`
+target_dir := target_root / branch_slug
 export CARGO_TARGET_DIR := target_dir
 
 # Tunables (all overridable from the environment).
@@ -131,10 +136,11 @@ wt-rm branch:
     main=$(dirname "$common")
     git worktree remove "$main/../scia-wt/{{branch}}"
     git branch -d "{{branch}}"
+    rm -rf "{{target_root}}/$(printf '%s' "{{branch}}" | tr '/' '-')"
 
-# Reclaim build artifacts older than 7 days and prune dead worktrees.
+# Reclaim build artifacts older than 7 days (every branch's target dir) and prune dead worktrees.
 sweep:
-    cargo sweep --time 7 {{target_dir}}
+    cargo sweep --time 7 --recursive {{target_root}}
     git worktree prune
 
 # Report whether the shared build lock is currently held.
