@@ -38,6 +38,9 @@ use crate::palette::{Palette, Rgb};
 use crate::registry::{create_builtin, scene_info};
 use crate::scene::{ParamSpec, Params, Scene, SceneCtx};
 
+mod watch;
+pub use watch::{PresetWatcher, ReloadEvent};
+
 // ---------------------------------------------------------------------------
 // Public value types
 // ---------------------------------------------------------------------------
@@ -1072,7 +1075,7 @@ impl Preset {
 // ---------------------------------------------------------------------------
 
 /// The `spectra` built-in preset template.
-static SPECTRA_PRESET: &str = include_str!("../../../presets/spectra.toml");
+static SPECTRA_PRESET: &str = include_str!("../../../../presets/spectra.toml");
 
 /// The built-in preset files compiled into the crate, as `(name, source)`.
 static BUILTIN_PRESETS: &[(&str, &str)] = &[("spectra", SPECTRA_PRESET)];
