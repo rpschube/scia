@@ -9,3 +9,10 @@ pub mod convert;
 
 #[cfg(feature = "capture-cpal")]
 pub mod cpal;
+
+/// The Windows-only companion render stream that pulls the endpoint engine
+/// period down to its minimum (perf mode). Compiled under the `perf-mode`
+/// feature on every platform — a real WASAPI implementation on Windows, a
+/// compile-everywhere stub elsewhere.
+#[cfg(feature = "perf-mode")]
+pub mod wasapi_perf;
