@@ -69,6 +69,10 @@ build: (_cargo "build" "--workspace")
 # Run the test suite via nextest.
 test: (_cargo "nextest" "run" "--workspace" "--test-threads" test_threads)
 
+# P5 probe: Luau scene-tick benchmark (an optimized build of one small crate,
+# still under the shared lock/nice wrapper; the only release build we run).
+bench-p5: (_cargo "bench" "-p" "scia-scenes" "--bench" "luau_tick")
+
 # Format all crates in place.
 fmt:
     cargo fmt --all
