@@ -43,7 +43,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
+use windows::Foundation::TypedEventHandler;
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession as Session,
     GlobalSystemMediaTransportControlsSessionManager as Manager,
@@ -128,8 +128,10 @@ enum Internal {
 /// session leaves the set or the backend shuts down.
 struct SessionSub {
     session: Session,
-    media_token: EventRegistrationToken,
-    playback_token: EventRegistrationToken,
+    /// WinRT event-registration tokens. windows-rs 0.62 represents these as
+    /// plain `i64` handles rather than an `EventRegistrationToken` struct.
+    media_token: i64,
+    playback_token: i64,
 }
 
 impl SessionSub {
@@ -181,7 +183,7 @@ impl BackendState {
 /// The backend thread entry point.
 fn run(out: &MetaSender, tx: &Sender<Internal>, rx: &Receiver<Internal>, policy: RetryPolicy) {
     // SMTC is delivered on the WinRT threadpool (MTA). Initialise COM in the
-    // multithreaded apartment on this thread so async `.get()` calls and event
+    // multithreaded apartment on this thread so async `.join()` calls and event
     // delivery behave. A benign S_FALSE/RPC_E_CHANGED_MODE is ignored.
     // SAFETY: `CoInitializeEx`/`CoUninitialize` are balanced on this one thread;
     // no COM object created here escapes it.
@@ -210,7 +212,7 @@ fn run_inner(
     rx: &Receiver<Internal>,
     policy: RetryPolicy,
 ) -> WinResult<()> {
-    let manager = Manager::RequestAsync()?.get()?;
+    let manager = Manager::RequestAsync()?.join()?;
 
     // Manager-level: the session set changed.
     let tx_sessions = tx.clone();
@@ -424,7 +426,10 @@ fn read_now_playing(session: &Session, app_id: &str) -> NowPlaying {
         source_app: Some(app_id.to_string()),
         ..NowPlaying::default()
     };
-    if let Ok(props) = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()) {
+    if let Ok(props) = session
+        .TryGetMediaPropertiesAsync()
+        .and_then(|op| op.join())
+    {
         np.title = props.Title().ok().and_then(hstr_opt);
         np.artist = props.Artist().ok().and_then(hstr_opt);
         np.album = props.AlbumTitle().ok().and_then(hstr_opt);
@@ -436,7 +441,7 @@ fn read_now_playing(session: &Session, app_id: &str) -> NowPlaying {
 /// thumbnail stream and read all its bytes. `Ok(None)` means "no thumbnail yet"
 /// (drives a retry); `Err` is a transient WinRT failure, also treated as a miss.
 fn fetch_artwork_once(session: &Session) -> WinResult<Option<Vec<u8>>> {
-    let props = session.TryGetMediaPropertiesAsync()?.get()?;
+    let props = session.TryGetMediaPropertiesAsync()?.join()?;
     let thumb: IRandomAccessStreamReference = match props.Thumbnail() {
         Ok(t) => t,
         Err(_) => return Ok(None),
@@ -447,13 +452,13 @@ fn fetch_artwork_once(session: &Session) -> WinResult<Option<Vec<u8>>> {
 /// Read every byte of an [`IRandomAccessStreamReference`], or `Ok(None)` if the
 /// stream is empty.
 fn read_stream_ref(reference: &IRandomAccessStreamReference) -> WinResult<Option<Vec<u8>>> {
-    let stream = reference.OpenReadAsync()?.get()?;
+    let stream = reference.OpenReadAsync()?.join()?;
     let size = stream.Size()?;
     if size == 0 {
         return Ok(None);
     }
     let reader = DataReader::CreateDataReader(&stream)?;
-    reader.LoadAsync(size as u32)?.get()?;
+    reader.LoadAsync(size as u32)?.join()?;
     let mut buf = vec![0u8; size as usize];
     reader.ReadBytes(&mut buf)?;
     Ok(Some(buf))
@@ -469,17 +474,25 @@ fn app_id_of(session: &Session) -> String {
 
 /// Map a session's SMTC playback status onto the neutral [`PlaybackStatus`].
 fn status_of(session: &Session) -> PlaybackStatus {
-    let raw = session
+    let Ok(raw) = session
         .GetPlaybackInfo()
-        .and_then(|info| info.PlaybackStatus());
-    match raw {
-        Ok(WinStatus::Playing) => PlaybackStatus::Playing,
-        Ok(WinStatus::Paused) => PlaybackStatus::Paused,
-        Ok(WinStatus::Stopped) => PlaybackStatus::Stopped,
-        Ok(WinStatus::Changing) => PlaybackStatus::Changing,
-        Ok(WinStatus::Opened) => PlaybackStatus::Opened,
-        // Closed, or anything unreadable, counts as closed.
-        _ => PlaybackStatus::Closed,
+        .and_then(|info| info.PlaybackStatus())
+    else {
+        // Unreadable playback info counts as closed.
+        return PlaybackStatus::Closed;
+    };
+    if raw == WinStatus::Playing {
+        PlaybackStatus::Playing
+    } else if raw == WinStatus::Paused {
+        PlaybackStatus::Paused
+    } else if raw == WinStatus::Stopped {
+        PlaybackStatus::Stopped
+    } else if raw == WinStatus::Changing {
+        PlaybackStatus::Changing
+    } else if raw == WinStatus::Opened {
+        PlaybackStatus::Opened
+    } else {
+        PlaybackStatus::Closed
     }
 }
 
