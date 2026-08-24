@@ -20,3 +20,18 @@ zbus = { version = "5", default-features = false, features = ["async-io"] }
 async-io = "2"
 futures-lite = "2"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+
+# The Windows now-playing backend (SMTC). Windows-only: this dependency never
+# enters a non-Windows build, so Linux and macOS builds are untouched. Licensed
+# MIT OR Apache-2.0 (clears cargo-deny). Only the WinRT namespaces the SMTC
+# backend touches are enabled, plus `Win32_System_Com` for the multithreaded
+# apartment init the WinRT event delivery needs.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Control",
+    "Storage_Streams",
+    "Win32_System_Com",
+]

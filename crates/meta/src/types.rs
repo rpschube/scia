@@ -27,6 +27,15 @@ pub enum PlaybackStatus {
     Stopped,
 }
 
+impl PlaybackStatus {
+    /// Whether this player is actively playing. Selection policies prefer a
+    /// playing session over any paused or stopped one.
+    #[must_use]
+    pub fn is_playing(self) -> bool {
+        matches!(self, PlaybackStatus::Playing)
+    }
+}
+
 /// A playback position sample, tagged with the instant it was read so a
 /// consumer can extrapolate the live position without polling the player.
 ///
@@ -59,22 +68,31 @@ pub struct NowPlaying {
     pub artist: Option<String>,
     /// Album title, if published.
     pub album: Option<String>,
-    /// Stable cache identity for this track, derived from the fields above.
+    /// Stable cache identity for this track, derived from the metadata fields.
     pub track_key: String,
     /// Current playback status of the player this snapshot came from.
     pub status: PlaybackStatus,
     /// Position/length info when the player provides it.
     pub position: Option<PositionInfo>,
+    /// Identity of the application that owns the session (the Windows
+    /// `AppUserModelId` under SMTC, the MPRIS bus name under Linux), when known.
+    /// It lets a downstream consumer apply app-specific handling — for example,
+    /// cropping the letterbox padding Spotify bakes into its SMTC thumbnails —
+    /// without this crate ever touching pixels. It is not part of `track_key`.
+    pub source_app: Option<String>,
 }
 
 impl NowPlaying {
     /// Build a snapshot, deriving [`NowPlaying::track_key`] from the metadata.
+    /// `source_app` is the owning application's identity (bus name / AUMID) when
+    /// the backend knows it; it does not affect the derived `track_key`.
     pub fn new(
         title: Option<String>,
         artist: Option<String>,
         album: Option<String>,
         status: PlaybackStatus,
         position: Option<PositionInfo>,
+        source_app: Option<String>,
     ) -> Self {
         let track_key = track_key(artist.as_deref(), album.as_deref(), title.as_deref());
         Self {
@@ -84,6 +102,7 @@ impl NowPlaying {
             track_key,
             status,
             position,
+            source_app,
         }
     }
 }
@@ -176,6 +195,12 @@ pub enum MetaEvent {
         track_key: String,
         /// Raw encoded image bytes.
         bytes: Vec<u8>,
+        /// Identity of the application the artwork came from (the Windows
+        /// `AppUserModelId` / MPRIS bus name), mirroring
+        /// [`NowPlaying::source_app`] so the palette stage can decide whether
+        /// the bytes need app-specific cropping before it decodes them. `None`
+        /// when the backend does not know the source.
+        source_app: Option<String>,
     },
     /// The media session went away: no player is active. This is a normal
     /// state (nothing is playing), never an error.
@@ -310,11 +335,45 @@ mod tests {
             Some("Album".into()),
             PlaybackStatus::Playing,
             None,
+            Some("org.mpris.MediaPlayer2.spotify".into()),
         );
         assert_eq!(
             np.track_key,
             track_key(Some("Artist"), Some("Album"), Some("Title"))
         );
+        // source_app is carried verbatim and never folded into the key.
+        assert_eq!(
+            np.source_app.as_deref(),
+            Some("org.mpris.MediaPlayer2.spotify")
+        );
+    }
+
+    #[test]
+    fn nowplaying_source_app_does_not_affect_key() {
+        let a = NowPlaying::new(
+            Some("T".into()),
+            None,
+            None,
+            PlaybackStatus::Playing,
+            None,
+            Some("AppA".into()),
+        );
+        let b = NowPlaying::new(
+            Some("T".into()),
+            None,
+            None,
+            PlaybackStatus::Paused,
+            None,
+            Some("AppB".into()),
+        );
+        assert_eq!(a.track_key, b.track_key);
+    }
+
+    #[test]
+    fn playback_status_only_playing_is_active() {
+        assert!(PlaybackStatus::Playing.is_playing());
+        assert!(!PlaybackStatus::Paused.is_playing());
+        assert!(!PlaybackStatus::Stopped.is_playing());
     }
 
     #[test]

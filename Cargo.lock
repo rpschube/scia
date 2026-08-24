@@ -2318,6 +2318,7 @@ dependencies = [
  "image",
  "scia-core",
  "ureq",
+ "windows",
  "zbus",
 ]
 

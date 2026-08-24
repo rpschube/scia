@@ -92,10 +92,11 @@ pub fn start(tx: Sender<MetaEvent>) -> MetaHandle {
 }
 
 /// A unit of work for the artwork thread: fetch `art` and, on success, emit it
-/// tagged with `track_key`.
+/// tagged with `track_key` and the winning player's `source_app` (its bus name).
 struct ArtworkJob {
     track_key: String,
     art: ArtworkRef,
+    source_app: Option<String>,
 }
 
 /// Rewrite Spotify's stale `open.spotify.com/image/<id>` art URL to the working
@@ -358,6 +359,7 @@ async fn reconcile(
             parsed.album.clone(),
             pstatus,
             posinfo,
+            Some(bus.clone()),
         );
 
         // Bump the activity stamp when this player's status or track changed.
@@ -405,6 +407,7 @@ async fn reconcile(
                         let _ = art_tx.send(ArtworkJob {
                             track_key: np.track_key.clone(),
                             art,
+                            source_app: Some(bus.clone()),
                         });
                     }
                 }
@@ -421,6 +424,10 @@ async fn reconcile(
 /// off the event thread, and emits [`MetaEvent::Artwork`] on success.
 fn run_fetch_worker(rx: Receiver<ArtworkJob>, tx: Sender<MetaEvent>, stop: Arc<AtomicBool>) {
     let mut sched = FetchScheduler::default();
+    // The winning player's bus name for the one request the scheduler tracks.
+    // The scheduler keeps only the most recent request, so a single slot mirrors
+    // it exactly; it is refreshed on every `request` and consumed on emit.
+    let mut source_app: Option<String> = None;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -429,7 +436,10 @@ fn run_fetch_worker(rx: Receiver<ArtworkJob>, tx: Sender<MetaEvent>, stop: Arc<A
         // Absorb any queued requests.
         loop {
             match rx.try_recv() {
-                Ok(job) => sched.request(Instant::now(), job.track_key, job.art),
+                Ok(job) => {
+                    source_app = job.source_app;
+                    sched.request(Instant::now(), job.track_key, job.art);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
@@ -442,6 +452,7 @@ fn run_fetch_worker(rx: Receiver<ArtworkJob>, tx: Sender<MetaEvent>, stop: Arc<A
                     let _ = tx.send(MetaEvent::Artwork {
                         track_key: key,
                         bytes,
+                        source_app: source_app.clone(),
                     });
                 }
                 _ => sched.on_failure(Instant::now(), &key),
@@ -459,7 +470,10 @@ fn run_fetch_worker(rx: Receiver<ArtworkJob>, tx: Sender<MetaEvent>, stop: Arc<A
             .unwrap_or(cap)
             .min(cap);
         match rx.recv_timeout(wait) {
-            Ok(job) => sched.request(Instant::now(), job.track_key, job.art),
+            Ok(job) => {
+                source_app = job.source_app;
+                sched.request(Instant::now(), job.track_key, job.art);
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }

@@ -32,15 +32,27 @@
 //!
 //! [`NowPlaying`], [`PlaybackStatus`], [`PositionInfo`], [`ArtworkRef`],
 //! [`MetaEvent`] and [`MetaHandle`] are OS-neutral and shared by every backend.
-//! [`FetchScheduler`] is the shared, pure debounce/retry policy a backend uses
-//! to fetch artwork off its event thread.
+//! [`FetchScheduler`] is the shared, pure debounce/retry policy the MPRIS
+//! backend uses to fetch artwork off its event thread.
 //!
 //! # Backends
 //!
 //! - [`mpris`] — Linux, via the MPRIS D-Bus interface. Compiled only on Linux.
+//! - [`smtc`] — Windows, via the System Media Transport Controls. Compiled only
+//!   on Windows.
 //!
-//! A backend for another platform (e.g. Windows SMTC) produces the same
-//! [`MetaEvent`] stream from the same shared types.
+//! Both produce the same [`MetaEvent`] stream from the same shared types. Two
+//! platform-neutral helper modules support the SMTC backend and are unit-tested
+//! off-platform:
+//!
+//! - [`select`] — the SMTC session-selection policy (playing wins, then most
+//!   recent activity, then a deterministic tie-break). It mirrors the MPRIS
+//!   [`select_winner`](mpris::select_winner) policy; see its module docs for
+//!   the one deliberate difference (how a stopped session is treated).
+//! - [`artwork`] — encoded-image sniffing and the usable-bytes predicate the
+//!   SMTC backend uses to reject the placeholder thumbnails Windows returns
+//!   mid-swap. See its module docs for how it divides responsibility with
+//!   [`FetchScheduler`].
 
 #![deny(unsafe_code)]
 
@@ -57,6 +69,16 @@ pub mod mpris;
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
+
+pub mod artwork;
+pub mod select;
+
+/// The Windows System Media Transport Controls backend. Compiled only on
+/// Windows; the shared `types`/`select`/`artwork` surface it drives is
+/// platform-neutral and available everywhere.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub mod smtc;
 
 pub mod palette;
 
