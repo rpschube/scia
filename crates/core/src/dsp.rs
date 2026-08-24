@@ -3,8 +3,8 @@
 //! capture stalls the grid keeps advancing with synthesized silence so the
 //! render side always has a fresh, real-time snapshot.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::bands::{BandConfig, BandSplitter};
@@ -107,6 +107,12 @@ pub struct HopProcessor {
     flux: f32,
     onset: bool,
     onset_age_ms: f32,
+    // The configs the analyzer/bands/onset were built from, kept so a
+    // sample-rate/channel change ([`reformat`](HopProcessor::reformat)) can
+    // rebuild them exactly as the constructor did.
+    spectrum_config: SpectrumConfig,
+    bands_config: BandConfig,
+    onset_config: OnsetConfig,
 }
 
 impl HopProcessor {
@@ -178,7 +184,46 @@ impl HopProcessor {
             flux: 0.0,
             onset: false,
             onset_age_ms: 0.0,
+            spectrum_config: spectrum,
+            bands_config: bands,
+            onset_config: onset,
         }
+    }
+
+    /// Rebuild every format-dependent piece for a new stream shape, exactly as
+    /// [`with_configs`](HopProcessor::with_configs) would — the FFT plans and
+    /// analyzer, the band splitter and the onset detector are recreated for
+    /// `channels`/`sample_rate`, and the scratch buffers resized — but the hop
+    /// `generation` is kept monotonic so consumers never see the counter jump
+    /// back. Used by the DSP thread when a runtime reopen renegotiates the
+    /// format (a 44.1 ↔ 48 kHz device switch, say): after this the next
+    /// published snapshot carries the new `sample_rate`/`channels` and the
+    /// frequency mappings track the new rate. Off the hot path — it allocates,
+    /// like the constructor, and runs only on the rare reformat.
+    pub fn reformat(&mut self, channels: u16, sample_rate: u32) {
+        let channels = channels.max(1) as usize;
+        let analyzer = SpectrumAnalyzer::new(self.spectrum_config, sample_rate);
+        let bars = analyzer.bars();
+        let fft_main = analyzer.config().fft_main;
+        let fft_bass = analyzer.config().fft_bass;
+        let band_splitter = BandSplitter::new(self.bands_config, sample_rate, fft_main, fft_bass);
+        let onset_detector = OnsetDetector::new(self.onset_config, sample_rate, fft_main);
+
+        self.channels = channels;
+        self.dt_seconds = self.hop_frames as f32 / sample_rate.max(1) as f32;
+        self.interleaved = vec![0.0; self.hop_frames * channels];
+        self.mono = vec![0.0; self.hop_frames];
+        self.left = vec![0.0; self.hop_frames];
+        self.right = vec![0.0; self.hop_frames];
+        self.analyzer = analyzer;
+        self.spectrum_out = vec![0.0; bars];
+        self.band_splitter = band_splitter;
+        self.onset_detector = onset_detector;
+        self.bands_out = [0.0; 3];
+        self.flux = 0.0;
+        self.onset = false;
+        self.onset_age_ms = 0.0;
+        // `generation` deliberately preserved: the grid keeps climbing.
     }
 
     /// The current display-spectrum AGC gain.
@@ -402,6 +447,43 @@ impl HopProcessor {
     }
 }
 
+/// A one-slot hand-off from the engine to the running DSP thread, used to swap
+/// the sample ring under the thread without stopping it. On a runtime reopen the
+/// engine opens a fresh stream, then [`publish`](RingSwap::publish)es the new
+/// [`SampleConsumer`] and its (possibly renegotiated) [`StreamFormat`] here; the
+/// DSP thread picks it up at the top of its next wake with
+/// [`try_take`](RingSwap::try_take).
+///
+/// The engine side is a cold path and may block briefly on the mutex; the DSP
+/// side only ever `try_lock`s, so lock contention just means "retry next wake"
+/// and never stalls the hop grid. The DSP thread is not the capture callback, so
+/// this lock never sits on the wait-free capture path.
+pub(crate) struct RingSwap(Mutex<Option<(SampleConsumer, StreamFormat)>>);
+
+impl RingSwap {
+    /// An empty swap slot.
+    pub(crate) fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Engine side: hand a fresh consumer and format to the DSP thread. Replaces
+    /// any pending swap the thread has not yet taken (only the newest matters).
+    pub(crate) fn publish(&self, consumer: SampleConsumer, format: StreamFormat) {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some((consumer, format));
+    }
+
+    /// DSP side: take a pending swap if one is present and the lock is free.
+    /// Never blocks — on contention it returns `None` and the thread retries on
+    /// its next wake. Allocation-free.
+    fn try_take(&self) -> Option<(SampleConsumer, StreamFormat)> {
+        match self.0.try_lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => None,
+        }
+    }
+}
+
 /// Everything the DSP thread owns for its run.
 pub(crate) struct DspThread {
     pub consumer: SampleConsumer,
@@ -411,6 +493,8 @@ pub(crate) struct DspThread {
     pub stop: Arc<AtomicBool>,
     pub stats: Arc<SinkStats>,
     pub counters: Arc<DspCounters>,
+    /// Runtime ring/format hand-off from the engine (see [`RingSwap`]).
+    pub swap: Arc<RingSwap>,
 }
 
 /// Safety cap on silent hops emitted per starved wake, so a long starved sleep
@@ -449,12 +533,13 @@ fn stamp(snapshot: &mut FeatureSnapshot, activity: Activity, quiet_ms: f32) {
 pub(crate) fn run(mut thread: DspThread) {
     // TODO(priority): raise the scheduling priority of the scia-dsp thread once
     // the priority-tuning card lands so capture jitter cannot starve DSP.
-    let channels = thread.format.channels.max(1) as usize;
-    let needed = thread.config.hop_frames * channels;
-    let gap_ns = thread.config.gap_timeout.as_nanos() as u64;
-    let hop_period = Duration::from_secs_f64(
+    // Format-derived; recomputed if a runtime reopen renegotiates the format.
+    let mut channels = thread.format.channels.max(1) as usize;
+    let mut needed = thread.config.hop_frames * channels;
+    let mut hop_period = Duration::from_secs_f64(
         thread.config.hop_frames as f64 / f64::from(thread.format.sample_rate.max(1)),
     );
+    let gap_ns = thread.config.gap_timeout.as_nanos() as u64;
     let quiet_after = thread.config.quiet_after;
     let idle_after = thread.config.idle_after;
     // Linear-RMS form of the quiet threshold; a hop at or above it is signal.
@@ -480,6 +565,28 @@ pub(crate) fn run(mut thread: DspThread) {
         }
         // Every iteration is a wake, whether it processed hops or only slept.
         thread.counters.dsp_wakes.fetch_add(1, Ordering::Relaxed);
+
+        // Adopt a pending ring swap before anything else this wake. `try_take`
+        // never blocks: on contention we retry next wake. The old consumer is
+        // dropped here; its samples are gone, but a reopen only ever swaps in a
+        // fresh ring when the old stream was being replaced anyway. The DSP
+        // thread's silence machine (`last_non_quiet`, `silent_deadline`) is left
+        // untouched, so the activity state carries across the swap and the
+        // reopen window renders as a short starved quiet, never a freeze.
+        if let Some((new_consumer, new_format)) = thread.swap.try_take() {
+            thread.consumer = new_consumer;
+            if new_format != thread.format {
+                // A renegotiated format: rebuild the FFT/analyzer/bands/onset
+                // for the new rate, keeping the generation monotonic.
+                processor.reformat(new_format.channels, new_format.sample_rate);
+                channels = new_format.channels.max(1) as usize;
+                needed = thread.config.hop_frames * channels;
+                hop_period = Duration::from_secs_f64(
+                    thread.config.hop_frames as f64 / f64::from(new_format.sample_rate.max(1)),
+                );
+            }
+            thread.format = new_format;
+        }
 
         let mode = classify(last_non_quiet.elapsed(), quiet_after, idle_after);
 
