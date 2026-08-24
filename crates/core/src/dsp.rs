@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::bands::{BandConfig, BandSplitter};
-use crate::beat::BeatTracker;
+use crate::beat::{BeatDebug, BeatTracker};
 use crate::bus::FeatureWriter;
 use crate::capture::{SampleConsumer, SinkStats, StreamFormat};
 use crate::features::{Activity, FEATURE_SCHEMA_VERSION, FeatureSnapshot};
@@ -105,6 +105,15 @@ pub struct HopProcessor {
     band_splitter: BandSplitter,
     onset_detector: OnsetDetector,
     beat_tracker: BeatTracker,
+    /// Optional diagnostic side channel: when installed (only the engine's DSP
+    /// thread does — see [`set_beat_debug_sink`](HopProcessor::set_beat_debug_sink)),
+    /// the in-thread beat tracker's [`BeatDebug`] is mirrored here after every
+    /// induction pass. `None` on every direct-test/tooling path, which is what
+    /// keeps the per-hop no-alloc tests free of any lock.
+    beat_debug_sink: Option<Arc<Mutex<BeatDebug>>>,
+    /// The induction count last mirrored into `beat_debug_sink`, so the mirror
+    /// write happens once per induction pass rather than every hop.
+    last_beat_inductions: u64,
     bands_out: [f32; 3],
     flux: f32,
     onset: bool,
@@ -187,6 +196,8 @@ impl HopProcessor {
             band_splitter,
             onset_detector,
             beat_tracker,
+            beat_debug_sink: None,
+            last_beat_inductions: 0,
             bands_out: [0.0; 3],
             flux: 0.0,
             onset: false,
@@ -231,6 +242,9 @@ impl HopProcessor {
         self.band_splitter = band_splitter;
         self.onset_detector = onset_detector;
         self.beat_tracker = beat_tracker;
+        // The rebuilt tracker restarts its induction count from zero; keep the
+        // mirror cadence in step. The `beat_debug_sink` itself is preserved.
+        self.last_beat_inductions = 0;
         self.bands_out = [0.0; 3];
         self.flux = 0.0;
         self.onset = false;
@@ -340,6 +354,17 @@ impl HopProcessor {
         self.update_beat();
     }
 
+    /// Install the diagnostic beat-debug side channel. After this, every
+    /// induction pass mirrors the in-thread tracker's [`BeatDebug`] into `sink`
+    /// (via a non-blocking `try_lock`), so a probe can read the *real* tracker's
+    /// internals through [`Engine::beat_debug`](crate::Engine::beat_debug) rather
+    /// than a separate mirror tracker. Diagnostic-only: it never feeds back into
+    /// tracking. Left uninstalled on every direct-test path, so the per-hop
+    /// no-alloc tests never touch a lock.
+    pub fn set_beat_debug_sink(&mut self, sink: Arc<Mutex<BeatDebug>>) {
+        self.beat_debug_sink = Some(sink);
+    }
+
     /// Feed this hop's onset detection function (the normalized spectral flux)
     /// into the causal beat tracker and cache its tempo/phase/confidence for the
     /// next snapshot. Called exactly once per hop on every publish path.
@@ -349,6 +374,28 @@ impl HopProcessor {
         self.tempo_bpm = est.tempo_bpm;
         self.beat_phase = est.phase;
         self.beat_confidence = est.confidence;
+        self.mirror_beat_debug();
+    }
+
+    /// Mirror the beat tracker's [`BeatDebug`] into the diagnostic side channel,
+    /// but only when a fresh induction pass has landed (≈ every
+    /// `INDUCTION_SECONDS`), never on the per-hop path between passes. The read is
+    /// an allocation-free `Copy`; the write is a non-blocking `try_lock` that
+    /// skips on contention so a reader can never stall the DSP thread. When no
+    /// sink is installed (every direct-test path) this returns before touching
+    /// anything, keeping the per-hop and induction no-alloc tests lock-free.
+    fn mirror_beat_debug(&mut self) {
+        let Some(sink) = &self.beat_debug_sink else {
+            return;
+        };
+        let dbg = self.beat_tracker.debug_stats();
+        if dbg.inductions == self.last_beat_inductions {
+            return;
+        }
+        self.last_beat_inductions = dbg.inductions;
+        if let Ok(mut cell) = sink.try_lock() {
+            *cell = dbg;
+        }
     }
 
     /// Emit a silent hop (rms/peak 0, `starved = true`), incrementing the
@@ -526,6 +573,10 @@ pub(crate) struct DspThread {
     pub counters: Arc<DspCounters>,
     /// Runtime ring/format hand-off from the engine (see [`RingSwap`]).
     pub swap: Arc<RingSwap>,
+    /// Diagnostic side channel: the in-thread beat tracker's latest
+    /// [`BeatDebug`], refreshed once per induction pass. Read by
+    /// [`Engine::beat_debug`](crate::Engine::beat_debug); never on the hop path.
+    pub beat_debug: Arc<Mutex<BeatDebug>>,
 }
 
 /// Safety cap on silent hops emitted per starved wake, so a long starved sleep
@@ -584,6 +635,9 @@ pub(crate) fn run(mut thread: DspThread) {
         thread.config.bands,
         thread.config.onset,
     );
+    // Wire the diagnostic beat-debug mirror: the induction pass writes the
+    // tracker's stats into the shared cell the engine exposes. Off the hop path.
+    processor.set_beat_debug_sink(Arc::clone(&thread.beat_debug));
     let mut silent_deadline: Option<Instant> = None;
     // The instant of the last hop that carried signal. Everything since is quiet;
     // its age drives the state machine and `quiet_ms`. Seeded to "now" so a

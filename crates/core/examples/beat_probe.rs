@@ -7,22 +7,27 @@
 //!
 //! With `--list` it prints every device on every cpal host and exits. Otherwise
 //! it starts the normal engine on [`CpalBackend`], then watches the published
-//! feature stream. Every hop's onset detection function (the spectral flux the
-//! snapshot already carries) is fed into a mirror [`BeatTracker`] constructed for
-//! the same format — the identical, deterministic per-hop computation the DSP
-//! thread runs — so the tracker's internals become observable through the
-//! read-only [`BeatTracker::debug_stats`] surface without disturbing the engine
-//! or the published snapshot. The published tempo column is read straight off
-//! the engine's snapshot; the internal columns come from the mirror fed that
-//! same ODF, so the two agree hop for hop unless a hop is missed (reported).
+//! feature stream. The internal induction columns come straight from the *real*
+//! in-thread beat tracker the DSP thread runs, exposed through the diagnostic
+//! [`Engine::beat_debug`] side channel (the DSP thread mirrors its [`BeatDebug`]
+//! into a shared cell once per induction pass); the per-hop tempo/phase/
+//! confidence columns are read off the engine's published snapshot. There is no
+//! separate mirror tracker — an earlier version fed the published ODF into a
+//! second tracker, but a gappy `reader.latest()` poll misses generations, which
+//! collapsed the mirror's comb scores and made its columns untrustworthy. Now
+//! every internal is the genuine tracker's own state.
 //!
 //! Once per second it prints one aligned status line — elapsed, RMS, the
 //! short-term ODF level, the ODF-window kurtosis, the raw comb energy at the
-//! winning period, that period's candidate tempo, the smoothed confidence, the
-//! lock flag and the engine's published tempo. At each induction pass it prints
-//! a compact line with the top three comb candidates (`bpm:score`). At the end
-//! it prints a summary: min/median/max of kurtosis and confidence over the run,
-//! the fraction of hops locked, and the modal candidate tempo.
+//! winning period, that period's candidate tempo, the published confidence, the
+//! lock/coast flag and the engine's published tempo. At each induction pass it
+//! prints a compact line with the top three comb candidates (`bpm:score`). At the
+//! end it prints a summary: min/median/max of kurtosis and confidence over the
+//! run, the fraction of hops publishing a tempo, and the modal candidate tempo.
+//!
+//! The `hops observed`/`hops skipped` counters only qualify this probe's own
+//! display cadence — how many published generations the poll actually saw — not
+//! the tracker's correctness, which now comes from the engine directly.
 //!
 //! This never retunes anything: it only measures. The tracker's constants, the
 //! DSP chain and the published snapshot semantics are untouched.
@@ -37,12 +42,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use scia_core::{
-    BeatDebug, BeatTracker, CaptureError, CpalBackend, DeviceKind, DeviceSelector, Engine,
-    EngineConfig, EngineError, StreamHealth, list_devices,
+    BeatDebug, CaptureError, CpalBackend, DeviceKind, DeviceSelector, Engine, EngineConfig,
+    EngineError, StreamHealth, list_devices,
 };
-
-/// Frames per hop the pipeline runs on — fixed at 256 across the codebase.
-const HOP_FRAMES: usize = 256;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -167,15 +169,13 @@ fn probe(device: Option<String>, seconds: u64) -> ExitCode {
          cand · conf · locked · published bpm)"
     );
 
-    // The mirror tracker: fed the published ODF hop for hop, so its induction
-    // internals mirror the engine's tracker exactly (deterministic per-hop math).
-    let mut tracker = BeatTracker::new(format.sample_rate, HOP_FRAMES);
-
-    // Run accumulators for the summary.
+    // Run accumulators for the summary. Confidence is sampled per observed hop
+    // off the published snapshot (live, hop-accurate); kurtosis and candidates
+    // come from the engine's induction side channel (refreshed once per pass).
     let mut conf_samples: Vec<f32> = Vec::new();
     let mut kurt_samples: Vec<f32> = Vec::new();
     let mut cand_bpm_bins: Vec<i32> = Vec::new();
-    let mut locked_hops: u64 = 0;
+    let mut published_hops: u64 = 0;
     let mut total_hops: u64 = 0;
     let mut skipped_hops: u64 = 0;
 
@@ -190,10 +190,9 @@ fn probe(device: Option<String>, seconds: u64) -> ExitCode {
         let snap = *reader.latest();
 
         // A format renegotiation (a device switch) rebuilds the engine's tracker;
-        // rebuild the mirror to match so the geometry and cadence stay aligned.
+        // the side channel follows it automatically, so only note it here.
         if snap.sample_rate != 0 && snap.sample_rate != format.sample_rate {
             format = engine.format();
-            tracker = BeatTracker::new(format.sample_rate, HOP_FRAMES);
             last_induction = 0;
             println!("-- stream reformatted to {} Hz --", format.sample_rate);
         }
@@ -206,23 +205,24 @@ fn probe(device: Option<String>, seconds: u64) -> ExitCode {
             }
             last_gen = Some(snap.generation);
 
-            // Feed the mirror tracker the same ODF the engine's tracker saw.
-            tracker.process_hop(snap.flux);
-            let dbg = tracker.debug_stats();
-
-            conf_samples.push(dbg.confidence);
+            // Live per-hop fields come straight off the published snapshot.
+            conf_samples.push(snap.beat_confidence);
             total_hops += 1;
-            if dbg.locked {
-                locked_hops += 1;
+            if snap.tempo_bpm > 0.0 {
+                published_hops += 1;
             }
 
-            if dbg.inductions != last_induction {
-                last_induction = dbg.inductions;
-                kurt_samples.push(dbg.kurtosis);
-                if dbg.candidate_bpm > 0.0 {
-                    cand_bpm_bins.push(dbg.candidate_bpm.round() as i32);
+            // Induction internals come from the real tracker's side channel; a
+            // change in the pass counter means a fresh pass has landed.
+            if let Some(dbg) = engine.beat_debug() {
+                if dbg.inductions != last_induction {
+                    last_induction = dbg.inductions;
+                    kurt_samples.push(dbg.kurtosis);
+                    if dbg.candidate_bpm > 0.0 {
+                        cand_bpm_bins.push(dbg.candidate_bpm.round() as i32);
+                    }
+                    print_induction(start.elapsed().as_secs_f32(), &dbg);
                 }
-                print_induction(start.elapsed().as_secs_f32(), &dbg);
             }
         }
 
@@ -233,8 +233,8 @@ fn probe(device: Option<String>, seconds: u64) -> ExitCode {
         }
 
         if start.elapsed() >= next_tick {
-            let dbg = tracker.debug_stats();
-            print_status(next_tick.as_secs(), snap.rms, snap.tempo_bpm, &dbg);
+            let dbg = engine.beat_debug().unwrap_or_default();
+            print_status(next_tick.as_secs(), &snap, &dbg);
             next_tick += Duration::from_secs(1);
         }
 
@@ -246,7 +246,7 @@ fn probe(device: Option<String>, seconds: u64) -> ExitCode {
         &conf_samples,
         &kurt_samples,
         &cand_bpm_bins,
-        locked_hops,
+        published_hops,
         total_hops,
         skipped_hops,
     );
@@ -263,19 +263,27 @@ fn probe(device: Option<String>, seconds: u64) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// One aligned per-second status line. `pub_bpm` is the engine's published tempo
-/// (0 while unlocked); every other internal comes from the mirror tracker.
-fn print_status(t: u64, rms: f32, pub_bpm: f32, dbg: &BeatDebug) {
+/// One aligned per-second status line. The live tempo/phase/confidence come from
+/// the published snapshot `snap`; the induction internals (odf/kurt/comb/cand)
+/// come from the real tracker's side channel `dbg`.
+fn print_status(t: u64, snap: &scia_core::FeatureSnapshot, dbg: &BeatDebug) {
+    let lock = if dbg.coasting {
+        "coast"
+    } else if dbg.locked {
+        "yes"
+    } else {
+        "no"
+    };
     println!(
-        "t={t:>3}s  rms={rms:>7.4}  odf={:>8.5}  kurt={:>6.2}  comb={:>6.3}  \
-         cand={:>6.1}bpm  conf={:>5.3}  locked={:>3}  published={:>6.1}bpm",
+        "t={t:>3}s  rms={:>7.4}  odf={:>8.5}  kurt={:>6.2}  comb={:>6.3}  \
+         cand={:>6.1}bpm  conf={:>5.3}  locked={lock:>5}  published={:>6.1}bpm",
+        snap.rms,
         dbg.odf_level,
         dbg.kurtosis,
         dbg.comb_energy,
         dbg.candidate_bpm,
-        dbg.confidence,
-        if dbg.locked { "yes" } else { "no" },
-        pub_bpm,
+        snap.beat_confidence,
+        snap.tempo_bpm,
     );
 }
 
@@ -298,12 +306,12 @@ fn print_induction(t: f32, dbg: &BeatDebug) {
 }
 
 /// The closing summary block: distribution of kurtosis and confidence, the
-/// fraction of hops locked, and the modal candidate tempo.
+/// fraction of hops publishing a tempo, and the modal candidate tempo.
 fn print_summary(
     conf: &[f32],
     kurt: &[f32],
     cand_bins: &[i32],
-    locked_hops: u64,
+    published_hops: u64,
     total_hops: u64,
     skipped_hops: u64,
 ) {
@@ -316,10 +324,10 @@ fn print_summary(
     let frac = if total_hops == 0 {
         0.0
     } else {
-        locked_hops as f64 / total_hops as f64
+        published_hops as f64 / total_hops as f64
     };
     println!(
-        "time locked:         {:.1}% ({locked_hops}/{total_hops} hops)",
+        "time publishing:     {:.1}% ({published_hops}/{total_hops} hops with a tempo)",
         frac * 100.0
     );
     match modal(cand_bins) {
