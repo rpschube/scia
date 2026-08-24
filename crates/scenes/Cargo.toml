@@ -15,6 +15,12 @@ toml = "0.9"
 # watcher observes the preset file's parent directory so an editor's
 # rename-replace save is caught.
 notify = "8"
+# Expression mappings (US-CFG-3): a `[map]` value may be a string expression
+# compiled at preset load and evaluated per frame. The safe compiled-slab API is
+# allocation-free after construction; default features (which include
+# `unsafe-vars`) are disabled — the namespace is a plain compiled slab evaluated
+# against a fixed variable set.
+fasteval = { version = "0.2", default-features = false }
 
 # The scenes crate now carries serde + toml for the preset format. The mlua and
 # criterion dev-dependencies below remain probe-only (P5): they exist solely for

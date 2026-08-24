@@ -2,7 +2,8 @@
 
 use scia_core::FeatureSnapshot;
 use scia_scenes::{
-    Canvas, Curve, Feature, Mapping, MappingSet, Params, Primitive, Scene, SceneCtx, create_builtin,
+    Canvas, Curve, Feature, Mapping, MappingSet, Params, Primitive, Scene, SceneCtx,
+    create_builtin, parse_preset,
 };
 
 /// Build a snapshot with the given display spectrum and onset flag.
@@ -252,6 +253,89 @@ fn mapped_value_past_the_manifest_max_is_clamped() {
         clamped,
         static_punch(0.35),
         "the mapping did move `punch` off its default (the clamp is not vacuous)"
+    );
+}
+
+#[test]
+fn expression_mapped_param_reaches_the_same_frame_render() {
+    // `gap` driven by a string expression of loudness. A louder frame must widen
+    // the gap — and so narrow the bars — in the very frame it arrives, exactly
+    // like the table form. Exercises the compile-at-load, eval-per-frame path.
+    let values = [0.5f32; 8];
+
+    let bar_width_at = |rms: f32| -> f32 {
+        let preset = parse_preset(
+            "[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\ngap = \"loud * 0.8\"\n",
+            None,
+        )
+        .expect("preset validates");
+        let mut layers = preset.instantiate(1.0);
+        let layer = &mut layers[0];
+        let mut params = Params::new();
+        layer.mappings.seed(&mut params);
+        let mut sn = snap(&values, false);
+        sn.rms = rms;
+        let prims = mapped_frame(
+            layer.scene.as_mut(),
+            &mut layer.mappings,
+            &mut params,
+            &sn,
+            0.016,
+        );
+        bar_xwh(&prims[0]).1
+    };
+
+    let quiet = bar_width_at(0.0);
+    let loud = bar_width_at(0.9);
+    assert!(
+        loud + 1e-4 < quiet,
+        "a louder frame must narrow the bars via the live `gap` expression \
+         (quiet width {quiet}, loud width {loud})"
+    );
+}
+
+#[test]
+fn expression_result_past_the_manifest_max_is_clamped() {
+    // `punch` has manifest max 2.0. An expression that evaluates to 5.0 writes
+    // 5.0 into params every frame; the scene must clamp it to 2.0 on read, so it
+    // matches a static preset pinned at the max and differs from the default.
+    let values = [0.1f32; 16];
+
+    let static_punch = |punch: f32| -> Vec<Primitive> {
+        let mut ctx = SceneCtx::default();
+        ctx.params.set("punch", punch);
+        let mut s = spectra();
+        s.init(&ctx);
+        s.update(&snap(&values, true), 0.05);
+        render_to_vec(s.as_mut())
+    };
+
+    let preset = parse_preset(
+        "[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\npunch = \"5\"\n",
+        None,
+    )
+    .expect("preset validates");
+    let mut layers = preset.instantiate(1.0);
+    let layer = &mut layers[0];
+    let mut params = Params::new();
+    layer.mappings.seed(&mut params);
+    let clamped = mapped_frame(
+        layer.scene.as_mut(),
+        &mut layer.mappings,
+        &mut params,
+        &snap(&values, true),
+        0.05,
+    );
+
+    assert_eq!(
+        clamped,
+        static_punch(2.0),
+        "an expression evaluating to 5.0 is clamped to the manifest max 2.0"
+    );
+    assert_ne!(
+        clamped,
+        static_punch(0.35),
+        "the expression did move `punch` off its default (the clamp is not vacuous)"
     );
 }
 

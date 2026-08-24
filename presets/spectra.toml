@@ -44,15 +44,24 @@ gap = 0.15
 # gap = 0.2
 
 # Feature -> parameter mappings. Each key is a parameter of the mapped scene;
-# each value is a table naming a feature and a response. A string value here is
-# reserved for the expression VM (a later card) and is rejected today.
+# each value is EITHER a response table (feature + curve + envelope) OR a string
+# expression over the feature vocabulary, compiled at load and evaluated per
+# frame.
 #
 # feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
 # curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
 # attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+#
+# expression variables (all 0..1; width is raw stereo_correlation, 0 for now):
+#   bass mid treb loud peak onset flux beat beat_conf width
+# `onset` is an envelope: 1.0 on an onset hop, then a ~250 ms exponential decay.
+# operators + - * / % ^ with parentheses, plus fasteval's builtin math functions.
 [map]
 # Lift the low-end punch on every onset: a fast attack, a quarter-second decay.
 punch = { feature = "onset", curve = "linear", attack_ms = 0, decay_ms = 250, scale = 0.9, offset = 0.0 }
+# The same key could instead be driven by an expression (shown commented): ride
+# the punch on the onset envelope plus a touch of bass.
+# punch = "onset * 0.7 + bass * 0.2"
 
 [palette]
 # static | album-art. `album-art` is accepted and validated but resolves to the
