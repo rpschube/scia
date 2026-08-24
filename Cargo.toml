@@ -25,6 +25,14 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Linux system-mix capture via the PipeWire host. Off by default so the
+# standard gate builds stay PipeWire-free (no libpipewire-0.3-dev needed);
+# the pipewire CI job and Linux probe/dist builds turn it on. Without it the
+# Linux binary falls back to the ALSA default *input* (microphone-level), so
+# any build meant to visualize system audio on Linux must enable this.
+capture-pipewire = ["scia-core/capture-pipewire"]
+
 [[bin]]
 name = "scia"
 path = "src/main.rs"

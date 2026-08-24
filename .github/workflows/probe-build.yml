@@ -34,11 +34,15 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Install system audio headers (Linux only; cpal → alsa-sys)
+      - name: Install system audio headers (Linux only; cpal → alsa-sys + PipeWire)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libasound2-dev
+          # libpipewire/libspa are what the `capture-pipewire` feature links —
+          # without that feature a Linux binary captures the default *input*
+          # (microphone), not the system mix, so Linux probe builds enable it.
+          sudo apt-get install -y -qq --no-install-recommends \
+            libasound2-dev libpipewire-0.3-dev libspa-0.2-dev
 
       - name: Install toolchain (pinned by rust-toolchain.toml)
         run: |
@@ -48,11 +52,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build probes (debug profile, no LTO — these are diagnostics)
+        shell: bash
         run: |
-          cargo build -p scia-core --example capture_probe
-          cargo build -p scia-core --example latency_probe
-          cargo build -p scia-core --example beat_probe
-          cargo build --bin scia
+          # Linux probe binaries must capture the system mix, so they carry
+          # the capture-pipewire feature; other OSes need no feature.
+          features=()
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            features=(--features capture-pipewire)
+          fi
+          cargo build -p scia-core --example capture_probe "${features[@]}"
+          cargo build -p scia-core --example latency_probe "${features[@]}"
+          cargo build -p scia-core --example beat_probe "${features[@]}"
+          cargo build --bin scia "${features[@]}"
 
       - name: Collect
         shell: bash
