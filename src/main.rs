@@ -90,6 +90,11 @@ struct Cli {
     #[arg(long)]
     debug: bool,
 
+    /// Start with the debug/performance overlay panel visible (toggle at runtime
+    /// with the backtick key).
+    #[arg(long)]
+    overlay: bool,
+
     /// Render a built-in scene preset (from --list-scenes) instead of the plain
     /// spectrum bars. Invalid names exit 2 listing the available presets. Not
     /// valid with --headless.
@@ -258,11 +263,18 @@ fn run_demo(cli: &Cli) -> ExitCode {
         source: String::new(),
         frames: cli.frames,
         debug: cli.debug,
+        overlay: cli.overlay,
         scene: cli.scene.clone(),
         tier: Some(select_tier(cli)),
     };
 
-    let outcome = run(reader, || engine.stats(), || engine.health(), opts);
+    let outcome = run(
+        reader,
+        || engine.stats(),
+        || engine.health(),
+        || engine.now_ns(),
+        opts,
+    );
     engine.stop();
     report_tui_outcome(outcome)
 }
@@ -350,11 +362,18 @@ fn run_live(cli: &Cli) -> ExitCode {
         source,
         frames: cli.frames,
         debug: cli.debug,
+        overlay: cli.overlay,
         scene: cli.scene.clone(),
         tier: Some(select_tier(cli)),
     };
 
-    let outcome = run(reader, || engine.stats(), || engine.health(), opts);
+    let outcome = run(
+        reader,
+        || engine.stats(),
+        || engine.health(),
+        || engine.now_ns(),
+        opts,
+    );
     engine.stop();
     report_tui_outcome(outcome)
 }

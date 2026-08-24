@@ -68,6 +68,8 @@ pub struct TuiOptions {
     pub frames: Option<u64>,
     /// Start with the debug line visible.
     pub debug: bool,
+    /// Start with the debug/performance overlay panel visible.
+    pub overlay: bool,
     /// Built-in scene preset to render, by name. `None` runs the direct
     /// spectrum-bar renderer (the byte-identical legacy path); `Some(name)`
     /// drives the [`ScenePresenter`] on the selected [`tier`](Self::tier).
@@ -86,6 +88,7 @@ impl Default for TuiOptions {
             source: String::new(),
             frames: None,
             debug: false,
+            overlay: false,
             scene: None,
             tier: None,
         }
@@ -115,10 +118,13 @@ pub struct RunSummary {
 /// panic (a panic hook restores the terminal, then re-raises).
 ///
 /// `reader` is polled once per frame for the freshest snapshot; `stats` is
-/// called once per frame for the engine counters shown on the debug line, and
+/// called once per frame for the engine counters shown on the debug line;
 /// `health` is polled once per frame — when it reports
 /// [`StreamHealth::Errored`] the loop leaves the terminal cleanly and returns a
-/// [`RunSummary`] whose [`error`](RunSummary::error) carries the message.
+/// [`RunSummary`] whose [`error`](RunSummary::error) carries the message; and
+/// `clock` is the engine's snapshot clock (monotonic ns since the ring epoch),
+/// sampled once per frame so the overlay can show the newest feature's age as
+/// `clock() - snap.timestamp_ns`.
 ///
 /// When `opts.scene` is `Some(name)`, the scene presenter is built from the
 /// built-in preset *before* the terminal is touched, so an unknown or invalid
@@ -133,6 +139,7 @@ pub fn run(
     reader: FeatureReader,
     stats: impl FnMut() -> EngineStats,
     health: impl FnMut() -> StreamHealth,
+    clock: impl FnMut() -> u64,
     opts: TuiOptions,
 ) -> Result<RunSummary, RunError> {
     install_panic_hook();
@@ -149,6 +156,7 @@ pub fn run(
         reader,
         stats,
         health,
+        clock,
         &opts,
         presenter,
     )?)
@@ -236,6 +244,7 @@ fn run_loop(
     mut reader: FeatureReader,
     mut stats: impl FnMut() -> EngineStats,
     mut health: impl FnMut() -> StreamHealth,
+    mut clock: impl FnMut() -> u64,
     opts: &TuiOptions,
     mut presenter: Option<ScenePresenter>,
 ) -> io::Result<RunSummary> {
@@ -244,6 +253,7 @@ fn run_loop(
         label: opts.label.clone(),
         source: opts.source.clone(),
         debug: opts.debug,
+        overlay: opts.overlay,
         fps_measured: opts.fps as f32,
         // A scene presenter surfaces its ladder rung on the debug line; the
         // direct-bars renderer leaves it unset.
@@ -278,6 +288,8 @@ fn run_loop(
         // Refresh the engine counters first: activity feeds the idle downshift.
         ui.stats = stats();
         ui.fps_measured = fps_ema;
+        // Feature age against the engine's snapshot clock, for the overlay.
+        ui.feature_age_ms = render::feature_age_ms(clock(), snap.timestamp_ns);
 
         // Abort cleanly if the capture stream faulted. The guard restores the
         // terminal on return; the caller reports the message.
@@ -327,6 +339,10 @@ fn run_loop(
                         p.resize(body.width, body.height);
                         p.frame(&snap, dt);
                         p.draw(frame.buffer_mut(), body);
+                        // The overlay is drawn last, over the rasterized scene.
+                        if ui.overlay {
+                            render::render_overlay(frame.buffer_mut(), body, &snap, &ui);
+                        }
                     }
                 })?;
             }
@@ -407,9 +423,57 @@ fn handle_event(event: Event, ui: &mut UiState) -> Action {
                 ui.debug = !ui.debug;
                 Action::Redraw
             }
+            KeyCode::Char('`') => {
+                ui.overlay = !ui.overlay;
+                Action::Redraw
+            }
             _ => Action::None,
         },
         Event::Resize(_, _) => Action::Redraw,
         _ => Action::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        })
+    }
+
+    #[test]
+    fn backtick_toggles_overlay() {
+        let mut ui = UiState::default();
+        assert!(!ui.overlay);
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('`')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(ui.overlay, "backtick should turn the overlay on");
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('`')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(!ui.overlay, "backtick should turn the overlay back off");
+    }
+
+    #[test]
+    fn overlay_and_debug_toggle_independently() {
+        let mut ui = UiState::default();
+        // The debug-line key keeps its meaning and does not touch the overlay.
+        let _ = handle_event(press(KeyCode::Char('d')), &mut ui);
+        assert!(ui.debug);
+        assert!(!ui.overlay);
+        // The overlay key does not touch the debug line.
+        let _ = handle_event(press(KeyCode::Char('`')), &mut ui);
+        assert!(ui.debug);
+        assert!(ui.overlay);
     }
 }
