@@ -1,8 +1,30 @@
-//! Scene engine for scia: it loads TOML scene presets, evaluates their
-//! expressions and sandboxed scripts against the feature bus produced by
-//! `scia-core`, and drives the per-frame state that a frontend renders. It
-//! depends on the core for its feature inputs and stays free of any concrete
-//! rendering backend.
+//! Scene engine for scia: the TUI↔GPU portability seam.
+//!
+//! A [`Scene`] turns the feature stream from `scia-core` into a [`Canvas`] — an
+//! abstract display list in normalized coordinates. Presenters (a terminal one
+//! now, a GPU one later) rasterize the canvas; scenes never learn the physical
+//! cell or pixel size, so a single scene drives every backend unchanged. This
+//! crate carries the trait, the canvas, the scene context and continuity types,
+//! the host [`Palette`], a registry of built-in scenes and the first such
+//! scene, [`builtin::Spectra`].
+//!
+//! The design leaves room for a scripting rung (Luau presets) to bind to the
+//! same [`Scene`] shape later: draw calls are per-primitive methods on the
+//! canvas, feature scalars are read directly and the spectrum is a slice, so a
+//! bound scene pays the same costs a Rust one does.
+
+#![forbid(unsafe_code)]
+
+pub mod builtin;
+pub mod canvas;
+pub mod palette;
+pub mod registry;
+pub mod scene;
+
+pub use canvas::{Canvas, PALETTE_SLOTS, Primitive, Slot, Style};
+pub use palette::{Palette, Rgb};
+pub use registry::{SceneInfo, builtin_scenes, create_builtin};
+pub use scene::{Params, Scene, SceneCtx, SceneState};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
