@@ -177,11 +177,11 @@ impl Lattice {
     /// assigns scalars — it allocates nothing and resets no live state — so the
     /// grid is (re)built separately from `density` in [`Scene::init`].
     fn read_params(&mut self, params: &crate::scene::Params) {
-        self.density = params.get_or("density", 24.0);
-        self.ring_speed = params.get_or("ring_speed", 0.9);
-        self.ring_width = params.get_or("ring_width", 0.14);
-        self.flash = params.get_or("flash", 0.7);
-        self.glow = params.get_or("glow", 0.35);
+        read_param(&mut self.density, params, "density");
+        read_param(&mut self.ring_speed, params, "ring_speed");
+        read_param(&mut self.ring_width, params, "ring_width");
+        read_param(&mut self.flash, params, "flash");
+        read_param(&mut self.glow, params, "glow");
     }
 
     /// Rebuild the dot grid from the current `density` and the drawing aspect.
@@ -264,6 +264,13 @@ impl Scene for Lattice {
         self.loud_env = 0.0;
         self.prev_onset = false;
         self.prev_onset_age_ms = 0.0;
+    }
+
+    fn apply_params(&mut self, params: &crate::scene::Params) {
+        // Tuning scalars only: rings, glow envelope and the grid carry across.
+        // A live `density` change stays inert until the next `init` rebuilds
+        // the grid.
+        self.read_params(params);
     }
 
     fn update(&mut self, f: &scia_core::FeatureSnapshot, dt: f32) {
@@ -365,6 +372,22 @@ impl Scene for Lattice {
                 _ => *r = Ring::DEAD,
             }
         }
+    }
+}
+
+/// Refresh one tuning scalar from `params` in place. When `key` is present, the
+/// value is stored clamped to that parameter's manifest `[min, max]`; when
+/// absent, the slot keeps its current value. The clamp matters because a mapping
+/// writes `offset + scale * env`, which can leave the range validated at preset
+/// load. Allocation-free: a linear scan of the bag and the static manifest.
+#[inline]
+fn read_param(slot: &mut f32, params: &crate::scene::Params, key: &str) {
+    if let Some(v) = params.get(key) {
+        let spec = PARAMS
+            .iter()
+            .find(|s| s.key == key)
+            .expect("key is a lattice parameter");
+        *slot = v.clamp(spec.min, spec.max);
     }
 }
 
