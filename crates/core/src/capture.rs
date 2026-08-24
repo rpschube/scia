@@ -14,7 +14,7 @@ use std::time::Instant;
 /// Ring capacity in **frames** (~170 ms at 48 kHz). The ring is always sized
 /// for two channels regardless of the stream width, so it stores
 /// `RING_FRAMES * 2` interleaved `f32` slots.
-pub const RING_FRAMES: usize = 8192;
+pub const RING_FRAMES: usize = 32768;
 
 /// Interleaved channel count the ring is dimensioned for. Streams are 1 or 2
 /// channels; the ring is sized for the maximum so a stereo stream fits.

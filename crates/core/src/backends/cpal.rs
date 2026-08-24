@@ -39,6 +39,8 @@ use crate::capture::{
 
 /// Fallback upper bound (in frames) for the preallocated conversion buffer when
 /// the backend reports no maximum buffer size. Matches the ring's frame span.
+/// Preferred ALSA buffer size in frames (~10 ms at 48 kHz); clamped to the device range.
+const PREFERRED_BUFFER_FRAMES: u32 = 512;
 const DEFAULT_CAP_FRAMES: usize = 8192;
 
 /// Which device a [`CpalBackend`] opens.
@@ -218,7 +220,15 @@ fn build_stream(
             "device reported {sample_rate} Hz / {device_channels} channels"
         )));
     }
-    let config: cpal::StreamConfig = supported.config();
+    let mut config: cpal::StreamConfig = supported.config();
+    // On ALSA the device's default period can be enormous (16k+ frames, hundreds
+    // of milliseconds of latency). Ask for a small buffer when the device says it
+    // supports one; other hosts keep their engine-managed default.
+    #[cfg(target_os = "linux")]
+    if let cpal::SupportedBufferSize::Range { min, max } = supported.buffer_size() {
+        let want = PREFERRED_BUFFER_FRAMES.clamp(*min, *max);
+        config.buffer_size = cpal::BufferSize::Fixed(want);
+    }
 
     let downmix = Downmix::new(device_channels);
     let out_channels = downmix.out_channels;
