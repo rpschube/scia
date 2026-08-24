@@ -1,0 +1,48 @@
+# gate-windows — capture-relevant checks on Windows.
+# Runs only when core or bridge code (the capture path) changes, so most PRs
+# skip it; it is therefore NOT a required check. The justfile's bash/flock/
+# ionice wrappers are Linux-only, so on Windows the plain cargo commands are
+# the mirror of the gate's check + test steps.
+name: gate-windows
+
+on:
+  pull_request:
+    paths:
+      - crates/core/**
+      - crates/bridge/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/gate-windows.yml
+
+concurrency:
+  group: gate-windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: windows
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup toolchain install --profile minimal
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install test runner (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: check
+        run: cargo check --workspace --all-targets
+
+      - name: test
+        run: cargo nextest run --workspace
