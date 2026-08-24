@@ -18,6 +18,11 @@ to grow a GPU window and a desktop-wallpaper mode later.
 - Now-playing metadata and album-art palettes from any player
 - A single small binary, permissively licensed
 
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+build tooling, workflow and privacy rules every change follows.
+
 ## License
 
 Licensed under either of
