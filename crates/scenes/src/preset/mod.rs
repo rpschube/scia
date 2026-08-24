@@ -1262,6 +1262,12 @@ static TIDE_PRESET: &str = include_str!("../../../../presets/tide.toml");
 /// The `verso` built-in preset template.
 static VERSO_PRESET: &str = include_str!("../../../../presets/verso.toml");
 
+/// The `phosphor` built-in preset template.
+static PHOSPHOR_PRESET: &str = include_str!("../../../../presets/phosphor.toml");
+
+/// The `sonar` built-in preset template.
+static SONAR_PRESET: &str = include_str!("../../../../presets/sonar.toml");
+
 /// The built-in preset files compiled into the crate, as `(name, source)`.
 static BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("spectra", SPECTRA_PRESET),
@@ -1270,6 +1276,8 @@ static BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("starfall", STARFALL_PRESET),
     ("tide", TIDE_PRESET),
     ("verso", VERSO_PRESET),
+    ("phosphor", PHOSPHOR_PRESET),
+    ("sonar", SONAR_PRESET),
 ];
 
 /// The built-in preset files compiled into the crate, as `(name, source)`.

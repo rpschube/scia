@@ -2,8 +2,8 @@
 //! and construct one by id.
 
 use crate::builtin::{
-    Aurora, Lattice, Spectra, Starfall, Tide, Verso, aurora, lattice, spectra, starfall, tide,
-    verso,
+    Aurora, Lattice, Phosphor, Sonar, Spectra, Starfall, Tide, Verso, aurora, lattice, phosphor,
+    sonar, spectra, starfall, tide, verso,
 };
 use crate::scene::{ParamSpec, Scene};
 
@@ -64,6 +64,18 @@ static BUILTINS: &[SceneInfo] = &[
         summary: "The track title is the analyzer: each letter rides its own spectrum band, floating and shedding a dotted falling trail.",
         params: verso::PARAMS,
     },
+    SceneInfo {
+        id: "phosphor",
+        mood: "retro",
+        summary: "A Lissajous trace burned onto a decaying phosphor screen; the figure precesses and onsets bloom its amplitude.",
+        params: phosphor::PARAMS,
+    },
+    SceneInfo {
+        id: "sonar",
+        mood: "vigilant",
+        summary: "A sweep arm circling at the track tempo; onsets flare contacts that fade with the phosphor.",
+        params: sonar::PARAMS,
+    },
 ];
 
 /// The catalog of built-in scenes.
@@ -88,6 +100,8 @@ pub fn create_builtin(id: &str) -> Option<Box<dyn Scene>> {
         "starfall" => Some(Box::new(Starfall::new())),
         "tide" => Some(Box::new(Tide::new())),
         "verso" => Some(Box::new(Verso::new())),
+        "phosphor" => Some(Box::new(Phosphor::new())),
+        "sonar" => Some(Box::new(Sonar::new())),
         _ => None,
     }
 }

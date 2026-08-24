@@ -1,0 +1,68 @@
+# sonar — the radar-sweep preset.
+#
+# This is a copy-and-edit template: every table and key the preset format
+# understands appears here, either set or shown in a comment. See
+# docs/presets.md for the full reference (types, ranges, the feature
+# vocabulary, curve formulas, envelope semantics and the error format).
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric).
+name = "sonar"
+# Required. A registered scene id. `sonar` is the radar sweep.
+scene = "sonar"
+# Optional. A one-line human description.
+description = "A sweep arm circling at the track tempo; onsets flare contacts that fade with the phosphor."
+# Optional. A one-word mood; defaults to the scene's own mood ("vigilant").
+mood = "vigilant"
+
+# Typed parameters for the preset's scene. Every key must exist in the scene's
+# parameter manifest; every value is a number within the stated range. Omitted
+# keys keep their manifest default.
+[params]
+# beats_per_rev  4.0    range 1.0..=16.0   beats spanned by one full sweep revolution when locked to the beat
+beats_per_rev = 4.0
+# rate           0.15   range 0.02..=1.0   free rotation rate (revolutions/second) when the beat is unlocked
+rate = 0.15
+# decay          1.2    range 0.1..=5.0    contact persistence time constant (seconds)
+decay = 1.2
+# trail          0.5    range 0.0..=1.0    sweep trail length (phosphor persistence of the arm)
+trail = 0.5
+# rings          2.0    range 0.0..=4.0    number of faint range rings (rounded)
+rings = 2.0
+
+# Optional layer stack. With no [[layer]] tables the preset is exactly one
+# layer: [preset].scene with [params]. Each layer names its own scene, an
+# optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0); [layer.params] is typed against THAT layer's scene manifest and
+# merges over its defaults. When layers are present, [map] targets the FIRST
+# layer's scene.
+#
+# [[layer]]
+# scene = "sonar"
+# blend = "over"
+# intensity = 1.0
+# [layer.params]
+# rings = 3
+
+# Feature -> parameter mappings. Each key is a parameter of the mapped scene;
+# each value is either a table naming a feature and a response, or a string
+# expression over the feature vocabulary (evaluated per frame).
+#
+# feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
+# curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+[map]
+# Lengthen the sweep trail with loudness: a louder passage leaves a longer
+# phosphor smear behind the arm, on a gentle envelope. Stays inside trail's
+# 0.0..=1.0 range (offset 0.2, plus up to scale 0.7).
+trail = { feature = "loud", curve = "linear", attack_ms = 100, decay_ms = 400, scale = 0.7, offset = 0.2 }
+
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries; only meaningful with a
+# static source. Omit to use the host default palette. A radar ramp: near-black
+# through phosphor green for the arm, an amber contact flare, then three neutrals.
+slots = ["#02120a", "#0c5a2e", "#39e07a", "#7cffa0", "#ffcf40", "#060a08", "#3f6b50", "#e6ffe6"]

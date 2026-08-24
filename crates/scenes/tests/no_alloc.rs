@@ -350,3 +350,99 @@ fn verso_update_render_does_not_allocate() {
         strays.join("\n---\n")
     );
 }
+
+/// The `phosphor` scene must not allocate per frame once warmed: its persistence
+/// field is sized at init and decayed and re-deposited in place, and the canvas
+/// retains capacity.
+#[test]
+fn phosphor_update_render_does_not_allocate() {
+    let mut scene = create_builtin("phosphor").expect("phosphor exists");
+    scene.init(&SceneCtx::default());
+    let mut canvas = Canvas::new(16.0 / 9.0);
+
+    // A driving snapshot with loudness, bands and a toggled onset, so both the
+    // amplitude follower and the onset opening run.
+    let mut f = FeatureSnapshot {
+        rms: 0.6,
+        onset: false,
+        onset_age_ms: 100.0,
+        ..FeatureSnapshot::default()
+    };
+    f.bands = [1.4, 1.0, 1.2];
+
+    // Warm up: grow the field buffer and the canvas arena to steady capacity.
+    for i in 0..16 {
+        f.onset = i % 2 == 0;
+        f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+        scene.update(&f, 0.016);
+        canvas.clear();
+        scene.render(&mut canvas);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for i in 0..500 {
+            f.onset = i % 7 == 0;
+            f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+            scene.update(&f, 0.016);
+            canvas.clear();
+            scene.render(&mut canvas);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "phosphor update/render allocated {} time(s) across 500 frames:\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
+
+/// The `sonar` scene must not allocate per frame once warmed: its contact pool
+/// is a fixed array, spawns reuse a slot in place, and the canvas retains
+/// capacity.
+#[test]
+fn sonar_update_render_does_not_allocate() {
+    let mut scene = create_builtin("sonar").expect("sonar exists");
+    scene.init(&SceneCtx::default());
+    let mut canvas = Canvas::new(16.0 / 9.0);
+
+    // A driving snapshot with a locked beat, bands and a toggled onset, so the
+    // beat-lock path, contact spawns and fades all run.
+    let mut f = FeatureSnapshot {
+        beat_confidence: 0.9,
+        tempo_bpm: 128.0,
+        beat_phase: 0.0,
+        onset: false,
+        onset_age_ms: 100.0,
+        ..FeatureSnapshot::default()
+    };
+    f.bands = [1.2, 1.0, 0.8];
+
+    // Warm up: realize every contact slot and grow the canvas to steady capacity.
+    for i in 0..32 {
+        f.onset = i % 2 == 0;
+        f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+        f.beat_phase = (i as f32 * 0.1).rem_euclid(1.0);
+        scene.update(&f, 0.016);
+        canvas.clear();
+        scene.render(&mut canvas);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for i in 0..500 {
+            f.onset = i % 7 == 0;
+            f.onset_age_ms = if f.onset { 0.0 } else { 50.0 };
+            f.beat_phase = (i as f32 * 0.1).rem_euclid(1.0);
+            scene.update(&f, 0.016);
+            canvas.clear();
+            scene.render(&mut canvas);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "sonar update/render allocated {} time(s) across 500 frames:\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
