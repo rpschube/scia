@@ -54,6 +54,11 @@ struct Cli {
     #[arg(long)]
     headless: bool,
 
+    /// Disable the automatic capture-reopen watcher (no device-switch or fault
+    /// recovery). The watcher is on by default.
+    #[arg(long)]
+    no_route_watch: bool,
+
     /// With --headless, exit after N seconds. `0` (the default) runs until the
     /// process is killed.
     #[arg(long, default_value_t = 0)]
@@ -183,7 +188,11 @@ fn run_live(cli: &Cli) -> ExitCode {
         prefer_pipewire,
     };
 
-    let (engine, reader) = match Engine::start(Box::new(backend), EngineConfig::default()) {
+    let config = EngineConfig {
+        route_watch: !cli.no_route_watch,
+        ..EngineConfig::default()
+    };
+    let (engine, reader) = match Engine::start(Box::new(backend), config) {
         Ok(pair) => pair,
         Err(EngineError::Capture(CaptureError::NoDevice)) => {
             eprintln!("no capture device available; try --list-devices, or --demo");
@@ -264,9 +273,14 @@ fn run_headless(engine: Engine, mut reader: FeatureReader, seconds: u64) -> Exit
         let stats = engine.stats();
         let snap = *reader.latest();
         let (bar, val) = loudest_bar(&snap.spectrum[..snap.spectrum_len as usize]);
+        let reopens = if stats.reopens > 0 {
+            format!("  reopens {}", stats.reopens)
+        } else {
+            String::new()
+        };
         eprintln!(
             "act {}  gen {}  rms {:.4}  peak {:.4}  loudest {}({:.3})  push {}  gap {:.1}ms  \
-             dropped {}",
+             dropped {}{}",
             activity_label(stats.activity),
             snap.generation,
             snap.rms,
@@ -276,6 +290,7 @@ fn run_headless(engine: Engine, mut reader: FeatureReader, seconds: u64) -> Exit
             stats.pushes,
             stats.max_gap_ms,
             stats.dropped_frames,
+            reopens,
         );
 
         if let StreamHealth::Errored(msg) = engine.health() {
