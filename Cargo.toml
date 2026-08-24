@@ -34,6 +34,7 @@ scia-core = { path = "crates/core", version = "0.0.0" }
 scia-scenes = { path = "crates/scenes", version = "0.0.0" }
 scia-meta = { path = "crates/meta", version = "0.0.0" }
 scia-tui = { path = "crates/tui", version = "0.0.0" }
+clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 lto = "fat"
