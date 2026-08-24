@@ -16,6 +16,11 @@
 //! | `punch`       | `0.35`  | how much the envelope lifts the low bars            |
 //! | `gap`         | `0.15`  | gap between bars, as a fraction of a column          |
 //!
+//! All four are tuning scalars: the host re-applies them every frame through
+//! [`Scene::apply_params`] (after feature mappings rewrite the layer's params),
+//! so a `[map]` on any of them is honored live. Each is clamped to its manifest
+//! range on read, since a mapping's `offset + scale * env` can exceed it.
+//!
 //! # Continuity
 //!
 //! [`Scene::state`] carries only the onset envelope. The per-bar heights are
@@ -24,7 +29,7 @@
 //! worth of history is not worth serializing.
 
 use crate::canvas::{Canvas, Style};
-use crate::scene::{ParamSpec, Scene, SceneCtx, SceneState};
+use crate::scene::{ParamSpec, Params, Scene, SceneCtx, SceneState};
 
 /// The fraction of bars, from the low end, that ride the onset envelope.
 const LOW_FRACTION: f32 = 0.25;
@@ -93,6 +98,21 @@ impl Spectra {
             gap: 0.15,
         }
     }
+
+    /// Refresh the tuning scalars from `params`, and only those — the onset
+    /// envelope and per-bar heights are left untouched so a mid-run re-apply
+    /// (feature mappings, later live tuning) does not reset animation.
+    ///
+    /// Shared by [`Scene::init`] and [`Scene::apply_params`]. A key absent from
+    /// the bag keeps its current value; a present key is clamped to its
+    /// [`ParamSpec`] range, since a mapping writes `offset + scale * env`, which
+    /// can leave the range the preset validated at load. Allocation-free.
+    fn read_params(&mut self, params: &Params) {
+        read_param(&mut self.release, params, "release");
+        read_param(&mut self.punch_decay, params, "punch_decay");
+        read_param(&mut self.punch, params, "punch");
+        read_param(&mut self.gap, params, "gap");
+    }
 }
 
 impl Default for Spectra {
@@ -111,12 +131,16 @@ impl Scene for Spectra {
     }
 
     fn init(&mut self, ctx: &SceneCtx) {
-        self.release = ctx.params.get_or("release", 0.15);
-        self.punch_decay = ctx.params.get_or("punch_decay", 0.25);
-        self.punch = ctx.params.get_or("punch", 0.35);
-        self.gap = ctx.params.get_or("gap", 0.15);
+        self.read_params(&ctx.params);
         self.env = 0.0;
         self.heights.clear();
+    }
+
+    fn apply_params(&mut self, params: &Params) {
+        // Only the tuning scalars refresh: the onset envelope and per-bar
+        // heights carry across, so a live mapping is honored without resetting
+        // the animation mid-run.
+        self.read_params(params);
     }
 
     fn update(&mut self, f: &scia_core::FeatureSnapshot, dt: f32) {
@@ -177,6 +201,22 @@ impl Scene for Spectra {
         if let Some(env) = s.get("env") {
             self.env = env;
         }
+    }
+}
+
+/// Refresh one tuning scalar from `params` in place. When `key` is present, the
+/// value is stored clamped to that parameter's manifest `[min, max]`; when
+/// absent, the slot keeps its current value. The clamp matters because a mapping
+/// writes `offset + scale * env`, which can leave the range validated at preset
+/// load. Allocation-free: a linear scan of the bag and the static manifest.
+#[inline]
+fn read_param(slot: &mut f32, params: &Params, key: &str) {
+    if let Some(v) = params.get(key) {
+        let spec = PARAMS
+            .iter()
+            .find(|s| s.key == key)
+            .expect("key is a spectra parameter");
+        *slot = v.clamp(spec.min, spec.max);
     }
 }
 

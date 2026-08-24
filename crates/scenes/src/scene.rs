@@ -167,6 +167,17 @@ pub trait Scene: Send {
     /// Prepare the scene against the drawing context and parameters.
     fn init(&mut self, ctx: &SceneCtx);
 
+    /// Re-apply the layer's [`Params`] for the current frame.
+    ///
+    /// The host calls this once per frame, after feature mappings (and, later,
+    /// the live tuning UI) have rewritten the layer's params and before
+    /// [`Scene::update`]. It refreshes only the scene's tuning scalars from the
+    /// bag; animation and continuity state must be left untouched, so a value
+    /// mapped live takes effect on the same frame without resetting the scene.
+    /// Must be cheap and allocation-free — it runs every frame. Defaults to a
+    /// no-op for scenes with no live-tunable parameters.
+    fn apply_params(&mut self, _params: &Params) {}
+
     /// Fold the newest features into internal state. `dt` is seconds elapsed
     /// since the previous `update`.
     fn update(&mut self, f: &scia_core::FeatureSnapshot, dt: f32);

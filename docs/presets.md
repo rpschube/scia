@@ -176,6 +176,14 @@ The stored parameter value is `offset + scale * y`. A time constant `tau`
 reaches `1 - e⁻¹ ≈ 63 %` of a step in one `tau`; a decay from `1.0` reaches
 `e⁻¹ ≈ 37 %` after one `tau`.
 
+Mappings are applied **live**, every frame: the mapped parameters are folded
+into the layer's params and handed to the scene before it updates, so a mapped
+value drives that same frame's render — a scene reads its tuning parameters both
+at load and on every frame. Because `offset + scale * y` can leave the range the
+preset validated at load, the scene clamps each value back into that parameter's
+`[min, max]` when it reads it, so a mapping that overshoots is capped rather than
+rejected.
+
 ## Palette rules
 
 - `source` is `static` or `album-art`.

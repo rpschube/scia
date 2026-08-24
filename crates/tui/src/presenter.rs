@@ -184,10 +184,12 @@ impl ScenePresenter {
 
     /// Advance and rasterize one frame from the newest features.
     ///
-    /// Per layer: apply the feature mappings into the layer's params, update the
-    /// scene, render it onto the shared canvas, and rasterize the canvas into
-    /// the frame buffer with the layer's blend and intensity. The layers paint
-    /// in order into one buffer; the encoded [`CellGrid`] is produced last.
+    /// Per layer: apply the feature mappings into the layer's params, re-apply
+    /// those params to the scene so a mapped value takes effect this frame,
+    /// update the scene, render it onto the shared canvas, and rasterize the
+    /// canvas into the frame buffer with the layer's blend and intensity. The
+    /// layers paint in order into one buffer; the encoded [`CellGrid`] is
+    /// produced last.
     pub fn frame(&mut self, snap: &FeatureSnapshot, dt: f32) {
         // The incoming (or, without a fade, the only) layers rasterize into the
         // primary buffer.
@@ -229,10 +231,11 @@ impl ScenePresenter {
     }
 
     /// Advance, render and rasterize a layer stack into `fb`. Per layer: fold the
-    /// feature mappings into `params`, update the scene, render it onto the
-    /// shared `canvas`, and rasterize with the layer's blend and intensity.
-    /// Free-standing (not `&mut self`) so a fade can drive the incoming and
-    /// outgoing stacks with disjoint borrows of the presenter's fields.
+    /// feature mappings into `params`, re-apply `params` to the scene (so a value
+    /// a mapping just rewrote is honored on this frame), update the scene, render
+    /// it onto the shared `canvas`, and rasterize with the layer's blend and
+    /// intensity. Free-standing (not `&mut self`) so a fade can drive the incoming
+    /// and outgoing stacks with disjoint borrows of the presenter's fields.
     #[allow(clippy::too_many_arguments)]
     fn rasterize_layers(
         layers: &mut [LayerInstance],
@@ -247,6 +250,7 @@ impl ScenePresenter {
         let aspect = canvas.aspect();
         for (layer, p) in layers.iter_mut().zip(params.iter_mut()) {
             layer.mappings.apply(snap, dt, p);
+            layer.scene.apply_params(p);
             layer.scene.update(snap, dt);
             canvas.clear();
             canvas.set_aspect(aspect);
