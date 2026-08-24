@@ -25,6 +25,7 @@
 
 pub mod backends;
 pub mod bands;
+pub mod beat;
 pub mod bus;
 pub mod capture;
 pub mod dsp;
@@ -44,6 +45,7 @@ pub use backends::wasapi_perf::{
 };
 pub use backends::wasapi_route::RouteNotifier;
 pub use bands::{BandConfig, BandSplitter};
+pub use beat::{BeatEstimate, BeatTracker};
 pub use bus::{FeatureReader, FeatureWriter, feature_bus};
 pub use capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, RING_FRAMES, SampleConsumer,
