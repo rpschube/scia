@@ -19,21 +19,28 @@ use scia_scenes::{
 };
 
 use crate::mosaic::{CellGrid, FrameBuffer, TextRun, Tier};
-use crate::pixel::{PIXEL_BUDGET, PixelBuffer, image_dims};
+use crate::pixel::{PIXEL_BUDGET, PixelBuffer, image_dims, image_downscale};
 use scia_core::FeatureSnapshot;
 
-/// Which presenter drives the scene body: the cell mosaic on a [`Tier`], or the
-/// kitty graphics pixel image.
+/// Which presenter drives the scene body: the cell mosaic on a [`Tier`], the
+/// kitty graphics pixel image, or the sixel graphics pixel image.
 ///
-/// The kitty variant carries the terminal's cell size in pixels `(height,
-/// width)`, used to size the transmitted image; the mosaic variant carries the
-/// subpixel ladder rung.
+/// The kitty and sixel variants carry the terminal's cell size in pixels
+/// `(height, width)`, used to size the transmitted image; the mosaic variant
+/// carries the subpixel ladder rung. The two pixel presenters share the whole
+/// render path ([`PixelBuffer`]); they differ only in how the run loop encodes
+/// and writes the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresenterMode {
     /// The cell-mosaic rasterizer at the given ladder rung.
     Mosaic(Tier),
     /// The kitty graphics pixel presenter, sized from the reported cell size.
     Kitty {
+        /// Terminal cell size in pixels `(height, width)`.
+        cell_px: (u16, u16),
+    },
+    /// The sixel graphics pixel presenter, sized from the reported cell size.
+    Sixel {
         /// Terminal cell size in pixels `(height, width)`.
         cell_px: (u16, u16),
     },
@@ -86,9 +93,13 @@ pub struct ScenePresenter {
     /// The flattened RGB8 image the kitty encoder consumes, refreshed by
     /// [`frame`](Self::frame). Empty in mosaic mode.
     rgb8: Vec<u8>,
-    /// The current image size in pixels `(width, height)`, in kitty mode.
+    /// The current image size in pixels `(width, height)`, in a pixel mode.
     img_w: u16,
     img_h: u16,
+    /// The integer pixel-repeat factor for the sixel emit (`≥ 1`); the sixel
+    /// image is rasterized at `(img_w, img_h)` and repeated `×img_k` on emit to
+    /// cover the body area. Unused in kitty and mosaic modes.
+    img_k: u16,
     canvas: Canvas,
     layers: Vec<LayerInstance>,
     /// One parameter bag per layer, driven by that layer's feature mappings.
@@ -146,6 +157,7 @@ impl ScenePresenter {
             rgb8: Vec::new(),
             img_w: 0,
             img_h: 0,
+            img_k: 1,
             canvas: Canvas::new(1.0),
             layers,
             params,
@@ -182,7 +194,7 @@ impl ScenePresenter {
     pub fn tier(&self) -> Tier {
         match self.mode {
             PresenterMode::Mosaic(tier) => tier,
-            PresenterMode::Kitty { .. } => Tier::default(),
+            PresenterMode::Kitty { .. } | PresenterMode::Sixel { .. } => Tier::default(),
         }
     }
 
@@ -199,6 +211,7 @@ impl ScenePresenter {
         match self.mode {
             PresenterMode::Mosaic(tier) => tier.label(),
             PresenterMode::Kitty { .. } => "kitty",
+            PresenterMode::Sixel { .. } => "sixel",
         }
     }
 
@@ -227,6 +240,14 @@ impl ScenePresenter {
         (self.cols, self.rows)
     }
 
+    /// The sixel pixel-repeat factor (`≥ 1`): the budgeted image at
+    /// [`image_px`](Self::image_px) is repeated `×k` on emit to cover the body
+    /// area. `1` outside sixel mode.
+    #[must_use]
+    pub fn image_k(&self) -> u16 {
+        self.img_k
+    }
+
     /// Resize the pixel grid to a `cols × rows` cell area at the current tier
     /// and update the canvas aspect from the subcell geometry. Call this on a
     /// terminal resize or after [`set_tier`](Self::set_tier).
@@ -248,8 +269,12 @@ impl ScenePresenter {
                 let aspect = if ph > 0.0 { pw / ph } else { 1.0 };
                 self.canvas.set_aspect(aspect);
             }
-            PresenterMode::Kitty { cell_px } => {
+            PresenterMode::Kitty { cell_px } | PresenterMode::Sixel { cell_px } => {
                 let (w, h) = image_dims(cols, rows, cell_px, PIXEL_BUDGET);
+                // The sixel emit has no terminal-side scaling, so it repeats the
+                // budgeted image by the same integer factor the downscale used;
+                // kitty leaves scaling to the terminal and ignores this.
+                self.img_k = image_downscale(cols, rows, cell_px, PIXEL_BUDGET).max(1) as u16;
                 self.img_w = w;
                 self.img_h = h;
                 self.px.resize(w, h);
@@ -352,7 +377,7 @@ impl ScenePresenter {
                 self.fb_out.resize(self.cols, self.rows, tier);
                 self.fb_out_ready = true;
             }
-            PresenterMode::Kitty { .. } => {
+            PresenterMode::Kitty { .. } | PresenterMode::Sixel { .. } => {
                 self.px_out.resize(self.img_w, self.img_h);
                 self.px_out.set_cells(self.cols, self.rows);
                 self.px_out_ready = true;
@@ -389,7 +414,7 @@ impl ScenePresenter {
 
         match self.mode {
             PresenterMode::Mosaic(_) => self.frame_mosaic(snap, dt),
-            PresenterMode::Kitty { .. } => self.frame_kitty(snap, dt),
+            PresenterMode::Kitty { .. } | PresenterMode::Sixel { .. } => self.frame_pixel(snap, dt),
         }
     }
 
@@ -430,9 +455,11 @@ impl ScenePresenter {
         self.fb.encode(&mut self.grid);
     }
 
-    /// The kitty frame path: rasterize into the pixel image (mixing an active
-    /// cross-fade), then flatten it to the RGB8 buffer the encoder consumes.
-    fn frame_kitty(&mut self, snap: &FeatureSnapshot, dt: f32) {
+    /// The pixel frame path (kitty and sixel): rasterize into the pixel image
+    /// (mixing an active cross-fade), then flatten it to the RGB8 buffer the
+    /// encoder consumes. Both graphics presenters share this — they diverge only
+    /// at the run loop's encode-and-write step.
+    fn frame_pixel(&mut self, snap: &FeatureSnapshot, dt: f32) {
         Self::rasterize_layers(
             &mut self.layers,
             &mut self.params,
@@ -501,10 +528,12 @@ impl ScenePresenter {
     /// runs on top as real terminal text.
     ///
     /// In mosaic mode the encoded cells are painted first, then the text runs on
-    /// top. In kitty mode the image is *not* painted here — it is written to the
-    /// terminal as a graphics-protocol frame by the caller, and sits below the
-    /// text layer — so only the text runs are drawn, leaving the body cells clear
-    /// for the image to show through.
+    /// top. In the pixel modes the image is *not* painted here — it is written to
+    /// the terminal as a graphics-protocol frame by the caller — so only the text
+    /// runs are drawn, leaving the body cells clear for the image. In kitty mode
+    /// the image sits below the text layer; in sixel mode it paints over the
+    /// cells at its rectangle, so the text runs the caller emits afterward land on
+    /// top of it.
     pub fn draw(&self, buf: &mut Buffer, area: Rect) {
         match self.mode {
             PresenterMode::Mosaic(_) => {
@@ -522,7 +551,7 @@ impl ScenePresenter {
                 }
                 self.draw_text(buf, area, self.fb.text_runs(), |r| self.fb.run_text(r));
             }
-            PresenterMode::Kitty { .. } => {
+            PresenterMode::Kitty { .. } | PresenterMode::Sixel { .. } => {
                 self.draw_text(buf, area, self.px.text_runs(), |r| self.px.run_text(r));
             }
         }

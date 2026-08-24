@@ -42,7 +42,7 @@ CONFIG:
     Unix:     $XDG_CONFIG_HOME/scia/config.toml  (else ~/.config/scia/config.toml)
     Windows:  %APPDATA%\\scia\\config.toml
   [defaults]  scene, presenter, overlay, perf_mode, demo_bpm, chrome
-              (presenter = octant | sextant | quadrant | half | kitty;
+              (presenter = octant | sextant | quadrant | half | kitty | sixel;
               chrome = invisible | instrument | playful | utilitarian;
               both overridden by their flags)
   [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
@@ -162,9 +162,9 @@ struct Cli {
     scene_file: Option<PathBuf>,
 
     /// Force the presenter: a mosaic tier (octant|sextant|quadrant|half, which
-    /// skips capability probing), or `kitty` for the kitty graphics presenter
-    /// (probes for support and falls back to mosaic when absent). Without it the
-    /// mosaic tier is chosen by probing the terminal.
+    /// skips capability probing), or `kitty`/`sixel` for the graphics presenters
+    /// (each probes for support and falls back to mosaic when absent). Without it
+    /// the mosaic tier is chosen by probing the terminal.
     #[arg(long, value_enum, value_name = "PRESENTER")]
     presenter: Option<PresenterTier>,
 
@@ -203,6 +203,9 @@ enum PresenterTier {
     /// Kitty graphics protocol (ghostty/kitty). Falls back to the mosaic default
     /// tier when the terminal does not support it.
     Kitty,
+    /// Sixel graphics protocol (Windows Terminal and others). Falls back to the
+    /// mosaic default tier when the terminal does not support it.
+    Sixel,
 }
 
 impl PresenterTier {
@@ -214,7 +217,7 @@ impl PresenterTier {
             PresenterTier::Sextant => Some(Tier::Sextant),
             PresenterTier::Quadrant => Some(Tier::Quadrant),
             PresenterTier::Half => Some(Tier::Half),
-            PresenterTier::Kitty => None,
+            PresenterTier::Kitty | PresenterTier::Sixel => None,
         }
     }
 }
@@ -337,13 +340,14 @@ fn print_scene_list() -> ExitCode {
 /// notice.
 ///
 /// A forced mosaic `--presenter` tier skips probing (as before). A forced
-/// `--presenter kitty` probes the terminal for graphics support and cell size: on
-/// support it uses the kitty presenter; otherwise it falls back to the probed
-/// default mosaic tier and returns a notice explaining the fallback. With no
-/// force, the terminal is probed and the default mosaic tier is used —
-/// auto-selection is deliberately unchanged, so kitty is only ever opt-in. Prints
-/// the capability one-liner to stderr when probing a real terminal. Called only
-/// on the TUI path (never headless).
+/// `--presenter kitty` or `--presenter sixel` probes the terminal for that
+/// graphics protocol and the cell size: on support it uses the matching pixel
+/// presenter; otherwise it falls back to the probed default mosaic tier and
+/// returns a notice explaining the fallback. With no force, the terminal is
+/// probed and the default mosaic tier is used — auto-selection is deliberately
+/// unchanged, so the graphics presenters are only ever opt-in. Prints the
+/// capability one-liner to stderr when probing a real terminal. Called only on
+/// the TUI path (never headless).
 fn select_presenter(resolved: &Resolved) -> (PresenterMode, Option<String>) {
     match resolved.presenter {
         Some(PresenterTier::Kitty) => {
@@ -359,6 +363,22 @@ fn select_presenter(resolved: &Resolved) -> (PresenterMode, Option<String>) {
                 (
                     PresenterMode::Mosaic(tier),
                     Some("kitty graphics unavailable; using mosaic".to_string()),
+                )
+            }
+        }
+        Some(PresenterTier::Sixel) => {
+            let report = scia_tui::probe(PROBE_TIMEOUT);
+            if io::stdout().is_terminal() {
+                eprintln!("{report}");
+            }
+            if report.sixel {
+                let cell_px = report.cell_px.unwrap_or(scia_tui::FALLBACK_CELL_PX);
+                (PresenterMode::Sixel { cell_px }, None)
+            } else {
+                let tier = scia_tui::default_tier(&report);
+                (
+                    PresenterMode::Mosaic(tier),
+                    Some("sixel graphics unavailable; using mosaic".to_string()),
                 )
             }
         }
@@ -738,6 +758,12 @@ mod tests {
     }
 
     #[test]
+    fn presenter_sixel_flag_parses() {
+        let cli = Cli::try_parse_from(["scia", "--presenter", "sixel"]).expect("parses");
+        assert_eq!(cli.presenter, Some(PresenterTier::Sixel));
+    }
+
+    #[test]
     fn presenter_mosaic_flags_still_parse() {
         for (arg, expected) in [
             ("octant", PresenterTier::Octant),
@@ -752,6 +778,6 @@ mod tests {
 
     #[test]
     fn unknown_presenter_flag_is_rejected() {
-        assert!(Cli::try_parse_from(["scia", "--presenter", "sixel"]).is_err());
+        assert!(Cli::try_parse_from(["scia", "--presenter", "megatier"]).is_err());
     }
 }

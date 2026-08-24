@@ -26,6 +26,7 @@ mod pixel;
 mod presenter;
 mod probe;
 mod render;
+mod sixel;
 mod stats;
 
 use std::fmt;
@@ -64,6 +65,7 @@ pub use probe::{
     parse_da1, parse_decrqm_2026, probe, truecolor_from,
 };
 pub use render::{SceneNav, UiState, VERSION, draw, draw_help, draw_notice};
+pub use sixel::{SIXEL_REGISTERS, SixelEncoder, quantize as sixel_quantize};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
@@ -369,6 +371,11 @@ fn run_loop(
     let kitty_mode = matches!(opts.presenter_mode, PresenterMode::Kitty { .. });
     let mut kitty_encoder = KittyEncoder::new();
     let mut kitty_out: Vec<u8> = Vec::new();
+    // Sixel graphics state: the frame encoder and its reusable output buffer.
+    // Inert unless a sixel presenter is active.
+    let sixel_mode = matches!(opts.presenter_mode, PresenterMode::Sixel { .. });
+    let mut sixel_encoder = SixelEncoder::new();
+    let mut sixel_out: Vec<u8> = Vec::new();
 
     loop {
         let frame_start = Instant::now();
@@ -539,17 +546,17 @@ fn run_loop(
             // Scene path: draw the header/debug chrome, then rasterize the scene
             // into the body area the chrome left free.
             Some(p) => {
-                // The scene-body rect, captured inside the draw closure so the
-                // kitty image can be placed at its origin after the draw.
-                let mut kitty_body: Option<Rect> = None;
+                // The scene-body rect, captured inside the draw closure so a
+                // graphics image can be placed at its origin after the draw.
+                let mut image_body: Option<Rect> = None;
                 terminal.draw(|frame| {
                     if let Some(body) = render::draw_chrome(frame, &snap, &ui) {
                         p.resize(body.width, body.height);
                         p.frame(&snap, scene_dt);
-                        // In kitty mode `draw` paints only the text runs; the
-                        // image is written below as a graphics-protocol frame,
-                        // placed at the body origin captured here.
-                        kitty_body = Some(body);
+                        // In a pixel mode `draw` paints only the text runs; the
+                        // image is written as a graphics-protocol frame, placed at
+                        // the body origin captured here.
+                        image_body = Some(body);
                         p.draw(frame.buffer_mut(), body);
                         // The chrome personality paints over the scene, before
                         // the debug and help overlays layered above it.
@@ -584,7 +591,7 @@ fn run_loop(
                 // at the body origin — still inside the synchronized-update
                 // bracket so a supporting terminal shows image and text together.
                 if kitty_mode {
-                    if let Some(body) = kitty_body {
+                    if let Some(body) = image_body {
                         let (iw, ih) = p.image_px();
                         if iw > 0 && ih > 0 {
                             kitty_encoder.encode(
@@ -596,6 +603,29 @@ fn run_loop(
                             let mut out = io::stdout();
                             let _ = execute!(out, MoveTo(body.x, body.y));
                             let _ = out.write_all(&kitty_out);
+                            let _ = out.flush();
+                        }
+                    }
+                }
+                // Sixel mode: same seam as kitty, but the sixel bitmap paints
+                // over the body cells (there is no z-index). The cursor is moved
+                // to the body origin and the DCS stream is written there, still
+                // inside the synchronized-update bracket. A full-body overlay that
+                // ratatui drew this frame is covered until the next frame redraws
+                // its cells on top — at 60 fps that is a single frame.
+                if sixel_mode {
+                    if let Some(body) = image_body {
+                        let (iw, ih) = p.image_px();
+                        if iw > 0 && ih > 0 {
+                            sixel_encoder.encode(
+                                p.image_rgb8(),
+                                p.image_px(),
+                                p.image_k(),
+                                &mut sixel_out,
+                            );
+                            let mut out = io::stdout();
+                            let _ = execute!(out, MoveTo(body.x, body.y));
+                            let _ = out.write_all(&sixel_out);
                             let _ = out.flush();
                         }
                     }

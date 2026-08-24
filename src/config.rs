@@ -190,7 +190,7 @@ pub fn parse(text: &str) -> Config {
             Ok(tier) => Some(tier),
             Err(_) => {
                 warnings.push(format!(
-                    "config: unknown presenter `{name}`; ignoring (valid: octant, sextant, quadrant, half, kitty)"
+                    "config: unknown presenter `{name}`; ignoring (valid: octant, sextant, quadrant, half, kitty, sixel)"
                 ));
                 None
             }
@@ -370,6 +370,19 @@ mod tests {
             "#,
         );
         assert_eq!(cfg.defaults.presenter, Some(PresenterTier::Kitty));
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+    }
+
+    #[test]
+    fn sixel_presenter_parses() {
+        // The sixel presenter value validates like the mosaic tiers do.
+        let cfg = parse(
+            r#"
+            [defaults]
+            presenter = "sixel"
+            "#,
+        );
+        assert_eq!(cfg.defaults.presenter, Some(PresenterTier::Sixel));
         assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
     }
 
