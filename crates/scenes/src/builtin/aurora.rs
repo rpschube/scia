@@ -184,11 +184,11 @@ impl Aurora {
     /// Consume the preset parameters. Kept as the single point of parameter
     /// consumption so a per-frame `apply_params` hook can reuse it verbatim.
     fn read_params(&mut self, params: &Params) {
-        self.drift = params.get_or("drift", 1.0);
-        self.scale = params.get_or("scale", 1.0);
-        self.band = params.get_or("band", 0.14);
-        self.response = params.get_or("response", 0.35);
-        self.contrast = params.get_or("contrast", 2.2);
+        read_param(&mut self.drift, params, "drift");
+        read_param(&mut self.scale, params, "scale");
+        read_param(&mut self.band, params, "band");
+        read_param(&mut self.response, params, "response");
+        read_param(&mut self.contrast, params, "contrast");
     }
 }
 
@@ -213,6 +213,12 @@ impl Scene for Aurora {
         self.loud_env = 0.0;
         self.buf.clear();
         self.buf.resize(COLS * ROWS, 0.0);
+    }
+
+    fn apply_params(&mut self, params: &Params) {
+        // Tuning scalars only: wave phases, the loudness envelope and the field
+        // buffer carry across, so a live mapping never resets the drift.
+        self.read_params(params);
     }
 
     fn update(&mut self, f: &scia_core::FeatureSnapshot, dt: f32) {
@@ -322,4 +328,20 @@ fn shape_contrast(v: f32, c: f32) -> f32 {
     let t = (v - 0.5) * 2.0; // -1..1
     let s = t.signum() * t.abs().powf(1.0 / c);
     0.5 + 0.5 * s
+}
+
+/// Refresh one tuning scalar from `params` in place. When `key` is present, the
+/// value is stored clamped to that parameter's manifest `[min, max]`; when
+/// absent, the slot keeps its current value. The clamp matters because a mapping
+/// writes `offset + scale * env`, which can leave the range validated at preset
+/// load. Allocation-free: a linear scan of the bag and the static manifest.
+#[inline]
+fn read_param(slot: &mut f32, params: &Params, key: &str) {
+    if let Some(v) = params.get(key) {
+        let spec = PARAMS
+            .iter()
+            .find(|s| s.key == key)
+            .expect("key is an aurora parameter");
+        *slot = v.clamp(spec.min, spec.max);
+    }
 }
