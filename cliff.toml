@@ -1,0 +1,75 @@
+# git-cliff ~ configuration file
+# https://git-cliff.org/docs/configuration
+#
+# Changelog generation runs at release time only (`just changelog vX.Y.Z`),
+# never during a normal build. Conventional-commit types map to fixed sections;
+# commit and compare links point at the public repository.
+
+[changelog]
+# The changelog header.
+header = "# Changelog\n"
+# A Tera template rendered for each release.
+# See https://keats.github.io/tera/docs/#introduction
+body = """
+{% if version %}\
+    {% if previous.version %}\
+        ## [{{ version | trim_start_matches(pat="v") }}](<REPO>/compare/{{ previous.version }}...{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+    {% else %}\
+        ## [{{ version | trim_start_matches(pat="v") }}](<REPO>/releases/tag/{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+    {% endif %}\
+{% else %}\
+    ## [unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {% if commit.breaking %}**BREAKING** {% endif %}\
+            {{ commit.message | upper_first }} \
+            ([{{ commit.id | truncate(length=7, end="") }}](<REPO>/commit/{{ commit.id }}))\
+    {% endfor %}
+{% endfor %}
+"""
+# Remove leading and trailing whitespaces from the changelog's body.
+trim = true
+# An array of regex based postprocessors to modify the changelog.
+postprocessors = [
+    # Point every link at the public repository.
+    { pattern = '<REPO>', replace = "https://github.com/rpschube/scia" },
+]
+
+[git]
+# Parse commits according to the conventional commits specification.
+# See https://www.conventionalcommits.org
+conventional_commits = true
+# Exclude commits that do not match the conventional commits specification
+# (merge commits among them).
+filter_unconventional = true
+# Split commits on newlines, treating each line as an individual commit.
+split_commits = false
+# Prevent breaking-change commits from being excluded by commit parsers.
+protect_breaking_commits = true
+# An array of regex based parsers for extracting data from the commit message.
+# Assigns commits to groups; the <!-- N --> prefixes fix section order and are
+# stripped from the rendered heading.
+commit_parsers = [
+    { message = "^Merge ", skip = true },
+    { message = "^feat", group = "<!-- 0 -->Features" },
+    { message = "^fix", group = "<!-- 1 -->Bug fixes" },
+    { message = "^perf", group = "<!-- 2 -->Performance" },
+    { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+    { message = "^docs", group = "<!-- 4 -->Documentation" },
+    { message = "^test", group = "<!-- 5 -->Testing" },
+    { message = "^build", group = "<!-- 6 -->Maintenance" },
+    { message = "^ci", group = "<!-- 6 -->Maintenance" },
+    { message = "^chore", group = "<!-- 6 -->Maintenance" },
+    { message = "^revert", group = "<!-- 7 -->Reverts" },
+]
+# Exclude commits not matched by any parser (all repo-allowed types are mapped).
+filter_commits = true
+# Only tags matching this glob are treated as releases.
+tag_pattern = "v[0-9].*"
+# Order releases chronologically.
+topo_order = false
+# Order commits within each group oldest first.
+sort_commits = "oldest"
