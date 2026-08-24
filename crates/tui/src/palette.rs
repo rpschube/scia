@@ -8,10 +8,13 @@ use ratatui::style::Color;
 pub const LABEL_FG: Color = Color::Rgb(20, 20, 24);
 /// Background of the highlighted demo label (amber, impossible to miss).
 pub const LABEL_BG: Color = Color::Rgb(240, 180, 40);
-/// The `starved` state indicator.
+/// The `starved`/`idle` state indicator.
 pub const STARVED: Color = Color::Rgb(230, 120, 40);
-/// The `live` state indicator.
+/// The `live`/`active` state indicator.
 pub const LIVE: Color = Color::Rgb(120, 200, 120);
+/// The `quiet` activity indicator: signal present but below the quiet
+/// threshold.
+pub const QUIET: Color = Color::Rgb(210, 200, 120);
 /// The debug line.
 pub const DEBUG: Color = Color::Rgb(150, 150, 160);
 

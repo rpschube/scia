@@ -8,7 +8,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
-use scia_core::{EngineStats, FeatureSnapshot};
+use scia_core::{Activity, EngineStats, FeatureSnapshot};
 
 use crate::palette;
 
@@ -29,6 +29,11 @@ pub struct UiState {
     /// Header label, highlighted so demo mode can never be read as live
     /// capture. `None` for live capture.
     pub label: Option<String>,
+    /// Live-capture source description shown in the centre when [`label`] is
+    /// `None`, e.g. `"48000 Hz 2 ch"`. Ignored while a demo label is set.
+    ///
+    /// [`label`]: UiState::label
+    pub source: String,
     /// Whether the debug line is currently shown.
     pub debug: bool,
     /// Measured frame rate for the debug line.
@@ -67,13 +72,14 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
     }
 }
 
-/// Header: `scia <version>` at the left, the centred highlighted label, and the
-/// `starved`/`live` state with the generation at the right.
+/// Header: `scia <version>` at the left, a centred label — the highlighted demo
+/// label, or `live · <format>` for live capture — and the activity state with
+/// the generation at the right.
 fn render_header(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiState) {
     let y = rect.y;
     let max = rect.width as usize;
 
-    // Draw the centred label first so the edge texts win any collision on a
+    // Draw the centred text first so the edge texts win any collision on a
     // narrow terminal; the state indicator must always remain legible.
     if let Some(label) = &ui.label {
         let lw = label.chars().count() as u16;
@@ -83,6 +89,23 @@ fn render_header(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiSt
             .bg(palette::LABEL_BG)
             .add_modifier(Modifier::BOLD);
         buf.set_stringn(lx, y, label, max, hl);
+    } else {
+        // Live capture: name the source in the centre so a live session reads as
+        // live and shows its negotiated format.
+        let centre = if ui.source.is_empty() {
+            "live".to_string()
+        } else {
+            format!("live · {}", ui.source)
+        };
+        let cw = centre.chars().count() as u16;
+        let cx = rect.x + rect.width.saturating_sub(cw) / 2;
+        buf.set_stringn(
+            cx,
+            y,
+            &centre,
+            max,
+            Style::new().fg(palette::LIVE).add_modifier(Modifier::BOLD),
+        );
     }
 
     let left = format!("scia {VERSION}");
@@ -94,16 +117,38 @@ fn render_header(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiSt
         Style::new().add_modifier(Modifier::BOLD),
     );
 
-    let state = if snap.starved { "starved" } else { "live" };
-    let right = format!("{state}  gen {}", snap.generation);
+    // Right indicator reflects the engine's activity state, not the raw
+    // starved bit, so `quiet` and `idle` are distinguishable at a glance.
+    let activity = ui.stats.activity;
+    let right = format!("{}  gen {}", activity_label(activity), snap.generation);
     let rw = right.chars().count() as u16;
     let rx = rect.x + rect.width.saturating_sub(rw);
-    let state_style = if snap.starved {
-        Style::new().fg(palette::STARVED)
-    } else {
-        Style::new().fg(palette::LIVE)
-    };
-    buf.set_stringn(rx, y, &right, max, state_style);
+    buf.set_stringn(
+        rx,
+        y,
+        &right,
+        max,
+        Style::new().fg(activity_color(activity)),
+    );
+}
+
+/// The short indicator word for an [`Activity`].
+fn activity_label(activity: Activity) -> &'static str {
+    match activity {
+        Activity::Active => "active",
+        Activity::Quiet => "quiet",
+        Activity::Idle => "idle",
+    }
+}
+
+/// The header colour for an [`Activity`]: green while active, amber once quiet,
+/// orange once idle.
+fn activity_color(activity: Activity) -> ratatui::style::Color {
+    match activity {
+        Activity::Active => palette::LIVE,
+        Activity::Quiet => palette::QUIET,
+        Activity::Idle => palette::STARVED,
+    }
 }
 
 /// Body: one vertical bar per output column, spread across the full width.
@@ -148,7 +193,8 @@ fn render_body(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot) {
 fn render_debug(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiState) {
     let s = &ui.stats;
     let line = format!(
-        "fps {:.1}  frame p50 {:.2}ms p99 {:.2}ms  gen {}  hops {}/{}  dropped {}  agc {:.2}",
+        "fps {:.1}  frame p50 {:.2}ms p99 {:.2}ms  gen {}  hops {}/{}  dropped {}  agc {:.2}  \
+         act {}  push {}  gap {:.1}ms",
         ui.fps_measured,
         ui.p50_frame_ms,
         ui.p99_frame_ms,
@@ -157,6 +203,9 @@ fn render_debug(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiSta
         s.hops_synthesized,
         s.dropped_frames,
         s.agc_gain,
+        activity_label(s.activity),
+        s.pushes,
+        s.max_gap_ms,
     );
     buf.set_stringn(
         rect.x,
