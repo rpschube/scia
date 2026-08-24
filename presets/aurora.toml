@@ -1,0 +1,68 @@
+# aurora — the calm interference-field preset.
+#
+# This is a copy-and-edit template: every table and key the preset format
+# understands appears here, either set or shown in a comment. See
+# docs/presets.md for the full reference (types, ranges, the feature
+# vocabulary, curve formulas, envelope semantics and the error format).
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric).
+name = "aurora"
+# Required. A registered scene id. `aurora` is the calm interference field.
+scene = "aurora"
+# Optional. A one-line human description.
+description = "A slow interference field: drifting wavefronts under a bright band that breathes with loudness."
+# Optional. A one-word mood; defaults to the scene's own mood ("serene").
+mood = "serene"
+
+# Typed parameters for the preset's scene. Every key must exist in the scene's
+# parameter manifest; every value is a number within the stated range. Omitted
+# keys keep their manifest default.
+[params]
+# drift     1.0    range 0.0..=4.0    field speed: scales how fast the wavefronts move
+drift = 1.0
+# scale     1.0    range 0.2..=4.0    spatial frequency: how many wave cycles span the field
+scale = 1.0
+# band      0.14   range 0.02..=0.5   base band half-width (fraction of height) at silence
+band = 0.14
+# response  0.35   range 0.0..=1.0    loudness-to-width gain: extra band half-width at full loudness
+response = 0.35
+# contrast  2.2    range 1.0..=4.0    contrast shaping: higher pushes darks darker and brights brighter
+contrast = 2.2
+
+# Optional layer stack. With no [[layer]] tables the preset is exactly one
+# layer: [preset].scene with [params]. Each layer names its own scene, an
+# optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0); [layer.params] is typed against THAT layer's scene manifest and
+# merges over its defaults. When layers are present, [map] targets the FIRST
+# layer's scene.
+#
+# [[layer]]
+# scene = "aurora"
+# blend = "over"
+# intensity = 1.0
+# [layer.params]
+# scale = 1.4
+
+# Feature -> parameter mappings. Each key is a parameter of the mapped scene;
+# each value is a table naming a feature and a response. A string value here is
+# reserved for the expression VM (a later card) and is rejected today.
+#
+# feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
+# curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+[map]
+# Widen the band with loudness on a slow, calm envelope: nearly a second to
+# swell in, a second and a half to settle back. Keeps the result inside band's
+# 0.02..=0.5 range (offset 0.1, plus up to scale 0.3).
+band = { feature = "loud", curve = "linear", attack_ms = 800, decay_ms = 1500, scale = 0.3, offset = 0.1 }
+
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries; only meaningful with a
+# static source. Omit to use the host default palette. A cool aurora ramp:
+# deep indigo through teal and green to violet, then three neutrals.
+slots = ["#0a1a3f", "#0f5f6f", "#17a08a", "#3fd0b0", "#9a6bff", "#12141c", "#8a8f9c", "#e6e8ee"]

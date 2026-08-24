@@ -1,7 +1,7 @@
 //! The built-in scene registry: enumerate the scenes compiled into this crate
 //! and construct one by id.
 
-use crate::builtin::{Lattice, Spectra, lattice, spectra};
+use crate::builtin::{Aurora, Lattice, Spectra, aurora, lattice, spectra};
 use crate::scene::{ParamSpec, Scene};
 
 /// A catalog entry describing a built-in scene, for a browser to list.
@@ -37,6 +37,12 @@ static BUILTINS: &[SceneInfo] = &[
         summary: "A calm dot lattice; onsets fire rings that ripple outward and loudness sets the base glow.",
         params: lattice::PARAMS,
     },
+    SceneInfo {
+        id: "aurora",
+        mood: "serene",
+        summary: "A slow interference field: drifting wavefronts under a bright band that breathes with loudness.",
+        params: aurora::PARAMS,
+    },
 ];
 
 /// The catalog of built-in scenes.
@@ -57,6 +63,7 @@ pub fn create_builtin(id: &str) -> Option<Box<dyn Scene>> {
     match id {
         "spectra" => Some(Box::new(Spectra::new())),
         "lattice" => Some(Box::new(Lattice::new())),
+        "aurora" => Some(Box::new(Aurora::new())),
         _ => None,
     }
 }
