@@ -130,13 +130,56 @@ impl CaptureBackend for CpalBackend {
         let stream = build_stream(&device, supported, sink)?;
         Ok(Box::new(stream))
     }
+
+    fn route_id(&self) -> Option<String> {
+        // The stable identity of the device `open` would bind to right now: its
+        // cpal display name. Shares the exact device-resolution logic `open`
+        // uses (default output/input per host, or the named device), so a change
+        // in the OS default route shows up here as a different name. Only the
+        // name is resolved — no config negotiation — so this stays cheap enough
+        // for the route watcher to poll every few hundred ms. Enumeration
+        // failure or a missing device maps to `None`, and the watcher then
+        // leans on stream health alone.
+        self.resolve_device()
+            .ok()
+            .map(|(device, _)| device.to_string())
+    }
+}
+
+/// Which default-config direction a resolved device is opened with. WASAPI and
+/// the PipeWire sink-monitor path open the default *output* endpoint as a
+/// loopback input, so they negotiate against its output config; plain ALSA,
+/// Core Audio and the fallback open a real input device. Each platform (and
+/// feature) only ever constructs one direction, so a variant is dead on any
+/// single target — expected, like the enumeration helpers below.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum ConfigDir {
+    Output,
+    Input,
 }
 
 impl CpalBackend {
     /// Resolve the device and its default stream configuration for the current
-    /// platform.
-    #[cfg(target_os = "windows")]
+    /// platform. Device selection is shared with [`route_id`](CpalBackend::route_id)
+    /// through [`resolve_device`](CpalBackend::resolve_device); only the
+    /// config-negotiation step is added here.
     fn resolve(&self) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CaptureError> {
+        let (device, dir) = self.resolve_device()?;
+        let supported = match dir {
+            ConfigDir::Output => device.default_output_config(),
+            ConfigDir::Input => device.default_input_config(),
+        }
+        .map_err(map_cpal_err)?;
+        Ok((device, supported))
+    }
+
+    /// Resolve just the device (and the config direction it is opened with) for
+    /// the current platform, without negotiating a stream config. Shared by
+    /// `open`/`resolve` and by `route_id`, so both always agree on which device
+    /// the backend would bind to.
+    #[cfg(target_os = "windows")]
+    fn resolve_device(&self) -> Result<(cpal::Device, ConfigDir), CaptureError> {
         // System mix = the default output endpoint, opened as an input
         // (shared-mode loopback).
         let host = cpal::default_host();
@@ -146,14 +189,12 @@ impl CpalBackend {
             }
             DeviceSelector::Named(name) => find_by_name(output_devices(&host)?, name)?,
         };
-        let supported = device.default_output_config().map_err(map_cpal_err)?;
-        Ok((device, supported))
+        Ok((device, ConfigDir::Output))
     }
 
-    /// Resolve the device and its default stream configuration for the current
-    /// platform.
+    /// See the Windows [`resolve_device`](CpalBackend::resolve_device).
     #[cfg(target_os = "linux")]
-    fn resolve(&self) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CaptureError> {
+    fn resolve_device(&self) -> Result<(cpal::Device, ConfigDir), CaptureError> {
         // Prefer the PipeWire sink monitor (the real system mix) when asked and
         // available. This whole branch only compiles with the feature; the
         // fallback below is the plain-ALSA default-input path. The undocumented
@@ -169,8 +210,7 @@ impl CpalBackend {
                     }
                     DeviceSelector::Named(name) => find_by_name(output_devices(&host)?, name)?,
                 };
-                let supported = device.default_output_config().map_err(map_cpal_err)?;
-                return Ok((device, supported));
+                return Ok((device, ConfigDir::Output));
             }
         }
 
@@ -181,35 +221,30 @@ impl CpalBackend {
             DeviceSelector::Default => host.default_input_device().ok_or(CaptureError::NoDevice)?,
             DeviceSelector::Named(name) => find_by_name(input_devices(&host)?, name)?,
         };
-        let supported = device.default_input_config().map_err(map_cpal_err)?;
-        Ok((device, supported))
+        Ok((device, ConfigDir::Input))
     }
 
-    /// Resolve the device and its default stream configuration for the current
-    /// platform.
+    /// See the Windows [`resolve_device`](CpalBackend::resolve_device).
     #[cfg(target_os = "macos")]
-    fn resolve(&self) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CaptureError> {
+    fn resolve_device(&self) -> Result<(cpal::Device, ConfigDir), CaptureError> {
         // Best-effort: default input. A Core Audio system tap is a later card.
         let host = cpal::default_host();
         let device = match &self.device {
             DeviceSelector::Default => host.default_input_device().ok_or(CaptureError::NoDevice)?,
             DeviceSelector::Named(name) => find_by_name(input_devices(&host)?, name)?,
         };
-        let supported = device.default_input_config().map_err(map_cpal_err)?;
-        Ok((device, supported))
+        Ok((device, ConfigDir::Input))
     }
 
-    /// Resolve the device and its default stream configuration for the current
-    /// platform.
+    /// See the Windows [`resolve_device`](CpalBackend::resolve_device).
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    fn resolve(&self) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CaptureError> {
+    fn resolve_device(&self) -> Result<(cpal::Device, ConfigDir), CaptureError> {
         let host = cpal::default_host();
         let device = match &self.device {
             DeviceSelector::Default => host.default_input_device().ok_or(CaptureError::NoDevice)?,
             DeviceSelector::Named(name) => find_by_name(input_devices(&host)?, name)?,
         };
-        let supported = device.default_input_config().map_err(map_cpal_err)?;
-        Ok((device, supported))
+        Ok((device, ConfigDir::Input))
     }
 }
 
@@ -257,6 +292,28 @@ fn build_stream(
 
     let error_state = Arc::new(StreamErrorState::default());
     let err_state = Arc::clone(&error_state);
+    // Device-loss behaviour, confirmed against the cpal 0.18.2 sources in the
+    // cargo registry, so the engine never waits for a stream to heal itself:
+    //
+    // - WASAPI: when the active endpoint is invalidated, the run loop's
+    //   process_input/process_output surfaces `AUDCLNT_E_DEVICE_INVALIDATED`,
+    //   which `From<windows::core::Error>` maps to `ErrorKind::DeviceNotAvailable`
+    //   (src/host/wasapi/mod.rs:62-64); `run_input`/`run_output` then call
+    //   `emit_error` and `break`, so the worker thread exits and never resumes
+    //   (src/host/wasapi/stream.rs:659-712). A default-device change with no
+    //   replacement reports `DeviceNotAvailable`, one with a replacement reports
+    //   `StreamInvalidated` (src/host/wasapi/stream.rs:730-736) — cpal 0.18 does
+    //   not silently reroute, so a rebuild is always required.
+    // - ALSA: on unplug the PCM enters `State::Disconnected`, mapped to
+    //   `ErrorKind::DeviceNotAvailable` (src/host/alsa/mod.rs:1087-1092); the
+    //   input/output worker then does `error_callback(err); return;` and exits
+    //   (src/host/alsa/mod.rs:956-958, 1015-1017). Only `Xrun` is recovered in
+    //   place (prepare()/start()); `DeviceNotAvailable` is terminal.
+    //
+    // Both hosts therefore deliver device invalidation as a non-Xrun error and
+    // stop their stream thread for good. The branch below records that as a
+    // health fault, and the engine's route watcher rebuilds the stream — it must
+    // not expect the dead stream to recover on its own.
     let error_callback = move |err: cpal::Error| {
         // Off the data path: locking here is allowed.
         // A buffer under/overrun is a transient glitch (the engine dropped or
