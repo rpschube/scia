@@ -1256,12 +1256,20 @@ static AURORA_PRESET: &str = include_str!("../../../../presets/aurora.toml");
 /// The `starfall` built-in preset template.
 static STARFALL_PRESET: &str = include_str!("../../../../presets/starfall.toml");
 
+/// The `tide` built-in preset template.
+static TIDE_PRESET: &str = include_str!("../../../../presets/tide.toml");
+
+/// The `verso` built-in preset template.
+static VERSO_PRESET: &str = include_str!("../../../../presets/verso.toml");
+
 /// The built-in preset files compiled into the crate, as `(name, source)`.
 static BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("spectra", SPECTRA_PRESET),
     ("lattice", LATTICE_PRESET),
     ("aurora", AURORA_PRESET),
     ("starfall", STARFALL_PRESET),
+    ("tide", TIDE_PRESET),
+    ("verso", VERSO_PRESET),
 ];
 
 /// The built-in preset files compiled into the crate, as `(name, source)`.

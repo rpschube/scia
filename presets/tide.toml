@@ -1,0 +1,69 @@
+# tide — the stacked-swell preset.
+#
+# This is a copy-and-edit template: every table and key the preset format
+# understands appears here, either set or shown in a comment. See
+# docs/presets.md for the full reference (types, ranges, the feature
+# vocabulary, curve formulas, envelope semantics and the error format).
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric).
+name = "tide"
+# Required. A registered scene id. `tide` is the stacked drifting swells.
+scene = "tide"
+# Optional. A one-line human description.
+description = "Four stacked horizontal swells drifting at their own tempos; the front swell lifts with the low band and the field breathes with loudness."
+# Optional. A one-word mood; defaults to the scene's own mood ("fluid").
+mood = "fluid"
+
+# Typed parameters for the preset's scene. Every key must exist in the scene's
+# parameter manifest; every value is a number within the stated range. Omitted
+# keys keep their manifest default.
+[params]
+# drift     1.0    range 0.0..=4.0    swell speed: scales how fast every swell drifts sideways
+drift = 1.0
+# swell     0.12   range 0.02..=0.4   base swell amplitude (fraction of height) the ridges wave by
+swell = 0.12
+# response  0.6    range 0.0..=1.5    how strongly the front swell lifts and grows with the low band
+response = 0.6
+# level     0.6    range 0.2..=1.0    overall brightness ceiling the loudness envelope breathes under
+level = 0.6
+# contrast  2.0    range 1.0..=4.0    contrast shaping: higher pushes darks darker and brights brighter
+contrast = 2.0
+
+# Optional layer stack. With no [[layer]] tables the preset is exactly one
+# layer: [preset].scene with [params]. Each layer names its own scene, an
+# optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0); [layer.params] is typed against THAT layer's scene manifest and
+# merges over its defaults. When layers are present, [map] targets the FIRST
+# layer's scene.
+#
+# [[layer]]
+# scene = "tide"
+# blend = "over"
+# intensity = 1.0
+# [layer.params]
+# swell = 0.18
+
+# Feature -> parameter mappings. Each key is a parameter of the mapped scene;
+# each value is either a table naming a feature and a response, or a string
+# expression over the feature vocabulary (evaluated per frame).
+#
+# feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
+# curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+[map]
+# Let the mids add a little swell amplitude on a slow, calm envelope — an axis
+# independent of the scene's own loudness breathing and low-band front lift, so
+# the mappings do not fight the built-in drivers. Stays inside swell's
+# 0.02..=0.4 range (offset 0.1, plus up to scale 0.12).
+swell = { feature = "mid", curve = "linear", attack_ms = 250, decay_ms = 700, scale = 0.12, offset = 0.1 }
+
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries; only meaningful with a
+# static source. Omit to use the host default palette. A tidewater ramp: deep
+# navy through teal and aqua to a pale crest, then three neutrals.
+slots = ["#06203a", "#0a4d6b", "#127a8f", "#4fc3c9", "#bfeef0", "#0a0e16", "#8a8f9c", "#e6e8ee"]

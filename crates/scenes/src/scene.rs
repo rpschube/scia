@@ -178,6 +178,20 @@ pub trait Scene: Send {
     /// no-op for scenes with no live-tunable parameters.
     fn apply_params(&mut self, _params: &Params) {}
 
+    /// Apply an external text value to the scene, keyed by a short name.
+    ///
+    /// Unlike [`apply_params`](Scene::apply_params), the host calls this **only
+    /// when the value changes** — for example when the now-playing track line
+    /// changes — never per frame. An implementation may therefore allocate (it
+    /// can rebuild a letter list, reassign bands, and so on); the cost is paid
+    /// on change, not on the frame path. `key` names which text changed
+    /// (`"track"` is the only key today); an implementation should ignore keys
+    /// it does not recognize, and an empty value means "no text".
+    ///
+    /// Defaults to a no-op: only a scene that renders host text (for example
+    /// `verso`, whose letters *are* the analyzer) overrides it.
+    fn apply_text(&mut self, _key: &str, _value: &str) {}
+
     /// Fold the newest features into internal state. `dt` is seconds elapsed
     /// since the previous `update`.
     fn update(&mut self, f: &scia_core::FeatureSnapshot, dt: f32);

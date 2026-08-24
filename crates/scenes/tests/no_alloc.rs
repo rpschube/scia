@@ -268,3 +268,85 @@ fn starfall_update_render_does_not_allocate() {
         strays.join("\n---\n")
     );
 }
+
+/// The `tide` scene must not allocate per frame once warmed: its field buffer is
+/// sized at init and overwritten in place, and the canvas retains capacity.
+#[test]
+fn tide_update_render_does_not_allocate() {
+    let mut scene = create_builtin("tide").expect("tide exists");
+    scene.init(&SceneCtx::default());
+    let mut canvas = Canvas::new(16.0 / 9.0);
+
+    let mut f = FeatureSnapshot {
+        rms: 0.5,
+        ..FeatureSnapshot::default()
+    };
+    f.bands = [1.5, 1.0, 0.8];
+
+    // Warm up: grow the field buffer and the canvas arena to steady state.
+    for _ in 0..8 {
+        scene.update(&f, 0.016);
+        canvas.clear();
+        scene.render(&mut canvas);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..500 {
+            scene.update(&f, 0.016);
+            canvas.clear();
+            scene.render(&mut canvas);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "tide update/render allocated {} time(s) across 500 frames:\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
+
+/// The `verso` scene must not allocate per frame in steady state: after the text
+/// is set the letter list and trail ring are fixed, single-char glyphs encode
+/// into a stack buffer, and the canvas retains capacity. The text is set BEFORE
+/// the measured window — the only allocation verso does is the letter rebuild
+/// inside `apply_text`, which is off the frame path.
+#[test]
+fn verso_update_render_does_not_allocate() {
+    let mut scene = create_builtin("verso").expect("verso exists");
+    scene.init(&SceneCtx::default());
+    scene.apply_text("track", "steady state title");
+    let mut canvas = Canvas::new(16.0 / 9.0);
+
+    // A spectrum with signal so letters move and the trail keeps spawning.
+    let mut f = FeatureSnapshot {
+        spectrum_len: scia_core::SPECTRUM_BINS as u16,
+        ..FeatureSnapshot::default()
+    };
+    for (i, b) in f.spectrum.iter_mut().enumerate() {
+        *b = 0.3 + 0.5 * ((i % 7) as f32) / 7.0;
+    }
+
+    // Warm up: settle the letter values, fill the trail ring, and grow the canvas
+    // to steady capacity.
+    for _ in 0..40 {
+        scene.update(&f, 0.05);
+        canvas.clear();
+        scene.render(&mut canvas);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..500 {
+            scene.update(&f, 0.05);
+            canvas.clear();
+            scene.render(&mut canvas);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "verso update/render allocated {} time(s) across 500 frames:\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
