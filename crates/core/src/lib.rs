@@ -45,7 +45,7 @@ pub use backends::wasapi_perf::{
 };
 pub use backends::wasapi_route::RouteNotifier;
 pub use bands::{BandConfig, BandSplitter};
-pub use beat::{BeatEstimate, BeatTracker};
+pub use beat::{BeatCandidate, BeatDebug, BeatEstimate, BeatTracker};
 pub use bus::{FeatureReader, FeatureWriter, feature_bus};
 pub use capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, RING_FRAMES, SampleConsumer,

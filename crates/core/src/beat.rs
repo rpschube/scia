@@ -115,6 +115,50 @@ pub struct BeatEstimate {
     pub confidence: f32,
 }
 
+/// One comb candidate the last induction pass considered: its tempo and the
+/// weighted comb score that ranked it. Diagnostic only.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BeatCandidate {
+    /// Candidate tempo in BPM (the period's fundamental).
+    pub bpm: f32,
+    /// The Rayleigh-weighted comb score that ranked this candidate.
+    pub score: f32,
+}
+
+/// Read-only snapshot of the beat tracker's internal induction state, purely
+/// for diagnostics and calibration probes — nothing here is ever read back by
+/// the tracker and it has no effect on tracking. The induction-derived fields
+/// (`kurtosis`, `comb_energy`, `candidate_bpm`, `top`, `inductions`) are filled
+/// on each induction pass; the per-hop fields (`odf_level`, `confidence`,
+/// `locked`, `tempo_bpm`) reflect the live state at the moment
+/// [`BeatTracker::debug_stats`] is called.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BeatDebug {
+    /// Short-term ODF level EMA driving the fast silence gate (live).
+    pub odf_level: f32,
+    /// Kurtosis of the ODF window at the last induction pass (the impulsiveness
+    /// the confidence gate reads).
+    pub kurtosis: f32,
+    /// Raw (un-normalized) comb energy summed at the winning period on the last
+    /// pass — `best_comb`, before the tap-weight normalization and kurtosis gate.
+    pub comb_energy: f32,
+    /// Tempo (BPM) of the winning refined period on the last pass, whether or not
+    /// the tracker locked it. `0.0` when the last window was flat/silent.
+    pub candidate_bpm: f32,
+    /// Smoothed confidence in `0.0..=1.0` (live).
+    pub confidence: f32,
+    /// Whether the tracker currently holds a tempo lock (live).
+    pub locked: bool,
+    /// Published tempo in BPM, `0.0` while unlocked (live).
+    pub tempo_bpm: f32,
+    /// The three highest-scoring comb candidates on the last pass, best first.
+    /// Zeroed entries pad a pass that found fewer (or a flat window).
+    pub top: [BeatCandidate; 3],
+    /// Count of induction passes run so far. A probe watches it change to know a
+    /// fresh pass has landed.
+    pub inductions: u64,
+}
+
 /// Causal beat tracker over a stream of ODF (spectral-flux) values. Construct
 /// once for a given sample rate and hop size; [`process_hop`](Self::process_hop)
 /// is then allocation-free.
@@ -154,6 +198,11 @@ pub struct BeatTracker {
     confidence: f32,
     tempo_bpm: f32,
     odf_level: f32,
+
+    /// Read-only diagnostic mirror of the last induction pass. Written only by
+    /// `induct`, read only by [`debug_stats`](Self::debug_stats); never consulted
+    /// by the tracker.
+    debug: BeatDebug,
 }
 
 impl BeatTracker {
@@ -216,6 +265,7 @@ impl BeatTracker {
             confidence: 0.0,
             tempo_bpm: 0.0,
             odf_level: 0.0,
+            debug: BeatDebug::default(),
         }
     }
 
@@ -289,6 +339,7 @@ impl BeatTracker {
         self.confidence = 0.0;
         self.tempo_bpm = 0.0;
         self.odf_level = 0.0;
+        self.debug = BeatDebug::default();
     }
 
     /// One induction pass: autocorrelate the ODF window, comb-filter and
@@ -296,6 +347,9 @@ impl BeatTracker {
     /// confidence and the lock state, and (when locked) track the period and
     /// re-align the phase to the recent ODF peaks. Allocation-free.
     fn induct(&mut self) {
+        // Count every pass (including a flat-window early return) so a probe can
+        // tell a fresh pass has landed. Diagnostic only.
+        self.debug.inductions += 1;
         let w = self.filled;
 
         // Copy the window into `work` in chronological order (oldest → newest)
@@ -335,6 +389,11 @@ impl BeatTracker {
                 self.locked = false;
                 self.tempo_bpm = 0.0;
             }
+            // Diagnostic: a flat pass has no candidates.
+            self.debug.kurtosis = kurtosis;
+            self.debug.comb_energy = 0.0;
+            self.debug.candidate_bpm = 0.0;
+            self.debug.top = [BeatCandidate::default(); 3];
             return;
         }
 
@@ -432,6 +491,31 @@ impl BeatTracker {
             self.locked = false;
             self.tempo_bpm = 0.0;
         }
+
+        // Diagnostic mirror of this pass: the winning-period energy, the tempo of
+        // the refined winning period, and the three top-scoring candidates. This
+        // is a read-only pass over the scores already computed above — it writes
+        // only `self.debug` and never feeds back into tracking.
+        let mut top = [BeatCandidate::default(); 3];
+        for idx in 0..self.score.len() {
+            let cand = BeatCandidate {
+                bpm: 60.0 / ((self.min_lag + idx) as f32 * self.dt),
+                score: self.score[idx],
+            };
+            for slot in 0..top.len() {
+                if cand.score > top[slot].score {
+                    for j in (slot + 1..top.len()).rev() {
+                        top[j] = top[j - 1];
+                    }
+                    top[slot] = cand;
+                    break;
+                }
+            }
+        }
+        self.debug.kurtosis = kurtosis;
+        self.debug.comb_energy = best_comb;
+        self.debug.candidate_bpm = 60.0 / (refined * self.dt);
+        self.debug.top = top;
     }
 
     /// Best beat-grid offset (in hops before the newest sample) for period
@@ -494,6 +578,22 @@ impl BeatTracker {
     #[must_use]
     pub fn is_locked(&self) -> bool {
         self.locked
+    }
+
+    /// Read-only snapshot of the tracker's internal induction state, for
+    /// diagnostics and calibration probes only (see [`BeatDebug`]). It combines
+    /// the last induction pass's mirror with the live per-hop state; it is
+    /// allocation-free, never consulted by the tracker, and has no effect on
+    /// tracking or on the published [`BeatEstimate`].
+    #[must_use]
+    pub fn debug_stats(&self) -> BeatDebug {
+        BeatDebug {
+            odf_level: self.odf_level,
+            confidence: self.confidence,
+            locked: self.locked,
+            tempo_bpm: self.tempo_bpm(),
+            ..self.debug
+        }
     }
 }
 
