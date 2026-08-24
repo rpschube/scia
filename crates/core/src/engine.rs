@@ -37,6 +37,15 @@ pub struct EngineConfig {
     pub route_watch: bool,
     /// How often the route watcher polls. Default 250 ms.
     pub route_poll: Duration,
+    /// Opt in to Windows perf mode: on start (and on every capture reopen)
+    /// capability-detect the default render endpoint and, when a faster engine
+    /// period exists, hold a companion silent render stream that pulls the
+    /// endpoint — and the loopback capture on it — down to that period. Default
+    /// `false`. Evaluated only when the `perf-mode` feature is compiled in and
+    /// the platform is Windows; anywhere else the engine reports
+    /// [`PerfModeState::Unavailable`] and captures unchanged. See
+    /// [`Engine::perf_mode_state`].
+    pub perf_mode: bool,
 }
 
 impl Default for EngineConfig {
@@ -46,8 +55,31 @@ impl Default for EngineConfig {
             dsp: DspConfig::default(),
             route_watch: true,
             route_poll: Duration::from_millis(250),
+            perf_mode: false,
         }
     }
+}
+
+/// The runtime state of Windows perf mode, read with [`Engine::perf_mode_state`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum PerfModeState {
+    /// Perf mode was not requested (`EngineConfig::perf_mode` was `false`).
+    Off,
+    /// A companion render stream is holding the endpoint at a fast engine
+    /// period; the loopback capture inherits it.
+    Active {
+        /// The engine period the companion stream runs at, in frames.
+        period_frames: u32,
+        /// The endpoint mix-format sample rate the period is measured against.
+        sample_rate: u32,
+    },
+    /// Perf mode was requested but could not be engaged. `reason` is a one-line
+    /// explanation: not Windows, no render endpoint, the endpoint is locked to
+    /// its default period, or the companion stream failed to open.
+    Unavailable {
+        /// Why perf mode is not active.
+        reason: String,
+    },
 }
 
 /// A snapshot of pipeline counters.
@@ -106,6 +138,14 @@ struct Route {
     format: StreamFormat,
     route_id: Option<String>,
     target: CaptureTarget,
+    /// The companion perf-mode render stream, when perf mode is active. It lives
+    /// and dies with the capture stream: re-created on each reopen (on the new
+    /// endpoint) and dropped at shutdown. `None` when perf mode is off,
+    /// unavailable, or not yet evaluated. Held purely as an RAII guard — its
+    /// value is never read back, only dropped — so `dead_code` is allowed.
+    #[cfg(feature = "perf-mode")]
+    #[allow(dead_code)]
+    perf: Option<crate::backends::wasapi_perf::PerfModeStream>,
 }
 
 /// State shared between the engine handle and the `scia-route` watcher thread.
@@ -120,6 +160,14 @@ struct Shared {
     request: AtomicBool,
     reopens: AtomicU64,
     reopen_failures: AtomicU64,
+    /// Whether perf mode was requested (`EngineConfig::perf_mode`). When set,
+    /// start and every successful reopen re-evaluate perf mode on the current
+    /// default render endpoint. Only read when the `perf-mode` feature is
+    /// compiled in; a feature-off build stores it but never consults it.
+    #[cfg_attr(not(feature = "perf-mode"), allow(dead_code))]
+    perf_mode: bool,
+    /// The latest perf-mode state, refreshed on start and every reopen.
+    perf_state: Mutex<PerfModeState>,
 }
 
 impl Shared {
@@ -141,6 +189,13 @@ impl Shared {
                 route.format = format;
                 route.route_id = route.backend.route_id();
                 self.reopens.fetch_add(1, Ordering::Relaxed);
+                // Re-evaluate perf mode on the (possibly new) endpoint: a device
+                // switch drops the old companion stream and re-detects on the new
+                // one. Still under the route lock, before the old stream is joined.
+                #[cfg(feature = "perf-mode")]
+                if self.perf_mode {
+                    self.evaluate_perf(&mut route);
+                }
                 // Release the route lock before joining the old stream's thread.
                 drop(route);
                 drop(old);
@@ -173,6 +228,67 @@ impl Shared {
             Some(current) => route.route_id.as_deref() != Some(current.as_str()),
             None => false,
         }
+    }
+
+    /// (Re-)evaluate perf mode for the default render endpoint and store the
+    /// resulting [`PerfModeState`]. Drops any existing companion stream first
+    /// (the endpoint may have changed), then, on Windows with a faster period
+    /// available, opens a fresh companion stream and holds it in `route`. Called
+    /// under the route lock from `start` and every successful `reopen`.
+    ///
+    /// The perf-mode evaluation queries the OS default render endpoint, which is
+    /// independent of the capture backend — so it neither reads from nor
+    /// disturbs a non-cpal (e.g. synthetic) backend.
+    #[cfg(feature = "perf-mode")]
+    fn evaluate_perf(&self, route: &mut Route) {
+        // Drop any prior companion stream before re-detecting; on a device
+        // switch the previous endpoint's stream must not linger.
+        route.perf = None;
+
+        #[cfg(windows)]
+        let state = {
+            use crate::backends::cpal::DeviceSelector;
+            use crate::backends::wasapi_perf::{
+                PerfModeAvailability, PerfModeConfig, PerfModeStream, availability,
+            };
+
+            let config = PerfModeConfig {
+                device: DeviceSelector::Default,
+                require_fast: true,
+            };
+            match availability(&config) {
+                PerfModeAvailability::Available { .. } => match PerfModeStream::open(&config) {
+                    Ok(stream) => {
+                        let info = stream.info();
+                        route.perf = Some(stream);
+                        PerfModeState::Active {
+                            period_frames: info.chosen_period_frames,
+                            sample_rate: info.sample_rate,
+                        }
+                    }
+                    Err(e) => PerfModeState::Unavailable {
+                        reason: format!("companion stream failed to open: {e}"),
+                    },
+                },
+                PerfModeAvailability::DriverLocked { info } => {
+                    let ms = f64::from(info.default_period_frames) * 1000.0
+                        / f64::from(info.sample_rate.max(1));
+                    PerfModeState::Unavailable {
+                        reason: format!(
+                            "endpoint is locked to its {} ({ms:.3} ms) engine period",
+                            info.default_period_frames
+                        ),
+                    }
+                }
+                PerfModeAvailability::Unsupported(reason) => PerfModeState::Unavailable { reason },
+            }
+        };
+        #[cfg(not(windows))]
+        let state = PerfModeState::Unavailable {
+            reason: "perf mode is Windows-only".to_string(),
+        };
+
+        *self.perf_state.lock().unwrap_or_else(|e| e.into_inner()) = state;
     }
 }
 
@@ -236,13 +352,35 @@ impl Engine {
                 format,
                 route_id,
                 target: config.target,
+                #[cfg(feature = "perf-mode")]
+                perf: None,
             }),
             stats,
             swap,
             request: AtomicBool::new(false),
             reopens: AtomicU64::new(0),
             reopen_failures: AtomicU64::new(0),
+            perf_mode: config.perf_mode,
+            perf_state: Mutex::new(PerfModeState::Off),
         });
+
+        // Evaluate perf mode once before the watcher can race a reopen. Only the
+        // `perf-mode` feature on Windows can actually engage it; every other
+        // build reports it unavailable when it was requested.
+        if config.perf_mode {
+            #[cfg(feature = "perf-mode")]
+            {
+                let mut route = shared.route.lock().unwrap_or_else(|e| e.into_inner());
+                shared.evaluate_perf(&mut route);
+            }
+            #[cfg(not(feature = "perf-mode"))]
+            {
+                *shared.perf_state.lock().unwrap_or_else(|e| e.into_inner()) =
+                    PerfModeState::Unavailable {
+                        reason: "perf mode requires the perf-mode feature".to_string(),
+                    };
+            }
+        }
 
         let watch_join = if config.route_watch {
             let shared = Arc::clone(&shared);
@@ -298,6 +436,19 @@ impl Engine {
     #[must_use]
     pub fn now_ns(&self) -> u64 {
         self.shared.stats.now_ns()
+    }
+
+    /// The current [`PerfModeState`]: [`PerfModeState::Off`] when perf mode was
+    /// not requested, [`PerfModeState::Active`] when a companion stream is
+    /// holding the endpoint at a fast period, or [`PerfModeState::Unavailable`]
+    /// with a reason. Refreshed on start and on every successful reopen.
+    #[must_use]
+    pub fn perf_mode_state(&self) -> PerfModeState {
+        self.shared
+            .perf_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Current pipeline counters.
@@ -375,9 +526,14 @@ impl Engine {
         if let Some(join) = self.dsp_join.take() {
             let _ = join.join();
         }
-        // Dropping the stream stops the capture thread and joins it.
+        // Dropping the stream stops the capture thread and joins it; dropping the
+        // companion perf stream stops and joins its render thread too.
         let mut route = self.shared.route.lock().unwrap_or_else(|e| e.into_inner());
         route.stream.take();
+        #[cfg(feature = "perf-mode")]
+        {
+            route.perf = None;
+        }
     }
 }
 
