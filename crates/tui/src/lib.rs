@@ -39,7 +39,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use scia_core::{Activity, EngineStats, FeatureReader, StreamHealth};
-use scia_scenes::{Preset, ReloadEvent};
+use scia_scenes::{Preset, ReloadEvent, builtin_preset, builtin_scenes};
 
 pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
 pub use presenter::{SceneError, ScenePresenter, build_scene_presenter};
@@ -47,7 +47,7 @@ pub use probe::{
     CapabilityReport, Da1, SyncSupport, TermFamily, classify_family, default_tier, parse_cell_size,
     parse_da1, parse_decrqm_2026, probe, truecolor_from,
 };
-pub use render::{UiState, VERSION, draw, draw_notice};
+pub use render::{SceneNav, UiState, VERSION, draw, draw_notice};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
@@ -271,6 +271,17 @@ fn run_loop(
     mut presenter: Option<ScenePresenter>,
 ) -> io::Result<RunSummary> {
     let mut frame_times = stats::FrameTimes::new();
+    // The browser and live cycling navigate the built-in scenes, so they are
+    // enabled only on the built-in `--scene` path: a presenter is running and it
+    // was built from a registry name, not a disk preset (whose live-authored
+    // file must not be swapped out for a built-in). Cycling then starts from the
+    // `--scene` id.
+    let scene_mode = presenter.is_some() && opts.preset.is_none() && opts.scene.is_some();
+    let initial_scene = opts
+        .scene
+        .as_deref()
+        .and_then(|name| builtin_scenes().iter().position(|s| s.id == name))
+        .unwrap_or(0);
     let mut ui = UiState {
         label: opts.label.clone(),
         source: opts.source.clone(),
@@ -280,6 +291,8 @@ fn run_loop(
         // A scene presenter surfaces its ladder rung on the debug line; the
         // direct-bars renderer leaves it unset.
         tier: presenter.as_ref().map(|p| p.tier().label()),
+        scene_mode,
+        scene_nav: SceneNav::new(initial_scene),
         ..UiState::default()
     };
     // Frame period fed to the scene presenter; seeded to the target period.
@@ -311,6 +324,20 @@ fn run_loop(
         prev_frame_start = Some(frame_start);
 
         let snap = *reader.latest();
+
+        // Apply a scene switch the browser/cycle keys requested on the previous
+        // frame, then age the cycle toast on the frame clock. The switch reuses
+        // the presenter's crossfade path (the same one hot reload uses); a rapid
+        // sequence of moves collapses to the latest target, retargeting one fade
+        // rather than blanking between them.
+        if let Some(id) = ui.scene_nav.take_pending() {
+            if let Some(p) = presenter.as_mut() {
+                if let Some(Ok(preset)) = builtin_preset(id) {
+                    p.swap_preset(&preset);
+                }
+            }
+        }
+        ui.scene_nav.tick(dt);
 
         // Refresh the engine counters first: activity feeds the idle downshift.
         ui.stats = stats();
@@ -401,6 +428,9 @@ fn run_loop(
                         if ui.overlay {
                             render::render_overlay(frame.buffer_mut(), body, &snap, &ui);
                         }
+                        // The browser panel and cycle toast paint over the live
+                        // scene, like the meter bridge, so they draw after it.
+                        render::draw_scene_nav(frame.buffer_mut(), body, &ui.scene_nav);
                     }
                     // The reload notice lands on top of the scene body, so it
                     // draws after the presenter rather than inside the chrome.
@@ -478,19 +508,60 @@ enum Action {
 /// toggles.
 fn handle_event(event: Event, ui: &mut UiState) -> Action {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
-            KeyCode::Char('d') => {
-                ui.debug = !ui.debug;
-                Action::Redraw
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            let browsing = ui.scene_mode && ui.scene_nav.is_open();
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
+                KeyCode::Char('q') => Action::Quit,
+                // Esc closes the browser (restoring the original scene) while it
+                // is open; only outside the browser does it quit.
+                KeyCode::Esc => {
+                    if browsing {
+                        ui.scene_nav.cancel();
+                        Action::Redraw
+                    } else {
+                        Action::Quit
+                    }
+                }
+                // Tab toggles the browser overlay.
+                KeyCode::Tab if ui.scene_mode => {
+                    ui.scene_nav.toggle_browser();
+                    Action::Redraw
+                }
+                // Up/k and Down/j move the highlight while browsing.
+                KeyCode::Up | KeyCode::Char('k') if browsing => {
+                    ui.scene_nav.highlight_prev();
+                    Action::Redraw
+                }
+                KeyCode::Down | KeyCode::Char('j') if browsing => {
+                    ui.scene_nav.highlight_next();
+                    Action::Redraw
+                }
+                // Enter accepts the highlighted scene and closes the browser.
+                KeyCode::Enter if browsing => {
+                    ui.scene_nav.accept();
+                    Action::Redraw
+                }
+                // Left/Right cycle scenes directly, only outside the browser.
+                KeyCode::Left if ui.scene_mode && !browsing => {
+                    ui.scene_nav.cycle_prev();
+                    Action::Redraw
+                }
+                KeyCode::Right if ui.scene_mode && !browsing => {
+                    ui.scene_nav.cycle_next();
+                    Action::Redraw
+                }
+                KeyCode::Char('d') => {
+                    ui.debug = !ui.debug;
+                    Action::Redraw
+                }
+                KeyCode::Char('`') => {
+                    ui.overlay = !ui.overlay;
+                    Action::Redraw
+                }
+                _ => Action::None,
             }
-            KeyCode::Char('`') => {
-                ui.overlay = !ui.overlay;
-                Action::Redraw
-            }
-            _ => Action::None,
-        },
+        }
         Event::Resize(_, _) => Action::Redraw,
         _ => Action::None,
     }
@@ -537,5 +608,161 @@ mod tests {
         let _ = handle_event(press(KeyCode::Char('`')), &mut ui);
         assert!(ui.debug);
         assert!(ui.overlay);
+    }
+
+    /// A UiState with the browser/cycle keys live, as the loop sets it on the
+    /// built-in `--scene` path. The registry order is spectra, lattice, aurora,
+    /// starfall.
+    fn scene_ui() -> UiState {
+        UiState {
+            scene_mode: true,
+            ..UiState::default()
+        }
+    }
+
+    #[test]
+    fn tab_toggles_browser_and_esc_restores_original() {
+        let mut ui = scene_ui();
+        // Closed: Esc quits.
+        assert!(matches!(
+            handle_event(press(KeyCode::Esc), &mut ui),
+            Action::Quit
+        ));
+        // Tab opens the browser on the committed scene (spectra).
+        assert!(matches!(
+            handle_event(press(KeyCode::Tab), &mut ui),
+            Action::Redraw
+        ));
+        assert!(ui.scene_nav.is_open());
+        // Highlight down previews the next scene: a switch to lattice is asked.
+        let _ = handle_event(press(KeyCode::Down), &mut ui);
+        assert_eq!(ui.scene_nav.highlight(), 1);
+        assert_eq!(ui.scene_nav.take_pending(), Some("lattice"));
+        // Esc closes and crossfades back to the original scene, not a quit.
+        assert!(matches!(
+            handle_event(press(KeyCode::Esc), &mut ui),
+            Action::Redraw
+        ));
+        assert!(!ui.scene_nav.is_open());
+        assert_eq!(
+            ui.scene_nav.take_pending(),
+            Some("spectra"),
+            "Esc asks the presenter for the original scene id"
+        );
+        // Closed again: Esc quits only now that the browser is shut.
+        assert!(matches!(
+            handle_event(press(KeyCode::Esc), &mut ui),
+            Action::Quit
+        ));
+    }
+
+    #[test]
+    fn highlight_moves_crossfade_to_the_highlighted_scene() {
+        let mut ui = scene_ui();
+        let _ = handle_event(press(KeyCode::Tab), &mut ui);
+        // `j` moves down like Down; `k` moves up like Up.
+        let _ = handle_event(press(KeyCode::Char('j')), &mut ui);
+        assert_eq!(ui.scene_nav.take_pending(), Some("lattice"));
+        let _ = handle_event(press(KeyCode::Char('j')), &mut ui);
+        assert_eq!(ui.scene_nav.take_pending(), Some("aurora"));
+        let _ = handle_event(press(KeyCode::Char('k')), &mut ui);
+        assert_eq!(ui.scene_nav.take_pending(), Some("lattice"));
+        // The highlight clamps at the top rather than wrapping.
+        let _ = handle_event(press(KeyCode::Char('k')), &mut ui);
+        assert_eq!(ui.scene_nav.take_pending(), Some("spectra"));
+        let _ = handle_event(press(KeyCode::Char('k')), &mut ui);
+        assert_eq!(ui.scene_nav.highlight(), 0);
+        assert_eq!(
+            ui.scene_nav.take_pending(),
+            None,
+            "clamped move asks nothing"
+        );
+    }
+
+    #[test]
+    fn enter_keeps_the_highlighted_scene() {
+        let mut ui = scene_ui();
+        let _ = handle_event(press(KeyCode::Tab), &mut ui);
+        let _ = handle_event(press(KeyCode::Down), &mut ui); // preview lattice
+        let _ = ui.scene_nav.take_pending(); // drain the preview switch
+        assert!(matches!(
+            handle_event(press(KeyCode::Enter), &mut ui),
+            Action::Redraw
+        ));
+        assert!(!ui.scene_nav.is_open());
+        assert_eq!(ui.scene_nav.current(), 1, "Enter commits the highlight");
+        assert_eq!(
+            ui.scene_nav.take_pending(),
+            None,
+            "the kept scene is already live; nothing to re-switch"
+        );
+        // A later Esc quits: the browser is closed.
+        assert!(matches!(
+            handle_event(press(KeyCode::Esc), &mut ui),
+            Action::Quit
+        ));
+    }
+
+    #[test]
+    fn arrows_cycle_scenes_in_registry_order_and_wrap() {
+        let mut ui = scene_ui();
+        for expected in ["lattice", "aurora", "starfall", "spectra"] {
+            assert!(matches!(
+                handle_event(press(KeyCode::Right), &mut ui),
+                Action::Redraw
+            ));
+            assert_eq!(ui.scene_nav.take_pending(), Some(expected));
+        }
+        // Left wraps backward from spectra to the last scene.
+        assert!(matches!(
+            handle_event(press(KeyCode::Left), &mut ui),
+            Action::Redraw
+        ));
+        assert_eq!(ui.scene_nav.take_pending(), Some("starfall"));
+    }
+
+    #[test]
+    fn cycle_raises_a_toast_that_expires_on_the_frame_clock() {
+        let mut ui = scene_ui();
+        let _ = handle_event(press(KeyCode::Right), &mut ui);
+        let toast = ui.scene_nav.toast_text().expect("cycling raises a toast");
+        assert!(
+            toast.contains("lattice"),
+            "toast names the scene: {toast:?}"
+        );
+        assert!(
+            toast.contains('●'),
+            "toast shows the filled position dot: {toast:?}"
+        );
+        // Just short of the ~2 s timer: still shown.
+        ui.scene_nav.tick(1.9);
+        assert!(ui.scene_nav.toast_text().is_some());
+        // Past the timer: it expires.
+        ui.scene_nav.tick(0.2);
+        assert!(
+            ui.scene_nav.toast_text().is_none(),
+            "toast expires after its timer"
+        );
+    }
+
+    #[test]
+    fn browser_keys_are_inert_without_a_scene() {
+        // Direct-bars mode leaves scene_mode off; the new keys fall through and
+        // Esc keeps its quit meaning.
+        let mut ui = UiState::default();
+        assert!(matches!(
+            handle_event(press(KeyCode::Tab), &mut ui),
+            Action::None
+        ));
+        assert!(!ui.scene_nav.is_open());
+        assert!(matches!(
+            handle_event(press(KeyCode::Right), &mut ui),
+            Action::None
+        ));
+        assert_eq!(ui.scene_nav.take_pending(), None);
+        assert!(matches!(
+            handle_event(press(KeyCode::Esc), &mut ui),
+            Action::Quit
+        ));
     }
 }

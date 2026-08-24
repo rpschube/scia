@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
 use scia_core::{Activity, EngineStats, FeatureSnapshot};
+use scia_scenes::{SceneInfo, builtin_scenes};
 
 use crate::palette;
 
@@ -61,6 +62,16 @@ pub struct UiState {
     /// bottom row, even when the debug line is off. `None` when there is nothing
     /// to report.
     pub notice: Option<String>,
+    /// Whether the scene browser and live cycling are active. Set by the render
+    /// loop when a built-in scene presenter is driving the body; the direct-bars
+    /// renderer and the disk-preset (`--scene-file`) path leave it `false`, so
+    /// the browser keys stay inert there. Modelled on
+    /// [`overlay`](UiState::overlay): a plain flag the input handler reads.
+    pub scene_mode: bool,
+    /// The scene-browser overlay and live scene-cycle state. Drawn over the live
+    /// canvas like the meter bridge when open, and consulted each frame by the
+    /// loop to retarget the presenter's crossfade.
+    pub scene_nav: SceneNav,
 }
 
 /// Compute the frame layout: the header row, the optional body area, and the
@@ -94,6 +105,9 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
         if ui.overlay {
             render_overlay(buf, body, snap, ui);
         }
+        // The browser panel and cycle toast paint over the body, last, like the
+        // meter bridge. Inert unless the browser is open or a toast is up.
+        draw_scene_nav(buf, body, &ui.scene_nav);
     }
     if let Some(debug) = debug {
         render_debug(buf, debug, snap, ui);
@@ -123,6 +137,363 @@ pub fn draw_notice(buf: &mut Buffer, area: Rect, ui: &UiState) {
         &text,
         width,
         Style::new().fg(palette::DEBUG).add_modifier(Modifier::DIM),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scene browser + live cycling
+// ---------------------------------------------------------------------------
+
+/// Seconds a scene-cycle toast stays up before it disappears. The storyboard
+/// calls for roughly two seconds.
+const TOAST_SECS: f32 = 2.0;
+
+/// A transient corner toast: a single line shown for a bounded time, its life
+/// counted down on the frame clock (no wall clock). One small reusable
+/// primitive — the design reserves it for hot-reload confirmations too, but the
+/// scene-cycle confirmation is its only wiring today.
+#[derive(Clone, Debug)]
+pub struct Toast {
+    text: String,
+    remaining: f32,
+}
+
+impl Toast {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            remaining: TOAST_SECS,
+        }
+    }
+
+    /// Advance the toast by `dt` seconds; returns whether it is still alive.
+    fn tick(&mut self, dt: f32) -> bool {
+        self.remaining -= dt.max(0.0);
+        self.remaining > 0.0
+    }
+}
+
+/// The scene-browser overlay and live scene-cycle state machine.
+///
+/// It holds the registry listing (static), the committed scene index, the
+/// browser's open/highlight/origin state, a pending switch the render loop
+/// applies to the presenter, and the cycle toast. It is pure state: the input
+/// handler drives it and the loop reads [`take_pending`](Self::take_pending)
+/// once per frame to retarget the presenter's crossfade — no blending lives
+/// here, so every transition reuses the one switch path.
+///
+/// The browser marks the committed scene and moves a separate highlight cursor;
+/// each highlight move previews live (a crossfade to the highlighted scene)
+/// without committing, so `Enter` keeps the preview and `Esc` crossfades back to
+/// the scene that was committed when the browser opened.
+#[derive(Clone, Debug)]
+pub struct SceneNav {
+    /// The built-in registry, in listing order (static).
+    scenes: &'static [SceneInfo],
+    /// The committed (marked) scene index.
+    current: usize,
+    /// Whether the browser overlay is open.
+    open: bool,
+    /// The highlight cursor while the browser is open.
+    highlight: usize,
+    /// The committed index when the browser opened, restored on `Esc`.
+    origin: usize,
+    /// A scene index the loop must crossfade the presenter to, if any.
+    pending: Option<usize>,
+    /// The live cycle toast, if showing.
+    toast: Option<Toast>,
+}
+
+impl Default for SceneNav {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl SceneNav {
+    /// Build the navigator committed to `initial` (clamped into the registry).
+    #[must_use]
+    pub fn new(initial: usize) -> Self {
+        let scenes = builtin_scenes();
+        let current = if scenes.is_empty() {
+            0
+        } else {
+            initial.min(scenes.len() - 1)
+        };
+        Self {
+            scenes,
+            current,
+            open: false,
+            highlight: current,
+            origin: current,
+            pending: None,
+            toast: None,
+        }
+    }
+
+    /// Whether the browser overlay is open.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The committed (marked) scene index.
+    #[must_use]
+    pub fn current(&self) -> usize {
+        self.current
+    }
+
+    /// The highlight cursor index.
+    #[must_use]
+    pub fn highlight(&self) -> usize {
+        self.highlight
+    }
+
+    /// The current toast text, if one is showing.
+    #[must_use]
+    pub fn toast_text(&self) -> Option<&str> {
+        self.toast.as_ref().map(|t| t.text.as_str())
+    }
+
+    /// Toggle the browser. Opening snaps the highlight to the committed scene
+    /// and remembers it for restore; a second `Tab` closes it keeping the
+    /// highlighted scene, the same as `Enter`.
+    pub fn toggle_browser(&mut self) {
+        if self.scenes.is_empty() {
+            return;
+        }
+        if self.open {
+            self.accept();
+        } else {
+            self.open = true;
+            self.origin = self.current;
+            self.highlight = self.current;
+        }
+    }
+
+    /// Commit the highlighted scene and close the browser. The highlighted scene
+    /// is already live from the last preview, so no new switch is requested.
+    pub fn accept(&mut self) {
+        if !self.open {
+            return;
+        }
+        self.current = self.highlight;
+        self.open = false;
+    }
+
+    /// Close the browser and crossfade back to the scene committed when it
+    /// opened. The committed scene never moved while browsing, so only the live
+    /// preview needs restoring.
+    pub fn cancel(&mut self) {
+        if !self.open {
+            return;
+        }
+        self.open = false;
+        if self.highlight != self.origin {
+            self.pending = Some(self.origin);
+        }
+        self.highlight = self.origin;
+    }
+
+    /// Move the highlight one scene toward the end of the list, previewing it.
+    pub fn highlight_next(&mut self) {
+        self.move_highlight(1);
+    }
+
+    /// Move the highlight one scene toward the start of the list, previewing it.
+    pub fn highlight_prev(&mut self) {
+        self.move_highlight(-1);
+    }
+
+    /// Move the highlight by `delta`, clamped to the list. A move that lands on a
+    /// new scene previews it live (a crossfade) without committing.
+    fn move_highlight(&mut self, delta: isize) {
+        if !self.open || self.scenes.is_empty() {
+            return;
+        }
+        let last = self.scenes.len() as isize - 1;
+        let next = (self.highlight as isize + delta).clamp(0, last) as usize;
+        if next != self.highlight {
+            self.highlight = next;
+            self.pending = Some(next);
+        }
+    }
+
+    /// Cycle the committed scene one step forward, wrapping, and raise a toast.
+    pub fn cycle_next(&mut self) {
+        self.cycle(1);
+    }
+
+    /// Cycle the committed scene one step backward, wrapping, and raise a toast.
+    pub fn cycle_prev(&mut self) {
+        self.cycle(-1);
+    }
+
+    /// Cycle the committed scene by `delta` in registry order (wrapping), request
+    /// the crossfade, and raise the naming toast. Inert while the browser is
+    /// open — cycling is the outside-the-browser gesture.
+    fn cycle(&mut self, delta: isize) {
+        if self.open || self.scenes.is_empty() {
+            return;
+        }
+        let n = self.scenes.len() as isize;
+        let next = (self.current as isize + delta).rem_euclid(n) as usize;
+        self.current = next;
+        self.highlight = next;
+        self.pending = Some(next);
+        self.toast = Some(Toast::new(self.toast_line(next)));
+    }
+
+    /// Age the toast on the frame clock, dropping it once its timer runs out.
+    pub fn tick(&mut self, dt: f32) {
+        if let Some(toast) = self.toast.as_mut() {
+            if !toast.tick(dt) {
+                self.toast = None;
+            }
+        }
+    }
+
+    /// Take the pending scene id the loop should crossfade the presenter to, if
+    /// any. Only the latest target survives a burst of moves, so a rapid
+    /// sequence retargets one fade rather than queuing several.
+    #[must_use]
+    pub fn take_pending(&mut self) -> Option<&'static str> {
+        let idx = self.pending.take()?;
+        self.scenes.get(idx).map(|s| s.id)
+    }
+
+    /// The toast line for a committed scene: its name plus position dots, e.g.
+    /// `lattice   · ● · ·`.
+    fn toast_line(&self, idx: usize) -> String {
+        let name = self.scenes.get(idx).map_or("", |s| s.id);
+        let mut dots = String::with_capacity(self.scenes.len().saturating_mul(2));
+        for i in 0..self.scenes.len() {
+            if i > 0 {
+                dots.push(' ');
+            }
+            dots.push(if i == idx { '●' } else { '·' });
+        }
+        format!("{name}   {dots}")
+    }
+}
+
+/// The chrome rows the browser panel needs beyond one row per scene: a title
+/// row and a bottom hint row.
+const BROWSER_CHROME_ROWS: u16 = 2;
+/// The narrowest body that still hosts the full panel; below it (or when the
+/// body is too short) the browser degrades to a single summary line.
+const BROWSER_MIN_WIDTH: u16 = 24;
+
+/// Paint the scene browser and cycle toast over the live canvas, like the meter
+/// bridge. Draw this after the presenter so it overlays the scene. Draws nothing
+/// when the browser is closed and no toast is showing.
+pub fn draw_scene_nav(buf: &mut Buffer, body: Rect, nav: &SceneNav) {
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    if let Some(text) = nav.toast_text() {
+        render_toast(buf, body, text);
+    }
+    if nav.open {
+        render_browser(buf, body, nav);
+    }
+}
+
+/// The cycle toast: a single bold line in the body's top-left corner.
+fn render_toast(buf: &mut Buffer, body: Rect, text: &str) {
+    let style = Style::new()
+        .fg(palette::LABEL_FG)
+        .bg(palette::LABEL_BG)
+        .add_modifier(Modifier::BOLD);
+    let line = format!(" {text} ");
+    buf.set_stringn(body.x, body.y, &line, body.width as usize, style);
+}
+
+/// The browser overlay: the full list panel when the body has room, otherwise a
+/// single summary line — degrading the way the meter bridge falls back to its
+/// debug line on a small pane.
+fn render_browser(buf: &mut Buffer, body: Rect, nav: &SceneNav) {
+    let needed_rows = nav.scenes.len() as u16 + BROWSER_CHROME_ROWS;
+    if body.height < needed_rows || body.width < BROWSER_MIN_WIDTH {
+        render_browser_line(buf, body, nav);
+        return;
+    }
+    render_browser_panel(buf, body, nav);
+}
+
+/// The small-pane fallback: one line naming the highlighted scene and its
+/// position, on the body's top row.
+fn render_browser_line(buf: &mut Buffer, body: Rect, nav: &SceneNav) {
+    let name = nav.scenes.get(nav.highlight).map_or("", |s| s.id);
+    let line = format!(
+        " browse {} [{}/{}] ",
+        name,
+        nav.highlight + 1,
+        nav.scenes.len()
+    );
+    let style = Style::new()
+        .fg(palette::OVERLAY_FG)
+        .bg(palette::OVERLAY_BG)
+        .add_modifier(Modifier::BOLD);
+    buf.set_stringn(body.x, body.y, &line, body.width as usize, style);
+}
+
+/// The full list panel, framed and filled, top-left of the body: a title, one
+/// row per scene (marker for the committed scene, cursor for the highlight,
+/// name and mood), and a key hint.
+fn render_browser_panel(buf: &mut Buffer, body: Rect, nav: &SceneNav) {
+    let rows = nav.scenes.len() as u16 + BROWSER_CHROME_ROWS;
+    let name_w = nav.scenes.iter().map(|s| s.id.len()).max().unwrap_or(0);
+    let mood_w = nav.scenes.iter().map(|s| s.mood.len()).max().unwrap_or(0);
+    // markers + gaps + the two separators, then clamp to the body.
+    let want = (name_w + mood_w + 8) as u16;
+    let width = want.clamp(BROWSER_MIN_WIDTH, body.width);
+    let height = rows.min(body.height);
+    let panel = Rect::new(body.x, body.y, width, height);
+
+    let fill = Style::new().bg(palette::OVERLAY_BG).fg(palette::OVERLAY_FG);
+    for dy in 0..panel.height {
+        for dx in 0..panel.width {
+            if let Some(cell) = buf.cell_mut((panel.x + dx, panel.y + dy)) {
+                cell.set_char(' ').set_style(fill);
+            }
+        }
+    }
+
+    let inner_x = panel.x + 1;
+    let inner_w = panel.width.saturating_sub(2) as usize;
+    buf.set_stringn(
+        inner_x,
+        panel.y,
+        "scenes",
+        inner_w,
+        fill.add_modifier(Modifier::BOLD),
+    );
+
+    for (i, info) in nav.scenes.iter().enumerate() {
+        let y = panel.y + 1 + i as u16;
+        // The bottom row is reserved for the hint; stop if a scene would land on
+        // or past it (a body clamped shorter than the list can happen mid-resize).
+        if y >= panel.y + panel.height - 1 {
+            break;
+        }
+        let cursor = if i == nav.highlight { '▸' } else { ' ' };
+        let mark = if i == nav.current { '●' } else { '·' };
+        let text = format!("{cursor}{mark} {} · {}", info.id, info.mood);
+        let mut style = fill;
+        if i == nav.highlight {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        buf.set_stringn(inner_x, y, &text, inner_w, style);
+    }
+
+    let hint_y = panel.y + panel.height - 1;
+    buf.set_stringn(
+        inner_x,
+        hint_y,
+        "↑↓ move · enter keep · esc back",
+        inner_w,
+        fill.add_modifier(Modifier::DIM),
     );
 }
 

@@ -9,7 +9,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 
 use scia_core::{Activity, EngineStats, FeatureSnapshot};
-use scia_tui::{UiState, draw};
+use scia_tui::{SceneNav, UiState, draw};
 
 /// Render one frame at `w`×`h` and return the resulting buffer.
 fn render(w: u16, h: u16, snap: &FeatureSnapshot, ui: &UiState) -> Buffer {
@@ -350,6 +350,49 @@ fn overlay_off_is_byte_identical_to_no_overlay() {
         },
     );
     assert_eq!(base, off, "overlay off must not change the rendered frame");
+}
+
+#[test]
+fn browser_panel_falls_back_gracefully_on_a_small_pane() {
+    // Open the browser committed to spectra (index 0) and highlight lattice
+    // (index 1), then draw it over the direct-bars body headlessly.
+    let mut nav = SceneNav::new(0);
+    nav.toggle_browser();
+    nav.highlight_next();
+    let snap = snapshot_with(&[0.3, 0.6, 0.9, 0.4]);
+    let ui = UiState {
+        scene_nav: nav,
+        ..UiState::default()
+    };
+
+    // Roomy pane: the full list renders — every scene name and its mood.
+    let big = render(120, 40, &snap, &ui);
+    let panel = rows(&big, 1, 40, 120);
+    assert!(
+        panel.contains("scenes"),
+        "full panel has a title: {panel:?}"
+    );
+    assert!(
+        panel.contains("spectra") && panel.contains("starfall"),
+        "full panel lists every scene: {panel:?}"
+    );
+    assert!(
+        panel.contains("kinetic"),
+        "full panel shows moods: {panel:?}"
+    );
+
+    // Small pane: a 4-row body cannot host the six-row list, so it degrades to a
+    // single summary line naming the highlighted scene — no panic, no full list.
+    let small = render(120, 5, &snap, &ui);
+    let body = rows(&small, 1, 5, 120);
+    assert!(
+        body.contains("lattice"),
+        "fallback names the highlighted scene: {body:?}"
+    );
+    assert!(
+        !body.contains("kinetic"),
+        "small pane must not draw the full list: {body:?}"
+    );
 }
 
 #[test]
