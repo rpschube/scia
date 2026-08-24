@@ -57,3 +57,7 @@ pub mod mpris;
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
+
+pub mod palette;
+
+pub use palette::{ArtPalette, PaletteCache, PaletteError};

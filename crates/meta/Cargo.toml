@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 scia-core = { path = "../core", version = "0.0.0" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # The MPRIS backend and its artwork fetch are Linux-only. zbus talks D-Bus on
 # its own async-io executor (no tokio, so the workspace gains no required async
