@@ -1,0 +1,205 @@
+# pipewire — Linux system-mix baseline tripwire.
+#
+# The Linux system-mix capture relies on undocumented cpal 0.18 behaviour: with
+# the PipeWire host, an `Audio/Sink` is exposed as a duplex (input-capable)
+# device and opening an *input* stream on the default sink sets
+# `PW_KEY_STREAM_CAPTURE_SINK=true`, so the stream captures the sink monitor —
+# the real system mix. That is specified only in cpal's source, so it is pinned
+# (`crates/core/Cargo.toml`, `cpal = "=0.18.2"`) and continuously verified here:
+# this job stands up a headless PipeWire session with a null sink, plays a known
+# 1 kHz tone into it, and proves the engine captures that tone through the
+# PipeWire host. It doubles as the capture smoke test. See
+# docs/probes/p2-pipewire-pin.md.
+#
+# Runs on pull requests that touch the core crate, the workspace manifests/lock,
+# or this workflow, and on every push to master. The gate and master matrices
+# stay PipeWire-free (they build without the libpipewire dev libraries); the
+# `--features capture-pipewire` build lives only in this job.
+name: pipewire
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    paths:
+      - crates/core/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/pipewire.yml
+  push:
+    branches: [master]
+
+concurrency:
+  group: pipewire-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pipewire:
+    name: pipewire
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      XDG_RUNTIME_DIR: /tmp/scia-xdg
+      SCIA_LOG_DIR: /tmp/scia-logs
+      TONE_WAV: /tmp/scia-tone.wav
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PipeWire session and audio headers
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # pipewire/wireplumber run the session; pipewire-bin has pw-cli/pw-play;
+          # pipewire-pulse + pulseaudio-utils give pactl/paplay; the -dev packages
+          # are what cpal's `pipewire` feature links; dbus provides the session bus.
+          sudo apt-get install -y -qq --no-install-recommends \
+            pipewire \
+            pipewire-bin \
+            pipewire-pulse \
+            pipewire-audio \
+            wireplumber \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libasound2-dev \
+            pulseaudio-utils \
+            dbus
+
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install --profile minimal
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A distinct prefix so this cache never collides with the gate's.
+          prefix-key: v0-pipewire
+
+      - name: Install test runner (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: Start a headless PipeWire session
+        run: |
+          set -euo pipefail
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          mkdir -p "$SCIA_LOG_DIR"
+
+          # A private session bus at a known socket path, so its address is
+          # deterministic and can be exported to later steps.
+          dbus-daemon --session --address="unix:path=$XDG_RUNTIME_DIR/bus" \
+            --nopidfile --fork
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus" >> "$GITHUB_ENV"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+
+          # Bring up the graph, detached so it survives this step: the media
+          # server, then the session manager, then the PulseAudio-compat layer.
+          setsid pipewire        >"$SCIA_LOG_DIR/pipewire.log"       2>&1 </dev/null &
+          sleep 1
+          setsid wireplumber     >"$SCIA_LOG_DIR/wireplumber.log"    2>&1 </dev/null &
+          sleep 1
+          setsid pipewire-pulse  >"$SCIA_LOG_DIR/pipewire-pulse.log" 2>&1 </dev/null &
+
+          # Wait until both the native PipeWire core and the pulse-compat server
+          # answer, or fail with the logs.
+          ready=0
+          for i in $(seq 1 30); do
+            if pw-cli info 0 >/dev/null 2>&1 && pactl info >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "PipeWire session did not come up within 30 s" >&2
+            exit 1
+          fi
+          echo "PipeWire session is up:"
+          pw-cli info 0 | sed -n '1,20p'
+          pactl info
+
+      - name: Create the null sink and make it default
+        run: |
+          set -euo pipefail
+          pactl load-module module-null-sink \
+            sink_name=scia-test-sink \
+            sink_properties=device.description=scia-test-sink
+          pactl set-default-sink scia-test-sink
+          echo "sinks:"
+          pactl list short sinks
+          echo "nodes:"
+          pw-cli ls Node
+
+      - name: Play a 1 kHz tone into the sink
+        run: |
+          set -euo pipefail
+          # A 1 kHz, amplitude 0.5, 48 kHz, stereo, 60 s WAV. One exact period is
+          # 48 samples at 48 kHz, so tile a single period rather than compute
+          # 2.88M samples one by one.
+          python3 - "$TONE_WAV" <<'PY'
+          import sys, wave, struct, math
+          path = sys.argv[1]
+          sr, secs, freq, amp = 48_000, 60, 1_000.0, 0.5
+          period = sr // int(freq)  # 48 samples, exact
+          one = b''.join(
+              struct.pack('<hh', v, v)
+              for v in (int(amp * 32767 * math.sin(2 * math.pi * k / period))
+                        for k in range(period))
+          )
+          frames = sr * secs
+          reps = frames // period
+          w = wave.open(path, 'wb')
+          w.setnchannels(2)
+          w.setsampwidth(2)
+          w.setframerate(sr)
+          w.writeframes(one * reps)
+          w.close()
+          print(f"wrote {path}: {reps * period} frames, {reps * period / sr:.0f} s")
+          PY
+
+          # Play detached into the default sink; fall back to paplay.
+          if command -v pw-play >/dev/null 2>&1; then
+            setsid pw-play "$TONE_WAV" >"$SCIA_LOG_DIR/pw-play.log" 2>&1 </dev/null &
+          else
+            setsid paplay "$TONE_WAV" >"$SCIA_LOG_DIR/pw-play.log" 2>&1 </dev/null &
+          fi
+
+          # Give the stream a moment to connect, then confirm it is playing.
+          sleep 1
+          echo "sink-inputs:"
+          pactl list short sink-inputs
+          if [ -z "$(pactl list short sink-inputs)" ]; then
+            echo "no sink-input is playing — the tone did not start" >&2
+            cat "$SCIA_LOG_DIR/pw-play.log" >&2 || true
+            exit 1
+          fi
+
+      - name: Run the PipeWire sink-capture pin test
+        run: |
+          set -euo pipefail
+          # Called directly (not through a `just` recipe): the feature set here
+          # differs from the justfile's — the gate never enables capture-pipewire
+          # because it links libpipewire, which is present only on this job.
+          SCIA_PIPEWIRE_TEST=1 cargo nextest run \
+            -p scia-core \
+            --features capture-pipewire \
+            --test pipewire \
+            --no-fail-fast \
+            --success-output immediate
+
+      - name: Dump session logs on failure
+        if: failure()
+        run: |
+          for f in pipewire wireplumber pipewire-pulse pw-play; do
+            log="$SCIA_LOG_DIR/$f.log"
+            echo "===== $log ====="
+            if [ -f "$log" ]; then
+              tail -n 200 "$log"
+            else
+              echo "(no log)"
+            fi
+          done
