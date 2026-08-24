@@ -46,7 +46,7 @@ CONFIG:
               chrome = invisible | instrument | playful | utilitarian;
               both overridden by their flags)
   [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
-              quit, chrome, now_playing, palette. A value is a single
+              quit, chrome, now_playing, palette, tuning. A value is a single
               character, a named
               key (tab, esc, left, right, up, down, enter, space, backtick), or
               ctrl+<key>. Unknown actions or unparseable keys warn and are
@@ -56,8 +56,9 @@ KEYS (defaults, all rebindable; press ? in-app for the active map):
   right/left  next / prev scene      tab    scene browser
   `           debug overlay          space  pause         q  quit
   n           now-playing panel      p      apply palette
-  c           cycle chrome           esc    back (browser) / quit
-  ?           toggle help
+  c           cycle chrome           t      tuning strip
+  esc         back (browser/tuning) / quit  ?  toggle help
+  tuning:     tab param · ←/→ adjust · w write preset · esc done
 
 EXIT CODES:
   0  success            1  runtime error         2  usage / unsupported
@@ -473,6 +474,8 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         initial_notice,
         keymap,
         chrome: resolved.chrome,
+        scene_file: cli.scene_file.clone(),
+        config_dir: config::config_dir(),
     };
 
     let outcome = run(
@@ -588,6 +591,8 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         initial_notice,
         keymap,
         chrome: resolved.chrome,
+        scene_file: cli.scene_file.clone(),
+        config_dir: config::config_dir(),
     };
 
     let outcome = run(

@@ -15,6 +15,7 @@ use crate::chrome::ChromeState;
 use crate::keymap::{InputAction, Keymap};
 use crate::nowplaying::{self, NowPlayingState};
 use crate::palette;
+use crate::tuning::TuningStrip;
 
 /// Version string shown in the header, resolved from Cargo metadata.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -105,6 +106,15 @@ pub struct UiState {
     /// The chrome-personality state: the active mode plus its fade / wave / toast
     /// timers, advanced by the frame `dt`.
     pub chrome: ChromeState,
+    /// The quick tuning strip model: the parameters on show, the selection, and
+    /// the keys adjusted this session. Drawn over the body bottom when open.
+    pub tuning: TuningStrip,
+    /// A one-shot request from the tuning key to open the strip, consumed by the
+    /// render loop (which owns the presenter it seeds the strip from).
+    pub tuning_open_pending: bool,
+    /// A one-shot request from the strip's write key, consumed by the render loop
+    /// to write the adjusted values back to the preset file.
+    pub tuning_write_pending: bool,
 }
 
 impl UiState {

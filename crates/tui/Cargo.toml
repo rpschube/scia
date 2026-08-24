@@ -16,3 +16,6 @@ crossterm = "0.29"
 # zlib compression of kitty-graphics image payloads (US-TUI-3). Default features
 # use the pure-Rust miniz_oxide backend; already present in the workspace tree.
 flate2 = "1"
+# Comment-preserving TOML editing for the tuning strip's preset write-back
+# (US-UX-5). Already in the workspace tree via `toml`, so it adds no new version.
+toml_edit = "0.25"

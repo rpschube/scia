@@ -15,7 +15,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
 use scia_scenes::{
-    Blend, Canvas, LayerInstance, Palette, Params, Preset, Rgb, builtin_preset, builtin_presets,
+    Blend, Canvas, LayerInstance, Palette, ParamSpec, Params, Preset, Rgb, builtin_preset,
+    builtin_presets, scene_info,
 };
 
 use crate::mosaic::{CellGrid, FrameBuffer, TextRun, Tier};
@@ -185,6 +186,66 @@ impl ScenePresenter {
     pub fn set_text(&mut self, key: &str, value: &str) {
         for layer in self.layers.iter_mut().chain(self.outgoing.iter_mut()) {
             layer.scene.apply_text(key, value);
+        }
+    }
+
+    /// The first layer's scene id, if any layer exists. The tuning strip drives
+    /// the first layer, so its manifest, values and mappings are all read from
+    /// this scene.
+    #[must_use]
+    pub fn layer0_scene_id(&self) -> Option<&'static str> {
+        self.layers.first().map(|l| l.scene.id())
+    }
+
+    /// The first layer's scene parameter manifest, or an empty slice when there
+    /// is no layer or the scene is unknown.
+    #[must_use]
+    pub fn layer0_specs(&self) -> &'static [ParamSpec] {
+        self.layer0_scene_id()
+            .and_then(scene_info)
+            .map_or(&[], |i| i.params)
+    }
+
+    /// The current value of a first-layer parameter: the layer-0 params bag
+    /// value, falling back to the manifest default when the bag has no entry
+    /// (and `0.0` when the key is not a manifest key at all).
+    #[must_use]
+    pub fn layer0_value(&self, key: &str) -> f32 {
+        self.params
+            .first()
+            .and_then(|p| p.get(key))
+            .or_else(|| {
+                self.layer0_specs()
+                    .iter()
+                    .find(|s| s.key == key)
+                    .map(|s| s.default)
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// Whether a first-layer parameter is driven by a `[map]` entry. Derived
+    /// from the layer's mapping set: seeding a fresh bag inserts exactly the
+    /// mapping target keys, so a key present afterwards is mapped. A mapped key's
+    /// live adjustment is overwritten each frame by the mapping, so the strip
+    /// annotates it.
+    #[must_use]
+    pub fn layer0_mapped(&self, key: &str) -> bool {
+        let Some(layer) = self.layers.first() else {
+            return false;
+        };
+        let mut probe = Params::new();
+        layer.mappings.seed(&mut probe);
+        probe.get(key).is_some()
+    }
+
+    /// Set a first-layer parameter in the layer-0 params bag, so the value takes
+    /// effect on the next frame's [`Scene::apply_params`](scia_scenes::Scene::apply_params).
+    /// A `[map]`-driven key is overwritten by its mapping each frame (the write
+    /// still lands as the base an unmapped read would see); an unmapped key
+    /// changes the running scene on the same frame.
+    pub fn set_param(&mut self, key: &str, v: f32) {
+        if let Some(p) = self.params.first_mut() {
+            p.set(key, v);
         }
     }
 
@@ -850,6 +911,53 @@ mod tests {
                 "the forwarded track line `zephyr` should draw `{ch}`: {after:?}"
             );
         }
+    }
+
+    #[test]
+    fn set_param_changes_what_the_scene_sees_next_frame() {
+        // spectra's `gap` is an unmapped manifest key, so a set_param write
+        // survives the per-frame mapping pass and both reads back from the bag
+        // and visibly changes the rendered frame.
+        let preset = builtin_preset("spectra")
+            .expect("spectra is a built-in preset")
+            .expect("spectra parses");
+        let mut p = ScenePresenter::from_preset(&preset, Tier::Half);
+        let (cols, rows) = (24u16, 12u16);
+        p.resize(cols, rows);
+
+        // A varied spectrum with signal so bars (and their gaps) render, matching
+        // the setup the palette-fade test uses to get a steady spectra geometry.
+        let mut snap = FeatureSnapshot::default();
+        for (i, bar) in snap.spectrum.iter_mut().enumerate() {
+            *bar = 0.4 + 0.5 * ((i % 5) as f32) / 5.0;
+        }
+        snap.spectrum_len = snap.spectrum.len() as u16;
+
+        // The manifest default and the bag agree before any write.
+        assert!((p.layer0_value("gap") - 0.15).abs() < 1e-6);
+        assert!(p.layer0_specs().iter().any(|s| s.key == "gap"));
+        assert!(!p.layer0_mapped("gap"), "gap is unmapped in spectra");
+        assert!(p.layer0_mapped("punch"), "punch is mapped in spectra");
+
+        // Warm the bars to a steady height so the gap change is visible.
+        for _ in 0..80 {
+            p.frame(&snap, 0.05);
+        }
+        let before = snapshot_buffer(&p, cols, rows);
+
+        // Narrow the bars dramatically (a near-max gap); the change reads back
+        // from the bag and, once the next frames apply it, thins the bars.
+        p.set_param("gap", 0.9);
+        assert!((p.layer0_value("gap") - 0.9).abs() < 1e-6, "bag read back");
+        for _ in 0..10 {
+            p.frame(&snap, 0.05);
+        }
+        let after = snapshot_buffer(&p, cols, rows);
+
+        assert_ne!(
+            before, after,
+            "an unmapped param set through set_param changes the rendered frame"
+        );
     }
 
     #[test]
