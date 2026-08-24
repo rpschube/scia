@@ -28,3 +28,10 @@ triple_buffer = "9"
 [dependencies.cpal]
 version = "0.18"
 optional = true
+
+[dev-dependencies]
+# Golden-file DSP tests only: WAV fixture I/O and JSON golden files. None of
+# these reach the shipped library — they are test/example scaffolding.
+hound = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
