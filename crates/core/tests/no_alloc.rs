@@ -2,38 +2,15 @@
 //! counting global allocator wraps the system allocator and records every
 //! allocation; the hot loop must not move the counter.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+mod support {
+    pub mod alloc_watch;
+}
 
 use scia_core::backends::convert::{Downmix, f32_id, i16_to_f32};
 use scia_core::spectrum::{SpectrumAnalyzer, SpectrumConfig};
 use scia_core::{HopProcessor, StreamFormat, sample_ring};
-
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-struct CountingAllocator;
-
-// SAFETY: this is a test-only allocator that only counts allocations and
-// forwards every call unchanged to the system allocator. The library crate
-// itself is `#![forbid(unsafe_code)]`; integration tests are separate crates.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc_zeroed(layout) }
-    }
-}
+use std::time::Instant;
+use support::alloc_watch::{CountingAllocator, watch};
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
@@ -57,19 +34,19 @@ fn hot_path_does_not_allocate() {
         let _ = processor.try_process(&mut consumer, format, 0, 0);
     }
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for _ in 0..200 {
-        sink.push(&chunk);
-        let snapshot = processor.try_process(&mut consumer, format, 0, 0);
-        assert!(snapshot.is_some());
-    }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..200 {
+            sink.push(&chunk);
+            let snapshot = processor.try_process(&mut consumer, format, 0, 0);
+            assert!(snapshot.is_some());
+        }
+    });
 
-    assert_eq!(
-        after,
-        before,
-        "hot path allocated {} time(s)",
-        after - before
+    assert!(
+        stray_count == 0,
+        "hot path allocated {} time(s):\n{}",
+        stray_count,
+        strays.join("\n---\n")
     );
 }
 
@@ -102,19 +79,19 @@ fn idle_path_does_not_allocate() {
         let _ = processor.process_idle(&mut consumer, format, 0, 0, resume_rms);
     }
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for _ in 0..200 {
-        sink.push(&silence);
-        let snapshot = processor.process_idle(&mut consumer, format, 0, 0, resume_rms);
-        assert!(snapshot.is_some());
-    }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..200 {
+            sink.push(&silence);
+            let snapshot = processor.process_idle(&mut consumer, format, 0, 0, resume_rms);
+            assert!(snapshot.is_some());
+        }
+    });
 
-    assert_eq!(
-        after,
-        before,
-        "idle path allocated {} time(s)",
-        after - before
+    assert!(
+        stray_count == 0,
+        "idle path allocated {} time(s):\n{}",
+        stray_count,
+        strays.join("\n---\n")
     );
 }
 
@@ -156,20 +133,20 @@ fn full_hop_path_does_not_allocate() {
         let _ = processor.try_process(&mut consumer, format, 0, 0);
     }
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for _ in 0..200 {
-        fill(&mut chunk, &mut frame);
-        sink.push(&chunk);
-        let snapshot = processor.try_process(&mut consumer, format, 0, 0);
-        assert!(snapshot.is_some());
-    }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..200 {
+            fill(&mut chunk, &mut frame);
+            sink.push(&chunk);
+            let snapshot = processor.try_process(&mut consumer, format, 0, 0);
+            assert!(snapshot.is_some());
+        }
+    });
 
-    assert_eq!(
-        after,
-        before,
-        "full hop path allocated {} time(s)",
-        after - before
+    assert!(
+        stray_count == 0,
+        "full hop path allocated {} time(s):\n{}",
+        stray_count,
+        strays.join("\n---\n")
     );
 }
 
@@ -190,17 +167,17 @@ fn spectrum_analyzer_hot_path_does_not_allocate() {
         analyzer.process_hop(&mono, dt, &mut out);
     }
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for _ in 0..200 {
-        analyzer.process_hop(&mono, dt, &mut out);
-    }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..200 {
+            analyzer.process_hop(&mono, dt, &mut out);
+        }
+    });
 
-    assert_eq!(
-        after,
-        before,
-        "spectrum analyzer allocated {} time(s)",
-        after - before
+    assert!(
+        stray_count == 0,
+        "spectrum analyzer allocated {} time(s):\n{}",
+        stray_count,
+        strays.join("\n---\n")
     );
 }
 
@@ -224,19 +201,19 @@ fn converter_downmix_does_not_allocate() {
         dm2.mix_frames(&input_i16, i16_to_f32, &mut out);
     }
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for _ in 0..200 {
-        let n6 = dm6.mix_frames(&input6, f32_id, &mut out);
-        assert_eq!(n6, frames * 2);
-        let n2 = dm2.mix_frames(&input_i16, i16_to_f32, &mut out);
-        assert_eq!(n2, frames * 2);
-    }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..200 {
+            let n6 = dm6.mix_frames(&input6, f32_id, &mut out);
+            assert_eq!(n6, frames * 2);
+            let n2 = dm2.mix_frames(&input_i16, i16_to_f32, &mut out);
+            assert_eq!(n2, frames * 2);
+        }
+    });
 
-    assert_eq!(
-        after,
-        before,
-        "converter/downmix allocated {} time(s)",
-        after - before
+    assert!(
+        stray_count == 0,
+        "converter/downmix allocated {} time(s):\n{}",
+        stray_count,
+        strays.join("\n---\n")
     );
 }

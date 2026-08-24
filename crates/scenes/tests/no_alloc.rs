@@ -2,35 +2,12 @@
 //! wraps the system allocator; filling and clearing a warmed canvas must not
 //! move the counter. Same shape as `crates/core/tests/no_alloc.rs`.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+mod support {
+    pub mod alloc_watch;
+}
 
 use scia_scenes::{Canvas, Style};
-
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-struct CountingAllocator;
-
-// SAFETY: a test-only allocator that only counts allocations and forwards every
-// call unchanged to the system allocator. The library crate itself is
-// `#![forbid(unsafe_code)]`; integration tests are separate crates.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc_zeroed(layout) }
-    }
-}
+use support::alloc_watch::{CountingAllocator, watch};
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
@@ -62,17 +39,17 @@ fn canvas_retains_capacity() {
     }
     assert_eq!(canvas.primitives().len(), 500);
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for _ in 0..100 {
-        canvas.clear();
-        fill(&mut canvas);
-    }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..100 {
+            canvas.clear();
+            fill(&mut canvas);
+        }
+    });
 
-    assert_eq!(
-        after,
-        before,
-        "canvas allocated {} time(s) across 100 clear/refill cycles",
-        after - before
+    assert!(
+        stray_count == 0,
+        "canvas allocated {} time(s) across 100 clear/refill cycles:\n{}",
+        stray_count,
+        strays.join("\n---\n")
     );
 }
