@@ -263,6 +263,22 @@ impl SpectrumAnalyzer {
         &self.bars_meta
     }
 
+    /// The most recent main-FFT magnitude spectrum (window-sum normalized),
+    /// indexed by bin `0..=fft_main/2`. Bin `k` sits at `k * sample_rate /
+    /// fft_main` Hz. Exposed so sibling analyses (bands, onsets) can consume the
+    /// spectrum without recomputing an FFT; valid after the first
+    /// [`SpectrumAnalyzer::process_hop`].
+    pub(crate) fn mag_main(&self) -> &[f32] {
+        &self.mag_main
+    }
+
+    /// The most recent bass-FFT magnitude spectrum (window-sum normalized),
+    /// indexed by bin `0..=fft_bass/2`. Bin `k` sits at `k * sample_rate /
+    /// fft_bass` Hz. See [`SpectrumAnalyzer::mag_main`].
+    pub(crate) fn mag_bass(&self) -> &[f32] {
+        &self.mag_bass
+    }
+
     /// Append one hop of mono samples, recompute the spectrum, and write the
     /// `bars()` bar values (each in `0.0..=1.0`) into `out[..bars()]`.
     /// `dt_seconds` is the wall-clock duration of the hop, used for the

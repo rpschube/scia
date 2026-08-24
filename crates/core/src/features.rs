@@ -58,13 +58,18 @@ pub struct FeatureSnapshot {
     ///
     /// [`spectrum`]: FeatureSnapshot::spectrum
     pub spectrum_len: u16,
-    /// Bass / mid / treble band energies. Reserved (all 0) in schema 1.
+    /// Bass / mid / treble band levels, each normalized against that band's own
+    /// recent long-term average: `1.0` is the average level, `> 1.0` a swell,
+    /// `< 1.0` a dip. Clamped to `0.0..=4.0`.
     pub bands: [f32; 3],
-    /// Spectral flux for this hop. Reserved, 0 in schema 1.
+    /// Half-wave-rectified spectral flux for this hop, normalized against a slow
+    /// peak tracker. Range `0.0..=1.0`.
     pub flux: f32,
-    /// Onset detected on this hop. Reserved, `false` in schema 1.
+    /// `true` when an onset (transient) was detected on this hop.
     pub onset: bool,
-    /// Milliseconds since the last onset. Reserved, 0 in schema 1.
+    /// Milliseconds since the last onset, counting up from engine start and
+    /// saturating at `60_000.0` (the value that means "no recent onset"). Range
+    /// `0.0..=60_000.0`.
     pub onset_age_ms: f32,
     /// Beat phase in `0.0..1.0`. Reserved, 0 in schema 1.
     pub beat_phase: f32,
