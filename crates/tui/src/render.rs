@@ -50,30 +50,52 @@ pub struct UiState {
     pub tier: Option<&'static str>,
 }
 
+/// Compute the frame layout: the header row, the optional body area, and the
+/// optional debug row. The debug row takes the bottom line only when it is
+/// enabled and a body row still survives. Returns `None` for a degenerate
+/// zero-area frame.
+fn layout(area: Rect, debug: bool) -> Option<(Rect, Option<Rect>, Option<Rect>)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let header = Rect::new(area.x, area.y, area.width, 1);
+    let debug_rows: u16 = u16::from(debug && area.height >= 3);
+    let body_height = area.height.saturating_sub(1 + debug_rows);
+    let body = (body_height > 0).then(|| Rect::new(area.x, area.y + 1, area.width, body_height));
+    let debug_rect =
+        (debug_rows == 1).then(|| Rect::new(area.x, area.y + area.height - 1, area.width, 1));
+    Some((header, body, debug_rect))
+}
+
 /// Paint one frame: header row, spectrum body, and (when enabled) the debug
 /// line. Safe for any terminal size, including degenerate zero-area frames.
 pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
     let area = frame.area();
-    if area.width == 0 || area.height == 0 {
+    let Some((header, body, debug)) = layout(area, ui.debug) else {
         return;
-    }
+    };
     let buf = frame.buffer_mut();
-
-    // Header is always the top row.
-    let header = Rect::new(area.x, area.y, area.width, 1);
     render_header(buf, header, snap, ui);
-
-    // The debug line takes the bottom row, but only if a body row survives.
-    let debug_rows: u16 = u16::from(ui.debug && area.height >= 3);
-    let body_height = area.height.saturating_sub(1 + debug_rows);
-    if body_height > 0 {
-        let body = Rect::new(area.x, area.y + 1, area.width, body_height);
+    if let Some(body) = body {
         render_body(buf, body, snap);
     }
-    if debug_rows == 1 {
-        let debug = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+    if let Some(debug) = debug {
         render_debug(buf, debug, snap, ui);
     }
+}
+
+/// Paint only the header and debug-line chrome and return the body area, so a
+/// scene presenter can rasterize into the body itself. Returns `None` for a
+/// degenerate frame, or `Some(None)` when the chrome leaves no body row.
+pub fn draw_chrome(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) -> Option<Rect> {
+    let area = frame.area();
+    let (header, body, debug) = layout(area, ui.debug)?;
+    let buf = frame.buffer_mut();
+    render_header(buf, header, snap, ui);
+    if let Some(debug) = debug {
+        render_debug(buf, debug, snap, ui);
+    }
+    body
 }
 
 /// Header: `scia <version>` at the left, a centred label — the highlighted demo

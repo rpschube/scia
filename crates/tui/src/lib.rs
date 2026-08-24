@@ -19,9 +19,11 @@ mod mosaic;
 mod pacing;
 mod palette;
 mod presenter;
+mod probe;
 mod render;
 mod stats;
 
+use std::fmt;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
@@ -38,7 +40,11 @@ use ratatui::backend::CrosstermBackend;
 use scia_core::{Activity, EngineStats, FeatureReader, StreamHealth};
 
 pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
-pub use presenter::ScenePresenter;
+pub use presenter::{SceneError, ScenePresenter, build_scene_presenter};
+pub use probe::{
+    CapabilityReport, Da1, SyncSupport, TermFamily, classify_family, default_tier, parse_cell_size,
+    parse_da1, parse_decrqm_2026, probe, truecolor_from,
+};
 pub use render::{UiState, VERSION, draw};
 
 /// The crate name, resolved at compile time from Cargo metadata.
@@ -62,6 +68,14 @@ pub struct TuiOptions {
     pub frames: Option<u64>,
     /// Start with the debug line visible.
     pub debug: bool,
+    /// Built-in scene preset to render, by name. `None` runs the direct
+    /// spectrum-bar renderer (the byte-identical legacy path); `Some(name)`
+    /// drives the [`ScenePresenter`] on the selected [`tier`](Self::tier).
+    pub scene: Option<String>,
+    /// The mosaic tier to render a scene at. `None` means the caller did not
+    /// force one; [`run`] then falls back to [`Tier::default`]. Ignored when
+    /// [`scene`](Self::scene) is `None`.
+    pub tier: Option<Tier>,
 }
 
 impl Default for TuiOptions {
@@ -72,6 +86,8 @@ impl Default for TuiOptions {
             source: String::new(),
             frames: None,
             debug: false,
+            scene: None,
+            tier: None,
         }
     }
 }
@@ -104,19 +120,73 @@ pub struct RunSummary {
 /// [`StreamHealth::Errored`] the loop leaves the terminal cleanly and returns a
 /// [`RunSummary`] whose [`error`](RunSummary::error) carries the message.
 ///
+/// When `opts.scene` is `Some(name)`, the scene presenter is built from the
+/// built-in preset *before* the terminal is touched, so an unknown or invalid
+/// preset returns [`RunError::Scene`] cleanly with the terminal untouched. The
+/// caller turns that into a usage error (exit 2) listing the available names.
+///
 /// # Errors
-/// Returns any I/O error from terminal setup, drawing, or input polling. The
-/// terminal is restored before the error is returned.
+/// [`RunError::Scene`] for a missing/invalid `--scene` preset, or
+/// [`RunError::Io`] for any I/O error from terminal setup, drawing, or input
+/// polling. The terminal is restored before an I/O error is returned.
 pub fn run(
     reader: FeatureReader,
     stats: impl FnMut() -> EngineStats,
     health: impl FnMut() -> StreamHealth,
     opts: TuiOptions,
-) -> io::Result<RunSummary> {
+) -> Result<RunSummary, RunError> {
     install_panic_hook();
+    // Build the scene presenter first: a bad preset must fail with the terminal
+    // still in its normal state.
+    let presenter = match &opts.scene {
+        Some(name) => Some(build_scene_presenter(name, opts.tier.unwrap_or_default())?),
+        None => None,
+    };
     let mut guard = TerminalGuard::enter()?;
     // The guard restores the terminal on every exit path, including `?`.
-    run_loop(&mut guard.terminal, reader, stats, health, &opts)
+    Ok(run_loop(
+        &mut guard.terminal,
+        reader,
+        stats,
+        health,
+        &opts,
+        presenter,
+    )?)
+}
+
+/// How [`run`] can fail: a bad `--scene` preset, or an I/O error.
+#[derive(Debug)]
+pub enum RunError {
+    /// The requested scene preset was missing or invalid. The [`Display`] is a
+    /// user-facing message; the caller reports it as a usage error (exit 2).
+    ///
+    /// [`Display`]: std::fmt::Display
+    Scene(SceneError),
+    /// An I/O error from terminal setup, drawing, or input polling.
+    Io(io::Error),
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RunError::Scene(e) => write!(f, "{e}"),
+            RunError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
+
+impl From<SceneError> for RunError {
+    fn from(e: SceneError) -> Self {
+        RunError::Scene(e)
+    }
+}
+
+impl From<io::Error> for RunError {
+    fn from(e: io::Error) -> Self {
+        RunError::Io(e)
+    }
 }
 
 /// Owns the terminal for the lifetime of a run and restores it on drop, so
@@ -167,6 +237,7 @@ fn run_loop(
     mut stats: impl FnMut() -> EngineStats,
     mut health: impl FnMut() -> StreamHealth,
     opts: &TuiOptions,
+    mut presenter: Option<ScenePresenter>,
 ) -> io::Result<RunSummary> {
     let mut frame_times = stats::FrameTimes::new();
     let mut ui = UiState {
@@ -174,8 +245,13 @@ fn run_loop(
         source: opts.source.clone(),
         debug: opts.debug,
         fps_measured: opts.fps as f32,
+        // A scene presenter surfaces its ladder rung on the debug line; the
+        // direct-bars renderer leaves it unset.
+        tier: presenter.as_ref().map(|p| p.tier().label()),
         ..UiState::default()
     };
+    // Frame period fed to the scene presenter; seeded to the target period.
+    let default_dt = 1.0 / opts.fps.max(1) as f32;
 
     let mut frames: u64 = 0;
     // When the current continuous starvation began, if any.
@@ -186,9 +262,11 @@ fn run_loop(
 
     loop {
         let frame_start = Instant::now();
+        let mut dt = default_dt;
         if let Some(prev) = prev_frame_start {
             let period = frame_start.duration_since(prev).as_secs_f32();
             if period > 0.0 {
+                dt = period;
                 // Light EMA so the reading is stable but still tracks changes.
                 fps_ema = fps_ema * 0.8 + (1.0 / period) * 0.2;
             }
@@ -240,7 +318,23 @@ fn run_loop(
             let mut out = io::stdout();
             let _ = execute!(out, BeginSynchronizedUpdate);
         }
-        terminal.draw(|frame| draw(frame, &snap, &ui))?;
+        match presenter.as_mut() {
+            // Scene path: draw the header/debug chrome, then rasterize the scene
+            // into the body area the chrome left free.
+            Some(p) => {
+                terminal.draw(|frame| {
+                    if let Some(body) = render::draw_chrome(frame, &snap, &ui) {
+                        p.resize(body.width, body.height);
+                        p.frame(&snap, dt);
+                        p.draw(frame.buffer_mut(), body);
+                    }
+                })?;
+            }
+            // Direct-bars path: byte-identical to before.
+            None => {
+                terminal.draw(|frame| draw(frame, &snap, &ui))?;
+            }
+        }
         {
             let mut out = io::stdout();
             let _ = execute!(out, EndSynchronizedUpdate);
