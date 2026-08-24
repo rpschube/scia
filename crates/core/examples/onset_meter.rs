@@ -29,6 +29,8 @@ fn main() {
             amp: 0.8,
         },
         pacing: Pacing::Realtime,
+
+        emit_log: None,
     };
     let (engine, mut reader) =
         Engine::start(Box::new(backend), EngineConfig::default()).expect("engine start");

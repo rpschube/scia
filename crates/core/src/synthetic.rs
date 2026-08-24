@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, SampleSink, StreamFormat,
 };
+use crate::latency::{Emission, EmitLog};
 
 /// Frames per generated chunk — matches the DSP hop size.
 const CHUNK_FRAMES: usize = 256;
@@ -53,7 +54,10 @@ pub enum Pacing {
 }
 
 /// A hardware-free capture backend producing stereo `f32` audio.
-#[derive(Clone, Copy, Debug)]
+///
+/// Carrying an [`EmitLog`] (via [`emit_log`](SyntheticBackend::emit_log)) makes
+/// it drop `Copy`; it stays `Clone`, and cloning shares the same log.
+#[derive(Clone, Debug)]
 pub struct SyntheticBackend {
     /// Stream format to report and generate at. Defaults to 48 kHz stereo.
     pub format: StreamFormat,
@@ -61,6 +65,11 @@ pub struct SyntheticBackend {
     pub signal: Signal,
     /// Delivery pacing.
     pub pacing: Pacing,
+    /// Optional click-emission log for the latency probe. When set and
+    /// [`signal`](SyntheticBackend::signal) is [`Signal::Clicks`], each
+    /// generated click is recorded with `emit_ns` sampled immediately before
+    /// the containing chunk is pushed. `None` for every other use.
+    pub emit_log: Option<Arc<EmitLog>>,
 }
 
 impl Default for SyntheticBackend {
@@ -72,6 +81,7 @@ impl Default for SyntheticBackend {
             },
             signal: Signal::Silence,
             pacing: Pacing::Realtime,
+            emit_log: None,
         }
     }
 }
@@ -97,12 +107,22 @@ impl CaptureBackend for SyntheticBackend {
 
         let signal = self.signal;
         let pacing = self.pacing;
+        let emit_log = self.emit_log.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
 
         let handle = thread::Builder::new()
             .name("scia-synth".into())
-            .spawn(move || generate(format, signal, pacing, &thread_stop, &mut sink))
+            .spawn(move || {
+                generate(
+                    format,
+                    signal,
+                    pacing,
+                    emit_log.as_deref(),
+                    &thread_stop,
+                    &mut sink,
+                );
+            })
             .map_err(|e| CaptureError::Backend(e.to_string()))?;
 
         Ok(Box::new(SyntheticStream {
@@ -114,10 +134,18 @@ impl CaptureBackend for SyntheticBackend {
 }
 
 /// The producer thread: fill chunks and deliver them per the pacing policy.
+///
+/// When `emit_log` is set and the signal is [`Signal::Clicks`], each click in a
+/// chunk is recorded — `emit_ns` sampled from `sink.stats().now_ns()`
+/// immediately before that chunk is pushed, which is the same clock the DSP
+/// thread stamps `FeatureSnapshot::timestamp_ns` with (`dsp::run` reads
+/// `thread.stats.now_ns()`), so the two ends share one epoch. No allocation on
+/// that path.
 fn generate(
     format: StreamFormat,
     signal: Signal,
     pacing: Pacing,
+    emit_log: Option<&EmitLog>,
     stop: &AtomicBool,
     sink: &mut SampleSink,
 ) {
@@ -125,9 +153,16 @@ fn generate(
     let sample_rate = f64::from(format.sample_rate);
     let mut buffer = vec![0.0f32; CHUNK_FRAMES * channels];
 
+    // Click period in frames, for emission logging (Clicks only).
+    let click_period = match signal {
+        Signal::Clicks { bpm, .. } if bpm > 0.0 => (60.0 / f64::from(bpm) * sample_rate).round(),
+        _ => 0.0,
+    } as u64;
+
     let start = Instant::now();
     let mut frame_index: u64 = 0;
     let mut chunks_pushed: u64 = 0;
+    let mut click_count: u32 = 0;
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -156,6 +191,23 @@ fn generate(
 
         match pacing {
             Pacing::Realtime => {
+                // Record every click in this chunk with a single clock read
+                // taken immediately before the push (allocation-free).
+                if let Some(log) = emit_log {
+                    if click_period > 0 {
+                        let emit_ns = sink.stats().now_ns();
+                        for frame in 0..frames as u64 {
+                            if (frame_index + frame) % click_period == 0 {
+                                log.push(Emission {
+                                    index: click_count,
+                                    emit_ns,
+                                    output_delay_ns: 0,
+                                });
+                                click_count += 1;
+                            }
+                        }
+                    }
+                }
                 // The ring drops excess if the consumer is slow; that is fine
                 // for a real-time source.
                 sink.push(slice);

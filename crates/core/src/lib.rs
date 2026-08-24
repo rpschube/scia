@@ -29,6 +29,7 @@ pub mod capture;
 pub mod dsp;
 pub mod engine;
 pub mod features;
+pub mod latency;
 pub mod onset;
 pub mod spectrum;
 pub mod synthetic;
@@ -46,6 +47,10 @@ pub use capture::{
 pub use dsp::{DspConfig, HopProcessor};
 pub use engine::{Engine, EngineConfig, EngineError, EngineStats};
 pub use features::{Activity, FEATURE_SCHEMA_VERSION, FeatureSnapshot, SPECTRUM_BINS};
+pub use latency::{
+    ClickDetector, Detection, Emission, EmitLog, LatencyStats, Matched, Matcher, Percentiles,
+    Sample,
+};
 pub use onset::{OnsetConfig, OnsetDetector};
 pub use spectrum::{SpectrumAnalyzer, SpectrumConfig};
 pub use synthetic::{Pacing, Signal, SyntheticBackend};

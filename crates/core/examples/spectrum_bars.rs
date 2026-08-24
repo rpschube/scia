@@ -22,6 +22,8 @@ fn main() {
             amp: 0.5,
         },
         pacing: Pacing::Realtime,
+
+        emit_log: None,
     };
 
     let (engine, mut reader) =

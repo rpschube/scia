@@ -80,6 +80,7 @@ pub enum EngineError {
 pub struct Engine {
     stream: Option<Box<dyn CaptureStream>>,
     format: StreamFormat,
+    epoch: Instant,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     stats: Arc<SinkStats>,
@@ -128,6 +129,7 @@ impl Engine {
             Engine {
                 stream: Some(stream),
                 format,
+                epoch,
                 stop,
                 join: Some(join),
                 stats,
@@ -141,6 +143,22 @@ impl Engine {
     #[must_use]
     pub fn format(&self) -> StreamFormat {
         self.format
+    }
+
+    /// The ring epoch: the monotonic [`Instant`] every snapshot's
+    /// `timestamp_ns` (and [`Engine::now_ns`]) is measured from. A probe that
+    /// timestamps events outside the pipeline stamps them against this same
+    /// origin so both ends share one clock.
+    #[must_use]
+    pub fn epoch(&self) -> Instant {
+        self.epoch
+    }
+
+    /// Monotonic nanoseconds since the ring epoch — the exact clock the DSP
+    /// thread stamps `FeatureSnapshot::timestamp_ns` with.
+    #[must_use]
+    pub fn now_ns(&self) -> u64 {
+        self.stats.now_ns()
     }
 
     /// Current pipeline counters.
