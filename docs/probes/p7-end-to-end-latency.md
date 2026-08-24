@@ -87,7 +87,10 @@ in milliseconds:
   above. Expected on the order of a hop plus a poll (~6–10 ms) with the
   synthetic backend; a real loopback adds the endpoint's capture latency.
 - **output delay (cb→play)** — live only: the host's predicted output
-  callback→playback delay, recorded per click. `0` in synthetic mode.
+  callback→playback delay plus the click's offset inside that callback's buffer
+  (the burst starts partway through the buffer the callback fills), recorded per
+  click. Subtract its median from emit → observe to estimate the latency from
+  the moment the click actually enters the mix. `0` in synthetic mode.
 
 Quantization sources to keep in mind when reading the numbers: the 256-frame hop
 grid (5.33 ms at 48 kHz), the 1 ms DSP poll while waiting for a partial hop, the

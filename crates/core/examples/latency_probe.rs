@@ -406,10 +406,14 @@ fn open_click_player(
                 if click_idx < total_clicks && phase < click_frames {
                     sample = amp;
                     if phase == 0 {
+                        // The burst starts `frame` frames into this buffer: fold
+                        // that intra-buffer offset into the output delay so the
+                        // delay column is callback → this sample's playback.
+                        let offset_ns = frame as u64 * 1_000_000_000 / u64::from(sample_rate);
                         log.push(Emission {
                             index: click_idx as u32,
                             emit_ns: cb_ns,
-                            output_delay_ns: delay_ns,
+                            output_delay_ns: delay_ns + offset_ns,
                         });
                     }
                 }
