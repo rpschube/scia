@@ -1080,9 +1080,15 @@ static SPECTRA_PRESET: &str = include_str!("../../../../presets/spectra.toml");
 /// The `lattice` built-in preset template.
 static LATTICE_PRESET: &str = include_str!("../../../../presets/lattice.toml");
 
+/// The `aurora` built-in preset template.
+static AURORA_PRESET: &str = include_str!("../../../../presets/aurora.toml");
+
 /// The built-in preset files compiled into the crate, as `(name, source)`.
-static BUILTIN_PRESETS: &[(&str, &str)] =
-    &[("spectra", SPECTRA_PRESET), ("lattice", LATTICE_PRESET)];
+static BUILTIN_PRESETS: &[(&str, &str)] = &[
+    ("spectra", SPECTRA_PRESET),
+    ("lattice", LATTICE_PRESET),
+    ("aurora", AURORA_PRESET),
+];
 
 /// The built-in preset files compiled into the crate, as `(name, source)`.
 #[must_use]
