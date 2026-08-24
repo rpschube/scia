@@ -207,3 +207,22 @@ fn width_mismatch_is_handled() {
         }
     }
 }
+
+#[test]
+fn debug_line_shows_active_tier() {
+    // When a scene presenter drives the body it sets the tier label; the debug
+    // line surfaces it. The direct-bars path leaves `tier` unset (covered by
+    // `debug_line_toggles`, whose debug row carries no tier).
+    let snap = snapshot_with(&[0.3; 16]);
+    let ui = UiState {
+        debug: true,
+        tier: Some("octants"),
+        ..UiState::default()
+    };
+    let buf = render(120, 10, &snap, &ui);
+    let last = row(&buf, 9, 120);
+    assert!(
+        last.contains("tier octants"),
+        "debug row missing tier: {last:?}"
+    );
+}
