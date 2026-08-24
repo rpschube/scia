@@ -1,0 +1,68 @@
+# starfall — the outward-streaming starfield preset.
+#
+# This is a copy-and-edit template: every table and key the preset format
+# understands appears here, either set or shown in a comment. See
+# docs/presets.md for the full reference (types, ranges, the feature
+# vocabulary, curve formulas, envelope semantics and the error format).
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric).
+name = "starfall"
+# Required. A registered scene id. `starfall` is the streaming starfield.
+scene = "starfall"
+# Optional. A one-line human description.
+description = "A starfield streaming outward from the centre; loudness rides its speed and onsets warp the outer stars into streaks."
+# Optional. A one-word mood; defaults to the scene's own mood ("cosmic").
+mood = "cosmic"
+
+# Typed parameters for the preset's scene. Every key must exist in the scene's
+# parameter manifest; every value is a number within the stated range. Omitted
+# keys keep their manifest default.
+[params]
+# stars   192    range 16.0..=512.0   number of stars in the pool, preallocated at init
+stars = 192
+# speed   0.35   range 0.05..=2.0     base outward speed (canvas units / second) that loudness rides on
+speed = 0.35
+# streak  0.6    range 0.0..=2.0      streak-length gain on an onset (outer stars stretch into lines)
+streak = 0.6
+# size    1.0    range 0.2..=3.0      star size multiplier
+size = 1.0
+# spread  0.6    range 0.0..=1.0      spawn-direction spread: 1 spaces stars evenly, 0 scatters them into clusters
+spread = 0.6
+
+# Optional layer stack. With no [[layer]] tables the preset is exactly one
+# layer: [preset].scene with [params]. Each layer names its own scene, an
+# optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0); [layer.params] is typed against THAT layer's scene manifest and
+# merges over its defaults. When layers are present, [map] targets the FIRST
+# layer's scene.
+#
+# [[layer]]
+# scene = "starfall"
+# blend = "over"
+# intensity = 1.0
+# [layer.params]
+# speed = 0.5
+
+# Feature -> parameter mappings. Each key is a parameter of the mapped scene;
+# each value is a table naming a feature and a response. A string value here is
+# reserved for the expression VM (a later card) and is rejected today.
+#
+# feature:  bass | mid | treb | loud | peak | onset | flux | beat | width
+# curve:    linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+[map]
+# Punch the streak length on every onset: a fast attack so the warp snaps in on
+# the transient, ~300 ms decay so it stretches and relaxes with the beat. Stays
+# inside streak's 0.0..=2.0 range (offset 0.3, plus up to scale 0.9).
+streak = { feature = "onset", curve = "linear", attack_ms = 10, decay_ms = 300, scale = 0.9, offset = 0.3 }
+
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries; only meaningful with a
+# static source. Omit to use the host default palette. A deep-space ramp: dim
+# teal through cyan and amber to a hot coral rim, then three neutrals.
+slots = ["#0d3b3b", "#1f8f8f", "#3fd0d0", "#ffb020", "#ff6b5b", "#0a0c12", "#8a8f9c", "#e6e8ee"]

@@ -67,6 +67,16 @@ The `lattice` manifest:
 | `flash`      | `0.7`   | `0.0..=1.0` | ring brightness boost as its front passes a dot       |
 | `glow`       | `0.35`  | `0.0..=1.0` | base dot intensity that loudness rides on             |
 
+The `starfall` manifest:
+
+| key      | default | range         | meaning                                                           |
+| -------- | ------- | ------------- | ----------------------------------------------------------------- |
+| `stars`  | `192`   | `16.0..=512.0`| number of stars in the pool, preallocated at init                 |
+| `speed`  | `0.35`  | `0.05..=2.0`  | base outward speed (canvas units / second) that loudness rides on |
+| `streak` | `0.6`   | `0.0..=2.0`   | streak-length gain on an onset (outer stars stretch into lines)   |
+| `size`   | `1.0`   | `0.2..=3.0`   | star size multiplier                                              |
+| `spread` | `0.6`   | `0.0..=1.0`   | spawn-direction spread: 1 spaces stars evenly, 0 scatters them    |
+
 ### `[[layer]]` (optional)
 
 A layer stack. With **no** `[[layer]]` tables the preset is exactly one layer:

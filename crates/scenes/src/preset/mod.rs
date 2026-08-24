@@ -1083,11 +1083,15 @@ static LATTICE_PRESET: &str = include_str!("../../../../presets/lattice.toml");
 /// The `aurora` built-in preset template.
 static AURORA_PRESET: &str = include_str!("../../../../presets/aurora.toml");
 
+/// The `starfall` built-in preset template.
+static STARFALL_PRESET: &str = include_str!("../../../../presets/starfall.toml");
+
 /// The built-in preset files compiled into the crate, as `(name, source)`.
 static BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("spectra", SPECTRA_PRESET),
     ("lattice", LATTICE_PRESET),
     ("aurora", AURORA_PRESET),
+    ("starfall", STARFALL_PRESET),
 ];
 
 /// The built-in preset files compiled into the crate, as `(name, source)`.
