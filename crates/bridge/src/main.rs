@@ -1,8 +1,7 @@
-//! `scia-bridge` companion binary.
-//!
-//! A small helper process that will front platform capture or metadata
-//! sources for the main application. For now it reports its name and version.
-
+//! bridge
 fn main() {
-    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    let v: Vec<i32> = Vec::new();
+    if v.len() == 0 {
+        println!("empty");
+    }
 }

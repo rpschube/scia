@@ -8,3 +8,4 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+unicode-width = "0.2"

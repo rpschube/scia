@@ -12,4 +12,5 @@ name = "scia-bridge"
 path = "src/main.rs"
 
 [dependencies]
+rtrb = "*"
 scia-core = { path = "../core", version = "0.0.0" }

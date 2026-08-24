@@ -88,7 +88,7 @@ core-deps:
     #!/usr/bin/env bash
     set -euo pipefail
     crates=$(just _cargo tree -p scia-core -e normal --prefix none | awk '{ print $1 }')
-    if echo "$crates" | grep -Eiw 'scia-scenes|scia-meta|scia-tui|ratatui|crossterm|wgpu|winit|mlua'; then
+    if echo "$crates" | grep -Eiw 'scia-scenes|scia-meta|scia-tui|ratatui|crossterm|unicode-width|wgpu|winit|mlua'; then
         echo "core-deps: scia-core has a forbidden UI/scripting dependency (see above)" >&2
         exit 1
     fi
