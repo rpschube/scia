@@ -109,10 +109,49 @@ pub enum ArtworkStep {
     /// Sleep `delay`, then perform an attempt and feed the result back to
     /// [`ArtworkDriver::record`].
     Fetch { delay: Duration },
-    /// A usable image was obtained; emit these bytes and stop.
+    /// A usable image was obtained (and it is *not* a suspect-stale hold-over
+    /// from the previous track); emit these bytes and stop.
     Emit(Vec<u8>),
+    /// Every attempt was exhausted with nothing but **suspect-stale** bytes —
+    /// bytes byte-identical to the previous track's art while the metadata says
+    /// the album changed (a player whose thumbnail lagged the whole campaign).
+    /// Emit them anyway (stale art beats none), but the campaign is treated as
+    /// *not having obtained confirmed art*, so the late-properties re-campaign
+    /// ([`ArtCampaignTracker`]) stays armed to heal it. No user-visible label.
+    EmitStale(Vec<u8>),
     /// Every attempt was exhausted without usable bytes; stop quietly.
     GiveUp,
+}
+
+/// A 64-bit FNV-1a hash of encoded artwork bytes — a cheap identity used to spot
+/// a player still serving the *previous* track's thumbnail during the lag window
+/// after a track change. Not cryptographic and never persisted; only two byte
+/// blobs observed moments apart in one process are ever compared, so collision
+/// risk is negligible and the same-album guard makes a collision harmless anyway.
+#[must_use]
+pub fn art_hash(bytes: &[u8]) -> u64 {
+    // FNV-1a, 64-bit. Offset basis and prime per the reference specification.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The identity of the artwork most recently *emitted* for a source app: a cheap
+/// [`art_hash`] of the emitted bytes plus the album they belonged to.
+///
+/// A fresh [`ArtworkDriver`] is seeded with the previous track's `PrevArt` so it
+/// can recognise the lag window: if a fetch returns bytes whose hash matches the
+/// previous emission *and* the album has since changed, the thumbnail has not
+/// caught up yet and the bytes are treated as suspect-stale rather than emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrevArt {
+    /// Hash of the previously emitted artwork bytes.
+    pub hash: u64,
+    /// The album those bytes belonged to (`None` if the player published none).
+    pub album: Option<String>,
 }
 
 /// Drives one artwork fetch campaign through debounce and bounded retry.
@@ -129,18 +168,36 @@ pub struct ArtworkDriver {
     policy: RetryPolicy,
     /// Number of attempts already performed.
     attempts: u32,
-    /// Set once usable bytes have been recorded.
+    /// Set once usable, non-suspect bytes have been recorded.
     done: Option<Vec<u8>>,
+    /// Usable bytes that looked suspect-stale (byte-identical to the previous
+    /// track's art under a changed album). Held as a last resort: if the whole
+    /// campaign turns up nothing better, these are emitted via
+    /// [`ArtworkStep::EmitStale`] rather than showing nothing.
+    suspect: Option<Vec<u8>>,
+    /// The previous track's emitted artwork identity for this source app, if
+    /// known; the yardstick for the suspect-stale check.
+    prev_art: Option<PrevArt>,
 }
 
 impl ArtworkDriver {
-    /// Start a fresh campaign under `policy`.
+    /// Start a fresh campaign under `policy` with no previous-art context (the
+    /// suspect-stale check is inert — every usable fetch is emitted as-is).
     #[must_use]
     pub fn new(policy: RetryPolicy) -> Self {
+        Self::with_prev_art(policy, None)
+    }
+
+    /// Start a fresh campaign under `policy`, seeded with the previous track's
+    /// emitted-artwork identity so the suspect-stale lag window can be detected.
+    #[must_use]
+    pub fn with_prev_art(policy: RetryPolicy, prev_art: Option<PrevArt>) -> Self {
         Self {
             policy,
             attempts: 0,
             done: None,
+            suspect: None,
+            prev_art,
         }
     }
 
@@ -154,6 +211,11 @@ impl ArtworkDriver {
             return ArtworkStep::Emit(bytes.clone());
         }
         if self.attempts >= self.policy.max_attempts {
+            // Nothing confirmed; fall back to suspect-stale bytes if we held
+            // any, else give up quietly.
+            if let Some(bytes) = &self.suspect {
+                return ArtworkStep::EmitStale(bytes.clone());
+            }
             return ArtworkStep::GiveUp;
         }
         ArtworkStep::Fetch {
@@ -162,15 +224,44 @@ impl ArtworkDriver {
     }
 
     /// Record the outcome of one fetch attempt. `bytes` is whatever the stream
-    /// read produced (possibly empty or `None`); it is accepted only if
-    /// [`is_usable_artwork`] passes, otherwise the attempt counts as a miss and
-    /// the campaign retries until `max_attempts` is reached.
-    pub fn record(&mut self, bytes: Option<&[u8]>) {
+    /// read produced (possibly empty or `None`); `album` is the album the fetch's
+    /// media properties reported (used only for the suspect-stale check).
+    ///
+    /// Usable bytes ([`is_usable_artwork`]) are accepted as confirmed art unless
+    /// they are *suspect-stale* — byte-for-byte the previous track's emitted art
+    /// while the album has changed — in which case they are held aside (not
+    /// emitted) and the attempt still counts as a miss, so the campaign keeps
+    /// retrying within its bounded policy for the real thumbnail to arrive. An
+    /// empty, unusable, or `None` result is an ordinary miss.
+    pub fn record(&mut self, bytes: Option<&[u8]>, album: Option<&str>) {
         self.attempts += 1;
         if let Some(b) = bytes
             && is_usable_artwork(b)
         {
-            self.done = Some(b.to_vec());
+            if self.is_suspect_stale(b, album) {
+                self.suspect = Some(b.to_vec());
+            } else {
+                self.done = Some(b.to_vec());
+            }
+        }
+    }
+
+    /// Whether `bytes` are suspect-stale against the seeded [`PrevArt`]: identical
+    /// hash to the previous emission **and** a different album. When either album
+    /// is absent, or the albums match, the bytes are *not* suspect — two tracks
+    /// on the same album legitimately share art, so an identical-hash match there
+    /// is expected, not a lag artefact (and emitting it is harmless: the image is
+    /// the same one either way).
+    fn is_suspect_stale(&self, bytes: &[u8], album: Option<&str>) -> bool {
+        let Some(prev) = &self.prev_art else {
+            return false;
+        };
+        if art_hash(bytes) != prev.hash {
+            return false;
+        }
+        match (album, prev.album.as_deref()) {
+            (Some(cur), Some(prev_album)) => cur != prev_album,
+            _ => false,
         }
     }
 
@@ -293,8 +384,15 @@ pub enum ArtAction {
 /// The terminal outcome of one artwork campaign, fed back to the tracker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CampaignOutcome {
-    /// Usable artwork was obtained and emitted.
+    /// Confirmed artwork was obtained and emitted.
     Emitted,
+    /// Only suspect-stale artwork was available; it was emitted as a best-effort
+    /// fallback, but no *confirmed* art was obtained. Treated like [`GaveUp`] for
+    /// re-campaign bookkeeping so the late-properties follow-up stays armed and
+    /// can heal the display once the player swaps in the real thumbnail.
+    ///
+    /// [`GaveUp`]: CampaignOutcome::GaveUp
+    EmittedStale,
     /// Every bounded attempt was exhausted with no usable artwork.
     GaveUp,
     /// A newer change superseded the campaign before it finished; nothing was
@@ -384,7 +482,10 @@ impl ArtCampaignTracker {
     pub fn finish(&mut self, outcome: CampaignOutcome) {
         match outcome {
             CampaignOutcome::Emitted => self.obtained = true,
-            CampaignOutcome::GaveUp => self.obtained = false,
+            // A stale best-effort emit does *not* count as confirmed art: leave
+            // `obtained` false so a later winner-properties event still triggers
+            // the one allowed re-campaign and heals the display.
+            CampaignOutcome::EmittedStale | CampaignOutcome::GaveUp => self.obtained = false,
             CampaignOutcome::Abandoned => {}
         }
     }
@@ -429,13 +530,13 @@ mod tests {
         let mut d = ArtworkDriver::new(RetryPolicy::default());
         // First attempt returns nothing (player still swapping).
         assert!(matches!(d.next_step(), ArtworkStep::Fetch { .. }));
-        d.record(None);
+        d.record(None, None);
         // Second attempt returns an empty buffer -> still a miss.
         assert!(matches!(d.next_step(), ArtworkStep::Fetch { .. }));
-        d.record(Some(&[]));
+        d.record(Some(&[]), None);
         // Third attempt returns real PNG bytes.
         let art = png(256);
-        d.record(Some(&art));
+        d.record(Some(&art), Some("Album"));
         match d.next_step() {
             ArtworkStep::Emit(bytes) => assert_eq!(bytes, art),
             other => panic!("expected Emit, got {other:?}"),
@@ -452,7 +553,7 @@ mod tests {
         let mut d = ArtworkDriver::new(policy);
         for _ in 0..3 {
             assert!(matches!(d.next_step(), ArtworkStep::Fetch { .. }));
-            d.record(None);
+            d.record(None, None);
         }
         assert_eq!(d.next_step(), ArtworkStep::GiveUp);
         assert_eq!(d.attempts(), 3);
@@ -470,7 +571,7 @@ mod tests {
         let mut delays = Vec::new();
         while let ArtworkStep::Fetch { delay } = d.next_step() {
             delays.push(delay);
-            d.record(None);
+            d.record(None, None);
         }
         assert_eq!(
             delays,
@@ -592,5 +693,178 @@ mod tests {
         t.finish(CampaignOutcome::Abandoned);
         // A properties event for the still-art-less track may still retry once.
         assert_eq!(t.decide("a", false, true), ArtAction::Recampaign);
+    }
+
+    // Two distinct real images: `A` is the previous track's art, `B` the new
+    // track's real art. Different first bytes after the shared PNG magic keep
+    // their hashes apart.
+    fn art_a() -> Vec<u8> {
+        let mut v = png(256);
+        v[8] = 0xAA;
+        v
+    }
+    fn art_b() -> Vec<u8> {
+        let mut v = png(256);
+        v[8] = 0xBB;
+        v
+    }
+
+    #[test]
+    fn art_hash_is_deterministic_and_discriminating() {
+        // Stable across calls, equal for equal input.
+        assert_eq!(art_hash(&art_a()), art_hash(&art_a()));
+        // Different bytes hash differently (the whole discriminator's premise).
+        assert_ne!(art_hash(&art_a()), art_hash(&art_b()));
+        // A one-byte change is observed.
+        let mut a2 = art_a();
+        a2[8] = 0xAB;
+        assert_ne!(art_hash(&art_a()), art_hash(&a2));
+        // Known FNV-1a fixtures pin the constants (empty basis; "a").
+        assert_eq!(art_hash(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(art_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    fn prev_a() -> Option<PrevArt> {
+        Some(PrevArt {
+            hash: art_hash(&art_a()),
+            album: Some("Album A".to_string()),
+        })
+    }
+
+    #[test]
+    fn suspect_stale_bytes_are_held_not_emitted_and_drive_a_retry() {
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            ..RetryPolicy::default()
+        };
+        let mut d = ArtworkDriver::with_prev_art(policy, prev_a());
+        // The lagging player re-serves the PREVIOUS track's art, but the album
+        // metadata has already advanced to the new track: suspect-stale.
+        assert!(matches!(d.next_step(), ArtworkStep::Fetch { .. }));
+        d.record(Some(&art_a()), Some("Album B"));
+        // Not emitted; the campaign keeps retrying inside its bounded policy.
+        assert!(matches!(d.next_step(), ArtworkStep::Fetch { .. }));
+        assert_eq!(d.attempts(), 1);
+    }
+
+    #[test]
+    fn campaign_recovers_when_the_real_thumbnail_finally_arrives() {
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            ..RetryPolicy::default()
+        };
+        let mut d = ArtworkDriver::with_prev_art(policy, prev_a());
+        // First two attempts: still the stale previous art under the new album.
+        d.record(Some(&art_a()), Some("Album B"));
+        d.record(Some(&art_a()), Some("Album B"));
+        assert!(matches!(d.next_step(), ArtworkStep::Fetch { .. }));
+        // Third attempt: the real new art shows up (different hash) -> confirmed.
+        let b = art_b();
+        d.record(Some(&b), Some("Album B"));
+        match d.next_step() {
+            ArtworkStep::Emit(bytes) => assert_eq!(bytes, b),
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_album_identical_bytes_are_emitted_normally() {
+        // Two tracks on the same album share art: an identical-hash fetch under
+        // the SAME album is legitimate, not a lag artefact -> emit as confirmed.
+        let mut d = ArtworkDriver::with_prev_art(RetryPolicy::default(), prev_a());
+        d.record(Some(&art_a()), Some("Album A"));
+        match d.next_step() {
+            ArtworkStep::Emit(bytes) => assert_eq!(bytes, art_a()),
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_album_disables_the_suspect_check() {
+        // If either album is unknown we cannot claim the album changed, so an
+        // identical-hash fetch is emitted rather than suppressed.
+        let prev_no_album = Some(PrevArt {
+            hash: art_hash(&art_a()),
+            album: None,
+        });
+        let mut d = ArtworkDriver::with_prev_art(RetryPolicy::default(), prev_no_album);
+        d.record(Some(&art_a()), Some("Album B"));
+        assert!(matches!(d.next_step(), ArtworkStep::Emit(_)));
+
+        // Symmetric: previous album known, current fetch reports none.
+        let mut d = ArtworkDriver::with_prev_art(RetryPolicy::default(), prev_a());
+        d.record(Some(&art_a()), None);
+        assert!(matches!(d.next_step(), ArtworkStep::Emit(_)));
+    }
+
+    #[test]
+    fn no_prev_art_context_never_flags_stale() {
+        // The first-ever campaign (no previous emission) emits any usable bytes.
+        let mut d = ArtworkDriver::new(RetryPolicy::default());
+        d.record(Some(&art_a()), Some("Album A"));
+        assert!(matches!(d.next_step(), ArtworkStep::Emit(_)));
+    }
+
+    #[test]
+    fn exhausting_on_suspect_stale_emits_stale_as_a_last_resort() {
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            ..RetryPolicy::default()
+        };
+        let mut d = ArtworkDriver::with_prev_art(policy, prev_a());
+        // Every attempt sees only the stale previous art under the new album.
+        for _ in 0..3 {
+            assert!(matches!(d.next_step(), ArtworkStep::Fetch { .. }));
+            d.record(Some(&art_a()), Some("Album B"));
+        }
+        // Rather than show nothing, emit the held stale bytes — but as EmitStale.
+        match d.next_step() {
+            ArtworkStep::EmitStale(bytes) => assert_eq!(bytes, art_a()),
+            other => panic!("expected EmitStale, got {other:?}"),
+        }
+        assert_eq!(d.attempts(), 3);
+    }
+
+    #[test]
+    fn giveup_still_wins_when_no_suspect_bytes_were_held() {
+        // Pure misses (no usable bytes at all) still give up quietly — the stale
+        // fallback only triggers when suspect bytes were actually observed.
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            ..RetryPolicy::default()
+        };
+        let mut d = ArtworkDriver::with_prev_art(policy, prev_a());
+        d.record(None, None);
+        d.record(Some(&[]), None);
+        assert_eq!(d.next_step(), ArtworkStep::GiveUp);
+    }
+
+    #[test]
+    fn stale_success_leaves_the_recampaign_armed_and_heals_once() {
+        // The healing path end to end at the tracker level: a stale best-effort
+        // emit must behave, for re-campaign purposes, like it obtained no art.
+        let mut t = ArtCampaignTracker::new();
+        t.begin("z", ArtAction::Fresh);
+        t.finish(CampaignOutcome::EmittedStale);
+        // The late thumbnail swap arrives as a winner properties event: exactly
+        // one fresh campaign is granted to replace the stale art.
+        assert_eq!(t.decide("z", false, true), ArtAction::Recampaign);
+        t.begin("z", ArtAction::Recampaign);
+        t.finish(CampaignOutcome::Emitted);
+        // Healed and confirmed: no further re-campaigns for this track.
+        assert_eq!(t.decide("z", false, true), ArtAction::Skip);
+    }
+
+    #[test]
+    fn stale_success_recampaign_budget_is_still_one() {
+        // Even if the re-campaign itself only finds stale art again, the single
+        // follow-up is spent — a chatty player cannot spin the backend.
+        let mut t = ArtCampaignTracker::new();
+        t.begin("z", ArtAction::Fresh);
+        t.finish(CampaignOutcome::EmittedStale);
+        assert_eq!(t.decide("z", false, true), ArtAction::Recampaign);
+        t.begin("z", ArtAction::Recampaign);
+        t.finish(CampaignOutcome::EmittedStale);
+        assert_eq!(t.decide("z", false, true), ArtAction::Skip);
     }
 }
