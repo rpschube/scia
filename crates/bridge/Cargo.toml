@@ -13,3 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 scia-core = { path = "../core", version = "0.0.0" }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+# The end-to-end serve test decodes the bridge's stream with the library's own
+# wire readers; scia-core is already the runtime dependency, so this adds no new
+# third-party crate to the tree.
+scia-core = { path = "../core", version = "0.0.0" }

@@ -18,15 +18,30 @@
 //! change bumps both. A reader accepts only its own version and rejects any
 //! other with [`StreamError::UnsupportedSchema`] rather than mis-parsing.
 //!
-//! This module is deliberately free of any capture, UI or scripting dependency
-//! so another workspace crate (e.g. a future bridge) can reuse the wire form.
-//! The document `docs/feature-stream.md` is the human-facing reference for the
-//! field list, both framings, and the versioning policy.
+//! Alongside the wire form this module hosts the reusable **output-serving
+//! loop** ([`run_output`]): it paces an [`Engine`]'s live [`FeatureReader`] and
+//! writes each hop as a [`FeatureFrame`] to stdout or to every client on a
+//! `--listen` socket, in the chosen [`Encoding`], at a target frame rate,
+//! dropping to a slower keepalive cadence while the engine is idle. Both the
+//! main `scia` binary and the `scia-bridge` companion drive it, so neither
+//! duplicates the listener / client fan-out / rate pacing.
+//!
+//! This module is deliberately free of any UI or scripting dependency so another
+//! workspace crate (e.g. the bridge) can reuse both the wire form and the
+//! serving loop. The document `docs/feature-stream.md` is the human-facing
+//! reference for the field list, both framings, and the versioning policy.
 
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::FeatureReader;
+use crate::engine::{Engine, EngineHealth};
 use crate::features::{Activity, FEATURE_SCHEMA_VERSION, FeatureSnapshot, SPECTRUM_BINS};
 
 /// The wire schema version. Pinned to [`FEATURE_SCHEMA_VERSION`]: the frame is a
@@ -551,6 +566,200 @@ impl<R: BufRead> FrameStreamReader<R> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Output: serve the live feature bus (stdout or a --listen socket)
+// ---------------------------------------------------------------------------
+//
+// The reusable output-serving loop. It has no UI or scripting dependency, so
+// both the `scia` binary and the `scia-bridge` companion drive it rather than
+// each carrying its own listener / fan-out / pacing. The inverse direction (the
+// `--input` consumer that renders the TUI from a remote stream) stays with the
+// binary, since it feeds a UI.
+
+/// Default target frame rate when a rate is not given: 60 frames per second,
+/// matching the default render cadence.
+pub const DEFAULT_STREAM_RATE: u32 = 60;
+
+/// The reduced cadence the output stream falls back to while the engine reports
+/// [`Activity::Idle`]: one frame every 500 ms (2 Hz). It is a keepalive — enough
+/// that a consumer sees the stream is alive and observes the growing `quiet_ms`,
+/// without spinning at the full rate on silence. When the target rate is already
+/// slower than this, the slower rate wins (the interval is the max of the two).
+pub const IDLE_KEEPALIVE: Duration = Duration::from_millis(500);
+
+/// The emit interval for one output tick, given the target rate and the current
+/// activity. At [`Activity::Idle`] the interval is at least [`IDLE_KEEPALIVE`];
+/// otherwise it is `1/rate`. Pure, so the rate-limiting is unit-tested directly.
+#[must_use]
+pub fn emit_interval(rate: u32, activity: Activity) -> Duration {
+    let base = Duration::from_secs_f64(1.0 / f64::from(rate.max(1)));
+    match activity {
+        Activity::Idle => base.max(IDLE_KEEPALIVE),
+        Activity::Active | Activity::Quiet => base,
+    }
+}
+
+/// Where output frames are written: standard output, or the set of currently
+/// connected `--listen` clients.
+enum Sink {
+    Stdout(BufWriter<std::io::Stdout>),
+    Listen(Arc<Mutex<Vec<TcpStream>>>),
+}
+
+impl Sink {
+    /// Emit one frame to every destination, dropping any client that errors.
+    fn emit(&mut self, encoding: Encoding, frame: &FeatureFrame) {
+        match self {
+            Sink::Stdout(w) => {
+                let _ = write_frame(w, encoding, frame);
+                let _ = w.flush();
+            }
+            Sink::Listen(clients) => {
+                let mut guard = clients.lock().unwrap_or_else(|e| e.into_inner());
+                guard.retain_mut(|c| {
+                    write_frame(c, encoding, frame)
+                        .and_then(|()| c.flush())
+                        .is_ok()
+                });
+            }
+        }
+    }
+}
+
+/// Write one frame in the chosen encoding (NDJSON line or length-prefixed
+/// binary payload).
+fn write_frame<W: Write>(
+    w: &mut W,
+    encoding: Encoding,
+    frame: &FeatureFrame,
+) -> std::io::Result<()> {
+    match encoding {
+        Encoding::Json => {
+            let line = to_json_line(frame).map_err(|e| std::io::Error::other(e.to_string()))?;
+            w.write_all(line.as_bytes())?;
+            w.write_all(b"\n")
+        }
+        Encoding::Binary => write_binary_frame(w, frame).map_err(|e| match e {
+            StreamError::Io(io) => io,
+            other => std::io::Error::other(other.to_string()),
+        }),
+    }
+}
+
+/// Run headless feature output: pace `reader` and emit frames until `frames`
+/// have been sent (when `Some`), the engine fails, or the process is killed.
+///
+/// `engine` is owned so its health is polled and it is torn down on exit. With
+/// `listen`, a background thread accepts clients on the socket (writing the
+/// one-time binary header to each on connect); without it, frames go to stdout.
+/// Returns exit `0` on a clean frame-limit finish, `1` if capture failed.
+pub fn run_output(
+    encoding: Encoding,
+    listen: Option<String>,
+    rate: u32,
+    frames: Option<u64>,
+    engine: Engine,
+    mut reader: FeatureReader,
+) -> ExitCode {
+    let mut sink = match &listen {
+        Some(addr) => match TcpListener::bind(addr) {
+            Ok(listener) => {
+                eprintln!(
+                    "streaming {} frames on {addr} at {rate} fps",
+                    encoding_label(encoding)
+                );
+                let clients: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+                spawn_accept_loop(listener, encoding, Arc::clone(&clients));
+                Sink::Listen(clients)
+            }
+            Err(err) => {
+                eprintln!("failed to listen on {addr}: {err}");
+                engine.stop();
+                return ExitCode::from(1);
+            }
+        },
+        None => {
+            let mut w = BufWriter::new(std::io::stdout());
+            if encoding == Encoding::Binary {
+                if let Err(err) = write_binary_header(&mut w) {
+                    eprintln!("failed to write stream header: {err}");
+                    engine.stop();
+                    return ExitCode::from(1);
+                }
+                let _ = w.flush();
+            }
+            Sink::Stdout(w)
+        }
+    };
+
+    let mut emitted: u64 = 0;
+    let mut next = Instant::now();
+    loop {
+        let snap = *reader.latest();
+        let frame = FeatureFrame::from_snapshot(&snap);
+        sink.emit(encoding, &frame);
+        emitted += 1;
+
+        if let Some(limit) = frames {
+            if emitted >= limit {
+                break;
+            }
+        }
+
+        if let EngineHealth::Failed { error } = engine.engine_health() {
+            eprintln!("capture stream error: {error}");
+            engine.stop();
+            return ExitCode::from(1);
+        }
+
+        next += emit_interval(rate, snap.activity);
+        let now = Instant::now();
+        if next > now {
+            thread::sleep(next - now);
+        } else {
+            // Fell behind (a slow consumer or a long idle interval boundary):
+            // resynchronise rather than burst to catch up.
+            next = now;
+        }
+    }
+
+    engine.stop();
+    ExitCode::SUCCESS
+}
+
+/// Accept `--listen` clients in the background, writing the one-time binary
+/// header to each on connect (a no-op for JSON) and adding it to the fan-out
+/// set. Detached: it is torn down when the process exits.
+fn spawn_accept_loop(
+    listener: TcpListener,
+    encoding: Encoding,
+    clients: Arc<Mutex<Vec<TcpStream>>>,
+) {
+    thread::Builder::new()
+        .name("scia-stream-accept".into())
+        .spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut stream) = incoming else { continue };
+                let _ = stream.set_nodelay(true);
+                if encoding == Encoding::Binary && write_binary_header(&mut stream).is_err() {
+                    continue;
+                }
+                clients
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(stream);
+            }
+        })
+        .ok();
+}
+
+fn encoding_label(encoding: Encoding) -> &'static str {
+    match encoding {
+        Encoding::Json => "json",
+        Encoding::Binary => "binary",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,5 +977,41 @@ mod tests {
             r#""chroma":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}"#,
         );
         assert_eq!(line, expected);
+    }
+
+    // -- output-serving loop: rate pacing ----------------------------------
+
+    #[test]
+    fn active_rate_is_honored() {
+        // At 60 fps an active/quiet tick is ~16.7 ms.
+        let d = emit_interval(60, Activity::Active);
+        assert!(
+            (d.as_secs_f64() - 1.0 / 60.0).abs() < 1e-9,
+            "60 fps active interval was {d:?}"
+        );
+        assert_eq!(
+            emit_interval(60, Activity::Quiet),
+            d,
+            "quiet paces like active"
+        );
+        assert_eq!(
+            emit_interval(10, Activity::Active),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn idle_drops_to_keepalive_cadence() {
+        // A fast rate is throttled to the keepalive interval when idle...
+        assert_eq!(emit_interval(60, Activity::Idle), IDLE_KEEPALIVE);
+        assert_eq!(emit_interval(240, Activity::Idle), IDLE_KEEPALIVE);
+        // ...but a rate already slower than the keepalive keeps its slower pace.
+        assert_eq!(emit_interval(1, Activity::Idle), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn zero_rate_does_not_divide_by_zero() {
+        // Clamped to at least 1 fps.
+        assert_eq!(emit_interval(0, Activity::Active), Duration::from_secs(1));
     }
 }
