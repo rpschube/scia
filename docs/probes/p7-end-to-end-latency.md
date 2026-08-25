@@ -137,10 +137,11 @@ Reading:
   or the loopback path buffers more than its packet cadence suggests. The
   follow-up that decomposes this — cross-correlating raw ring samples against
   the emitted click (sub-millisecond, no hop quantization) — is *Raw-ring
-  mode* below. Its first field run mis-measured because of a drain-timestamp
-  bug (now fixed; see *Raw-ring mode → Field reconciliation*), so a corrected
-  raw-ring run on this endpoint is still owed before the ≤ 33 ms US-PERF-1
-  criterion is scored.
+  mode* below. Its field runs so far mis-measured — first a drain-timestamp
+  poll-jitter bug, then a residual constant bias — both addressed across two
+  correction rounds (see *Raw-ring mode → Field reconciliation*), so a corrected
+  raw-ring run on this endpoint, read together with the new backlog readout, is
+  still owed before the ≤ 33 ms US-PERF-1 criterion is scored.
 
 ## Raw-ring mode (`--raw-ring`)
 
@@ -161,7 +162,16 @@ against the known click template (a rectangular burst of `--click-ms` at
 `--amp`) over a search window one click spacing wide centered on the click's
 `emit_ns` (`emit_ns − spacing/2` … `emit_ns + spacing/2`), and takes the
 correlation argmax as the click's **leading edge in the raw stream**. Resolution
-is one sample (≈ 0.02 ms at 48 kHz), not one hop. (The window reaches back half a
+is one sample (≈ 0.02 ms at 48 kHz), not one hop. The normalized score is bounded
+to `[−1, 1]` by construction (Cauchy–Schwarz): each offset's window sum and window
+energy are computed from the same samples, so the ratio cannot exceed 1. A score
+`> 1` would therefore be a numerical artifact — it was one, before this round: a
+running window energy carried across offsets accumulated the rounding error of a
+loud burst, and in a later low-energy window that residual dwarfed the true energy
+and let the normalized score blow past 1 and win the peak, planting a spurious
+late arrival. The energy is now recomputed exactly per offset (and the score
+clamped to 1 as a last-ulp guard), so `ncc > 1` can no longer be reported. (The
+window reaches back half a
 spacing as well as forward because the synthetic backend stamps `emit_ns` just
 before pushing a chunk, so on the near-zero-transport synthetic path a sample's
 continuous-capture time can fall a few ms *before* the emission; a neighbour
@@ -173,12 +183,27 @@ ring*, not *when the probe read them out*. The frames a poll drains entered the
 ring when a capture callback delivered them; the newest was delivered by the most
 recent push, whose time the sink records as `last_push_ns` (on the ring epoch).
 The probe reads `last_push_ns` just before the drain and places the drain's oldest
-frame at `last_push_ns − frames × ns_per_frame`, stepping one frame-period per
+frame at `anchor − frames × ns_per_frame`, stepping one frame-period per
 frame — so the newest sits about one frame-period before its delivery and the
 oldest about `frames` frame-periods before it. The ring clock is the same epoch
 `FeatureSnapshot.timestamp_ns` and the click player's `emit_ns` use, so
 `emit → raw-arrival` is a difference on one clock. The residual error is a single
 *push* interval of jitter on the anchor (sub-millisecond quanta are negligible).
+
+`anchor` is `last_push_ns` only when the drain has caught up to the writer.
+`last_push_ns` is the delivery time of the writer's *newest* frame; if a steady
+backlog of undrained frames remains in the ring after a drain, the newest frame
+that drain actually ended on is older than the writer's newest by exactly the
+backlog, and anchoring on `last_push_ns` shifts every reconstructed time late by
+that constant. The probe therefore reads the writer's cumulative `pushed_frames`
+alongside `last_push_ns` and corrects the anchor to
+`last_push_ns − backlog × ns_per_frame`, where `backlog` is the frames the writer
+had delivered that the drain did not pop. With the unbounded drain the ring
+empties every poll, so the backlog is ~0 and the correction vanishes; it only
+bites if the drain ever falls behind (a bounded chunk, correlation work between
+wakes, or a push landing mid-drain). The probe now also **reports the observed
+steady-state backlog** (worst and last, in frames and ms) so a hardware run can
+read directly whether the drain kept up rather than inferring it.
 
 Anchoring on the *delivery* clock, not the probe's own poll-read clock, is what
 keeps raw-arrival a true subset of the publish path. A sample enters the ring
@@ -241,6 +266,46 @@ raw-arrival measures ring entry and the subset invariant holds by construction.
 > compare it against the `81.3 ms` normal-run number or use it to score
 > US-PERF-1. The `81.3 ms` normal-run table stands; only the raw-ring figure was
 > affected. A corrected raw-ring run lands here later via the orchestrator.
+
+**Field reconciliation — second round.** The delivery-clock anchor above fixed
+the *jitter*: a follow-up raw-ring run held `emit → raw-arrival` to an extremely
+tight spread (~0.4 ms across the clicks), confirming the poll-to-delivery gap no
+longer leaks into the reconstruction. But a **constant ~27.5 ms late bias**
+remained — the run centred near `108.7 ms` median, still above the same session's
+`emit → publish`, still violating the subset invariant. `108.7 ms` is therefore a
+second *biased intermediate*, not an endpoint property; do not score US-PERF-1
+against it either. That run also showed one outlier click reading a normalized
+correlation `> 1` (the energy-drift artifact fixed above), which returned a
+spuriously late arrival for that click.
+
+Two changes this round address the constant bias at its most likely source and
+make the next run self-diagnosing:
+
+- **Occupancy-corrected anchor.** A constant late offset is exactly the signature
+  of a steady ring backlog: if a drain runs a fixed distance behind the writer,
+  the frame it ends on is a fixed number of frames older than `last_push_ns`, so
+  every reconstructed time is late by that fixed span. The anchor now subtracts
+  the measured backlog (see *Timestamp bookkeeping*), which cancels such an offset
+  exactly. A deliberately under-draining regression (`crates/core/tests`) that
+  builds a constant backlog now asserts the reconstruction stays pinned to
+  delivery — and that the *uncorrected* anchor drifts late by exactly the backlog
+  span, so the class of bug cannot silently return.
+- **Backlog readout.** The probe reports the observed steady-state backlog each
+  run. This is the discriminating measurement the next hardware run needs: a
+  reading near zero means the unbounded drain kept up and the residual constant
+  lives *outside* the drain reconstruction (candidates then narrow to a real
+  capture/output-path latency difference between the two modes, or an
+  under-measurement on the normal-mode publish side); a nonzero reading localizes
+  it to the drain and the correction above will have removed it.
+
+A reading of the reconstruction arithmetic (and an offline model of the
+writer/drain cadence) indicates the *current* unbounded per-poll drain empties
+the ring each wake and so should carry ~0 backlog — meaning the occupancy term,
+while provably correct and the right anchor, may not by itself account for the
+full 27.5 ms on this endpoint. That is precisely why the backlog readout was
+added rather than assumed: the next corrected raw-ring run should be read with the
+backlog line in hand before attributing the residual. The `81.3 ms` normal-run
+table still stands; a third raw-ring run lands here later via the orchestrator.
 
 **Synthetic self-test.** `--raw-ring --synthetic` (and the
 `crates/core/tests/latency.rs` regression that drives the same library logic)

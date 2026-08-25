@@ -584,24 +584,32 @@ fn run_raw_ring(
     // samples and their capture-delivery times; one final drain catches the last
     // tail. Each drain is anchored to `last_push_ns` (see `drain_into_timeline`),
     // so the reconstructed times measure ring entry, not the probe's poll read.
+    // Track the steady-state ring backlog (frames the writer had delivered that a
+    // drain did not pop). A drain that keeps up leaves ~0; a persistent nonzero
+    // backlog is the direct signature of a lagging drain, and the anchor is now
+    // corrected for it (see `drain_into_timeline`). Surface both the worst and the
+    // last observed backlog so a hardware run can see whether the drain keeps up.
+    let mut max_backlog: u64 = 0;
     let deadline = Instant::now() + Duration::from_millis(observe_ms);
     while Instant::now() < deadline {
-        drain_into_timeline(
+        max_backlog = max_backlog.max(drain_into_timeline(
             &mut consumer,
             &mut scratch,
             &mut mono,
             &mut timeline,
             channels,
-        );
+        ));
         sleep(Duration::from_millis(1));
     }
-    drain_into_timeline(
+    // The final drain catches the tail; its backlog is the last snapshot reported.
+    let last_backlog = drain_into_timeline(
         &mut consumer,
         &mut scratch,
         &mut mono,
         &mut timeline,
         channels,
     );
+    max_backlog = max_backlog.max(last_backlog);
 
     drop(player);
     drop(stream);
@@ -654,10 +662,22 @@ fn run_raw_ring(
         sample_rate,
         format.channels,
     );
+    let backlog_ms = |frames: u64| frames as f64 * 1000.0 / f64::from(sample_rate);
     println!(
-        "clicks {emitted} · matched {matched} · missed {}",
+        "clicks {emitted} · matched {matched} · missed {} · ring backlog max {max_backlog} fr \
+         ({:.2} ms) · last {last_backlog} fr ({:.2} ms)",
         emitted.saturating_sub(matched),
+        backlog_ms(max_backlog),
+        backlog_ms(last_backlog),
     );
+    if max_backlog > 0 {
+        eprintln!(
+            "note: a nonzero steady-state ring backlog means the drain ran behind the writer; \
+             the reconstructed times are anchored on capture delivery corrected for it \
+             (max {max_backlog} frames ≈ {:.2} ms).",
+            backlog_ms(max_backlog),
+        );
+    }
     let pct = Percentiles::nearest_rank(arrivals_ms.clone());
     println!(
         "{:<22} {:>7} {:>7} {:>7} {:>7}   (ms)",

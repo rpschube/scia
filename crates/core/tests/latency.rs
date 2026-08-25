@@ -188,26 +188,37 @@ fn synthetic_raw_ring_correlation_is_within_budget() {
     // drain is anchored to the capture-delivery clock (see `drain_into_timeline`),
     // so the reconstructed sample times measure ring entry — independent of how
     // coarsely the platform coalesces this poll.
+    let mut max_backlog: u64 = 0;
     let deadline = Instant::now() + Duration::from_millis(observe_ms);
     while Instant::now() < deadline {
-        drain_into_timeline(
+        max_backlog = max_backlog.max(drain_into_timeline(
             &mut consumer,
             &mut scratch,
             &mut mono,
             &mut timeline,
             channels,
-        );
+        ));
         sleep(Duration::from_millis(1));
     }
-    drain_into_timeline(
+    max_backlog = max_backlog.max(drain_into_timeline(
         &mut consumer,
         &mut scratch,
         &mut mono,
         &mut timeline,
         channels,
-    );
+    ));
 
     drop(stream);
+
+    // The unbounded `drain_all` empties the ring each poll, so the shipped path
+    // keeps up: the steady-state backlog stays within a couple of chunks (the
+    // frames a push can add between the anchor read and the drain), never the
+    // hundreds of frames a persistent lag would show. This is the empirical
+    // counterpart to the unit-level under-drain proof.
+    assert!(
+        max_backlog <= 4 * 256,
+        "steady-state ring backlog {max_backlog} frames — the drain is not keeping up"
+    );
 
     let mut emissions: Vec<Emission> = Vec::new();
     emit_log.drain(&mut emissions);
@@ -267,6 +278,86 @@ fn synthetic_raw_ring_correlation_is_within_budget() {
         pct.median.abs() < 10.0,
         "median emit→raw-arrival {:.2} ms should be within ±10 ms of zero",
         pct.median
+    );
+}
+
+/// Under-drain regression: a drain that runs a constant distance behind the
+/// writer (a steady ring backlog) must still place a click at its true capture-
+/// delivery time. This is the synthetic reproduction of the field's constant
+/// late bias — build a mono stream with a known click, reconstruct its times
+/// through a DELIBERATELY lagging drain, and assert the correlation-found arrival
+/// lands on delivery once the anchor is corrected for the backlog. Without the
+/// occupancy correction the same setup reports the click late by the backlog
+/// span, which the final assertion pins down so the test would have caught it.
+#[test]
+fn synthetic_under_drain_backlog_stays_anchored_to_delivery() {
+    let rate = 48_000u32;
+    let npf = 1.0e9 / f64::from(rate);
+    let fpp = 480u64; // writer packet: 480 frames / 10 ms
+    let period_ns = (fpp as f64 * npf) as u64;
+    let click_frames = 48usize; // ~1 ms click template
+
+    // The writer delivers `packets` packets. A click burst sits at a known global
+    // frame; its true delivery time is the push time of the packet carrying it.
+    let packets = 40u64;
+    let click_frame = 12_000u64; // inside packet 25 (12000 / 480)
+    let click_packet = click_frame / fpp;
+    let true_delivery_ns = (click_packet + 1) * period_ns;
+
+    // Build the mono stream: silence with a rectangular click burst.
+    let total_frames = (packets * fpp) as usize;
+    let mut mono = vec![0.0f32; total_frames];
+    for s in &mut mono[click_frame as usize..click_frame as usize + click_frames] {
+        *s = 0.8;
+    }
+
+    // Reconstruct times through a lagging drain: the drain pops one packet per
+    // poll, but the writer stays LAG packets ahead, so LAG*fpp frames are always
+    // owed. Corrected and uncorrected timelines run in parallel.
+    const LAG: u64 = 3;
+    let mut corrected = DrainTimeline::new(rate);
+    let mut uncorrected = DrainTimeline::new(rate);
+    for k in 0..packets {
+        let last_push_ns = (k + 1) * period_ns; // caught-up delivery clock
+        // With the writer LAG ahead, the drain reads a last_push_ns that is LAG
+        // packets newer and leaves LAG*fpp frames in the ring.
+        let lag_push_ns = last_push_ns + LAG * period_ns;
+        corrected.record_drain_with_backlog(lag_push_ns, fpp, LAG * fpp);
+        uncorrected.record_drain(lag_push_ns, fpp);
+    }
+
+    // Search a wide window around the true delivery and correlate the click.
+    let lo = corrected.frame_at_or_after(true_delivery_ns.saturating_sub(50_000_000)) as usize;
+    let hi = corrected.frame_at_or_after(true_delivery_ns + 50_000_000) as usize;
+    let (offset, peak) = rect_xcorr_peak(&mono, click_frames, lo, hi).expect("a peak");
+    assert!(
+        peak >= RAW_CORR_ACCEPT,
+        "click should correlate (ncc {peak})"
+    );
+    assert!(peak <= 1.0, "ncc {peak} must not exceed 1.0");
+
+    let arrival = corrected
+        .sample_time_ns(offset as u64)
+        .expect("arrival time");
+    let err_ms = (arrival as i64 - true_delivery_ns as i64) as f64 / 1.0e6;
+    // One frame period of quantization plus the click's own sub-packet offset.
+    assert!(
+        err_ms.abs() < 11.0,
+        "corrected arrival {arrival} ns is {err_ms:.2} ms off the true delivery \
+         {true_delivery_ns} ns — the backlog anchor did not pin it"
+    );
+
+    // The uncorrected anchor reports the same click late by ~the backlog span,
+    // proving the correction is what removes the constant bias.
+    let arrival_bad = uncorrected
+        .sample_time_ns(offset as u64)
+        .expect("uncorrected time");
+    let late_ms = (arrival_bad as i64 - arrival as i64) as f64 / 1.0e6;
+    let backlog_span_ms = (LAG * fpp) as f64 * npf / 1.0e6;
+    assert!(
+        (late_ms - backlog_span_ms).abs() < 1.0,
+        "uncorrected arrival should be late by the backlog span {backlog_span_ms:.2} ms, \
+         was {late_ms:.2} ms"
     );
 }
 
