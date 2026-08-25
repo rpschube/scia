@@ -577,6 +577,13 @@ pub(crate) struct DspThread {
     /// [`BeatDebug`], refreshed once per induction pass. Read by
     /// [`Engine::beat_debug`](crate::Engine::beat_debug); never on the hop path.
     pub beat_debug: Arc<Mutex<BeatDebug>>,
+    /// The fullscreen-pause control (US-PERF-3): while set, the loop forces its
+    /// *existing* idle downshift regardless of the audio level, so a game's own
+    /// sound cannot keep the grid at full rate. Driven by the
+    /// [`FullscreenWatch`](crate::fullscreen::FullscreenWatch); exposed to the
+    /// engine as [`Engine::pause_flag`](crate::Engine::pause_flag). Defaults to
+    /// an always-clear flag, so a paused-unaware caller behaves exactly as before.
+    pub pause: Arc<AtomicBool>,
 }
 
 /// Safety cap on silent hops emitted per starved wake, so a long starved sleep
@@ -673,10 +680,26 @@ pub(crate) fn run(mut thread: DspThread) {
             thread.format = new_format;
         }
 
-        let mode = classify(last_non_quiet.elapsed(), quiet_after, idle_after);
+        // Fullscreen pause (US-PERF-3): while a fullscreen-exclusive app is
+        // foreground, force the *existing* idle downshift regardless of the audio
+        // level — a game's own sound must not keep the grid at full rate. This
+        // reuses the idle branch below rather than adding a second throttle; the
+        // pause lifting (not a loud hop) is what resumes.
+        let paused = thread.pause.load(Ordering::Acquire);
+        let mode = if paused {
+            Activity::Idle
+        } else {
+            classify(last_non_quiet.elapsed(), quiet_after, idle_after)
+        };
 
         if mode == Activity::Idle {
             // ---- Idle downshift: drain everything cheaply, then sleep long. ----
+            // While paused, raise the resume threshold out of reach so a loud hop
+            // is never mistaken for a resume: `process_idle` then always takes its
+            // FFT-free relax path, holding paused CPU near zero even with audio
+            // flowing, and the drain never flips back to full rate until the pause
+            // is lifted.
+            let idle_resume_rms = if paused { f32::INFINITY } else { resume_rms };
             let mut resumed = false;
             while thread.consumer.buffered_samples() >= needed {
                 let dropped = thread.stats.dropped_frames.load(Ordering::Relaxed);
@@ -686,22 +709,27 @@ pub(crate) fn run(mut thread: DspThread) {
                     thread.format,
                     timestamp,
                     dropped,
-                    resume_rms,
+                    idle_resume_rms,
                 ) else {
                     break;
                 };
-                if snapshot.rms >= resume_rms && !snapshot.starved {
+                if snapshot.rms >= idle_resume_rms && !snapshot.starved {
                     // Playback resumed: this hop went through the full path.
                     last_non_quiet = Instant::now();
                     stamp(&mut snapshot, Activity::Active, 0.0);
                     resumed = true;
                 } else {
                     let quiet = last_non_quiet.elapsed();
-                    stamp(
-                        &mut snapshot,
-                        classify(quiet, quiet_after, idle_after),
-                        quiet.as_secs_f32() * 1000.0,
-                    );
+                    // While paused the signal may be loud, so `classify` would
+                    // return Active from the recent `last_non_quiet`; force Idle
+                    // so the fullscreen pause actually reads as the downshift it
+                    // is. Unpaused, the normal classification stands.
+                    let activity = if paused {
+                        Activity::Idle
+                    } else {
+                        classify(quiet, quiet_after, idle_after)
+                    };
+                    stamp(&mut snapshot, activity, quiet.as_secs_f32() * 1000.0);
                 }
                 thread
                     .counters

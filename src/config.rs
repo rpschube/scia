@@ -48,6 +48,7 @@ struct RawDefaults {
     presenter: Option<String>,
     overlay: Option<bool>,
     perf_mode: Option<bool>,
+    fullscreen_pause: Option<bool>,
     demo_bpm: Option<f32>,
     chrome: Option<String>,
     device: Option<String>,
@@ -65,6 +66,9 @@ pub struct FileDefaults {
     pub overlay: Option<bool>,
     /// Default perf-mode-on state.
     pub perf_mode: Option<bool>,
+    /// Default fullscreen-pause-on state (US-PERF-3). `None` leaves the built-in
+    /// default (on) in force.
+    pub fullscreen_pause: Option<bool>,
     /// Default demo tempo.
     pub demo_bpm: Option<f32>,
     /// Default chrome personality.
@@ -110,6 +114,10 @@ pub struct CliLayer {
     pub overlay: bool,
     /// `--perf-mode` presence.
     pub perf_mode: bool,
+    /// The fullscreen-pause choice from the two flags: `Some(true)` for
+    /// `--fullscreen-pause`, `Some(false)` for `--no-fullscreen-pause`, `None`
+    /// when neither was given (fall through to config, then the built-in default).
+    pub fullscreen_pause: Option<bool>,
     /// `--demo-bpm N`.
     pub demo_bpm: Option<f32>,
     /// `--chrome MODE`.
@@ -132,6 +140,9 @@ pub struct Resolved {
     pub overlay: bool,
     /// Whether perf mode is requested.
     pub perf_mode: bool,
+    /// Whether automatic pause while a fullscreen app is foreground is enabled
+    /// (US-PERF-3). The built-in default is `true`.
+    pub fullscreen_pause: bool,
     /// Demo tempo in BPM (still clamped by the caller).
     pub demo_bpm: f32,
     /// The chrome personality to start in.
@@ -163,6 +174,13 @@ pub fn resolve(cli: CliLayer, file: &FileDefaults) -> Resolved {
         presenter: cli.presenter.or(file.presenter),
         overlay: cli.overlay || file.overlay.unwrap_or(false),
         perf_mode: cli.perf_mode || file.perf_mode.unwrap_or(false),
+        // Fullscreen pause defaults ON, and has both a force-on and a force-off
+        // flag: a flag (either form) wins, else the config value, else the
+        // built-in default of `true`.
+        fullscreen_pause: cli
+            .fullscreen_pause
+            .or(file.fullscreen_pause)
+            .unwrap_or(true),
         demo_bpm: cli.demo_bpm.or(file.demo_bpm).unwrap_or(DEFAULT_DEMO_BPM),
         chrome: cli.chrome.or(file.chrome).unwrap_or_default(),
         device: cli.device.or_else(|| file.device.clone()),
@@ -239,6 +257,7 @@ pub fn parse(text: &str) -> Config {
         presenter,
         overlay: raw.defaults.overlay,
         perf_mode: raw.defaults.perf_mode,
+        fullscreen_pause: raw.defaults.fullscreen_pause,
         demo_bpm: raw.defaults.demo_bpm,
         chrome,
         device: raw.defaults.device,
@@ -443,6 +462,7 @@ mod tests {
             presenter: Some(PresenterTier::Half),
             overlay: Some(true),
             perf_mode: Some(true),
+            fullscreen_pause: Some(false),
             demo_bpm: Some(90.0),
             chrome: Some(ChromeMode::Instrument),
             device: Some("Speakers".to_string()),
@@ -455,6 +475,7 @@ mod tests {
                 presenter: None,
                 overlay: false,
                 perf_mode: false,
+                fullscreen_pause: None,
                 demo_bpm: None,
                 chrome: None,
                 device: None,
@@ -465,6 +486,10 @@ mod tests {
         assert_eq!(from_config.presenter, Some(PresenterTier::Half));
         assert!(from_config.overlay);
         assert!(from_config.perf_mode);
+        assert!(
+            !from_config.fullscreen_pause,
+            "the config `fullscreen_pause = false` applies with no flag"
+        );
         assert_eq!(from_config.demo_bpm, 90.0);
         assert_eq!(from_config.chrome, ChromeMode::Instrument);
         assert_eq!(
@@ -480,6 +505,7 @@ mod tests {
                 presenter: Some(PresenterTier::Octant),
                 overlay: true,
                 perf_mode: true,
+                fullscreen_pause: Some(true),
                 demo_bpm: Some(140.0),
                 chrome: Some(ChromeMode::Playful),
                 device: Some("Headset".to_string()),
@@ -493,6 +519,10 @@ mod tests {
             "the --device flag beats the config device"
         );
         assert_eq!(from_flags.presenter, Some(PresenterTier::Octant));
+        assert!(
+            from_flags.fullscreen_pause,
+            "--fullscreen-pause beats the config `false`"
+        );
         assert_eq!(from_flags.demo_bpm, 140.0);
         assert_eq!(
             from_flags.chrome,
@@ -507,6 +537,7 @@ mod tests {
                 presenter: None,
                 overlay: false,
                 perf_mode: false,
+                fullscreen_pause: None,
                 demo_bpm: None,
                 chrome: None,
                 device: None,
@@ -523,11 +554,60 @@ mod tests {
         assert!(!bare.overlay);
         assert!(!bare.perf_mode);
         assert_eq!(bare.demo_bpm, DEFAULT_DEMO_BPM);
+        assert!(
+            bare.fullscreen_pause,
+            "the built-in default for fullscreen pause is on"
+        );
         assert_eq!(
             bare.chrome,
             ChromeMode::Invisible,
             "the built-in default is invisible"
         );
+    }
+
+    #[test]
+    fn fullscreen_pause_defaults_on_and_flags_win_both_ways() {
+        // Built-in default: on, with nothing set anywhere.
+        assert!(resolve(empty_cli(), &FileDefaults::default()).fullscreen_pause);
+
+        // Config can turn it off, and back on, with no flag present.
+        let off = FileDefaults {
+            fullscreen_pause: Some(false),
+            ..FileDefaults::default()
+        };
+        assert!(!resolve(empty_cli(), &off).fullscreen_pause);
+        let on = FileDefaults {
+            fullscreen_pause: Some(true),
+            ..FileDefaults::default()
+        };
+        assert!(resolve(empty_cli(), &on).fullscreen_pause);
+
+        // --no-fullscreen-pause (Some(false)) beats a config `true`.
+        let forced_off = resolve(
+            CliLayer {
+                fullscreen_pause: Some(false),
+                ..empty_cli()
+            },
+            &on,
+        );
+        assert!(!forced_off.fullscreen_pause, "--no-fullscreen-pause wins");
+
+        // --fullscreen-pause (Some(true)) beats a config `false`.
+        let forced_on = resolve(
+            CliLayer {
+                fullscreen_pause: Some(true),
+                ..empty_cli()
+            },
+            &off,
+        );
+        assert!(forced_on.fullscreen_pause, "--fullscreen-pause wins");
+    }
+
+    #[test]
+    fn config_fullscreen_pause_key_parses() {
+        let cfg = parse("[defaults]\nfullscreen_pause = false\n");
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(cfg.defaults.fullscreen_pause, Some(false));
     }
 
     #[test]
@@ -549,6 +629,7 @@ mod tests {
                 presenter: None,
                 overlay: false,
                 perf_mode: false,
+                fullscreen_pause: None,
                 demo_bpm: None,
                 chrome: None,
                 device: None,
@@ -563,6 +644,7 @@ mod tests {
                 presenter: None,
                 overlay: false,
                 perf_mode: false,
+                fullscreen_pause: None,
                 demo_bpm: None,
                 chrome: None,
                 device: Some("Line In".to_string()),
@@ -593,6 +675,7 @@ mod tests {
             presenter: None,
             overlay: false,
             perf_mode: false,
+            fullscreen_pause: None,
             demo_bpm: None,
             chrome: None,
             device: None,

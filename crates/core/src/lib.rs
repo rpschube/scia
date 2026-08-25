@@ -31,6 +31,7 @@ pub mod capture;
 pub mod dsp;
 pub mod engine;
 pub mod features;
+pub mod fullscreen;
 pub mod latency;
 pub mod onset;
 pub mod spectrum;
@@ -56,6 +57,10 @@ pub use capture::{
 pub use dsp::{DspConfig, HopProcessor};
 pub use engine::{Engine, EngineConfig, EngineError, EngineStats, PerfModeState};
 pub use features::{Activity, FEATURE_SCHEMA_VERSION, FeatureSnapshot, SPECTRUM_BINS};
+pub use fullscreen::{
+    DEFAULT_POLL as FULLSCREEN_POLL, FullscreenDetector, FullscreenWatch, NoopFullscreenDetector,
+    detector as fullscreen_detector,
+};
 pub use latency::{
     ClickDetector, Detection, Emission, EmitLog, LatencyStats, Matched, Matcher, Percentiles,
     Sample,

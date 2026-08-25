@@ -494,6 +494,10 @@ pub struct Engine {
     /// [`BeatDebug`], refreshed by the DSP thread once per induction pass. Read
     /// with [`Engine::beat_debug`]; never on the hop path.
     beat_debug: Arc<Mutex<BeatDebug>>,
+    /// The fullscreen-pause control shared with the DSP thread (US-PERF-3).
+    /// Handed out with [`Engine::pause_flag`] so a
+    /// [`FullscreenWatch`](crate::fullscreen::FullscreenWatch) can drive it.
+    pause: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -522,6 +526,12 @@ impl Engine {
         let counters = Arc::new(DspCounters::default());
         let swap = Arc::new(RingSwap::new());
         let beat_debug = Arc::new(Mutex::new(BeatDebug::default()));
+        // The fullscreen-pause control (US-PERF-3): clear by default, so an
+        // engine no one drives behaves exactly as before. The DSP thread reads it
+        // to force its idle downshift; a caller flips it via a
+        // [`FullscreenWatch`](crate::fullscreen::FullscreenWatch) on the same
+        // `Arc` returned by [`Engine::pause_flag`].
+        let pause = Arc::new(AtomicBool::new(false));
 
         let dsp = DspThread {
             consumer,
@@ -533,6 +543,7 @@ impl Engine {
             counters: Arc::clone(&counters),
             swap: Arc::clone(&swap),
             beat_debug: Arc::clone(&beat_debug),
+            pause: Arc::clone(&pause),
         };
 
         let dsp_join = thread::Builder::new()
@@ -628,6 +639,7 @@ impl Engine {
                 route_notifier,
                 counters,
                 beat_debug,
+                pause,
             },
             reader,
         ))
@@ -654,6 +666,18 @@ impl Engine {
     #[must_use]
     pub fn now_ns(&self) -> u64 {
         self.shared.stats.now_ns()
+    }
+
+    /// The fullscreen-pause control (US-PERF-3): a clone of the flag the DSP
+    /// thread reads. While it is `true` the DSP thread forces its idle downshift
+    /// regardless of the audio level, so a foreground fullscreen game cannot keep
+    /// the grid at full rate; clearing it resumes full-rate processing within one
+    /// idle poll interval. A
+    /// [`FullscreenWatch`](crate::fullscreen::FullscreenWatch) drives this flag;
+    /// hand it the same `Arc` (and the render loop reads it too, to stop drawing).
+    #[must_use]
+    pub fn pause_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.pause)
     }
 
     /// The current [`PerfModeState`]: [`PerfModeState::Off`] when perf mode was

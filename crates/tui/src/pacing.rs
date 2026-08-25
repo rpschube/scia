@@ -31,6 +31,26 @@ pub fn target_interval(fps: u32, starved_for: Duration) -> Duration {
     }
 }
 
+/// The poll cadence while paused for a foreground fullscreen app (US-PERF-3).
+/// The window is covered, so the loop stops drawing and only polls input at this
+/// slow rate. Reuses [`IDLE_FPS`] so a state change (the app exiting, or a
+/// keystroke) is picked up within one ~100 ms tick — "resume within one poll
+/// interval".
+pub fn pause_interval() -> Duration {
+    active_interval(IDLE_FPS)
+}
+
+/// Whether to draw this frame under the fullscreen-pause policy, given the
+/// current and previous frame's paused state.
+///
+/// While paused the terminal is left untouched — the covered window content does
+/// not matter — *except* the single transition frame entering the pause, which
+/// is drawn so the status line surfaces the paused-for-fullscreen state. Resume
+/// (not paused) always draws.
+pub fn should_draw(fs_paused: bool, was_paused: bool) -> bool {
+    !fs_paused || !was_paused
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,6 +64,26 @@ mod tests {
     #[test]
     fn active_interval_survives_zero_fps() {
         assert_eq!(active_interval(0), active_interval(60));
+    }
+
+    #[test]
+    fn pause_interval_is_the_idle_rate() {
+        // The pause poll runs at the idle rate: slow enough for near-zero CPU,
+        // fast enough that resume/input latency stays ~one 100 ms tick.
+        assert_eq!(pause_interval(), active_interval(IDLE_FPS));
+        assert_eq!(pause_interval(), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn should_draw_policy() {
+        // Not paused: always draw (this covers the disabled case too — a disabled
+        // feature never sets fs_paused, so every frame draws).
+        assert!(should_draw(false, false));
+        assert!(should_draw(false, true), "resume draws");
+        // Entering pause: draw the one transition frame that shows the status.
+        assert!(should_draw(true, false), "entry frame draws");
+        // Held paused: skip drawing, leaving the terminal untouched.
+        assert!(!should_draw(true, true), "held pause stops draws");
     }
 
     #[test]
