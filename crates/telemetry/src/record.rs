@@ -134,6 +134,20 @@ impl Record {
     }
 }
 
+/// Serialize one [`Record`] to a single JSON line (no trailing newline).
+///
+/// The string counterpart to [`RecordWriter::write`] for callers that collect a
+/// run's records in memory and emit them as one JSONL block rather than
+/// streaming: the bytes are identical to a [`RecordWriter`] line without its
+/// trailing newline. Round-trips with [`Record::from_line`].
+///
+/// # Errors
+/// Returns the underlying `serde_json` error (does not occur for a well-formed
+/// record).
+pub fn to_line(record: &Record) -> serde_json::Result<String> {
+    serde_json::to_string(record)
+}
+
 /// A buffered JSON Lines writer for [`Record`]s.
 ///
 /// Each record is serialized into a single reused byte buffer (cleared, not

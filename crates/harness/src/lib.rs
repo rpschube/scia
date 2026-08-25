@@ -3,13 +3,17 @@
 //! The harness replays recorded feature-stream clips through scenes headlessly,
 //! scores the resulting [`scia_scenes::Canvas`] display lists with per-run
 //! metrics, and provides the A/B, preference-log and envelope-freeze plumbing
-//! that the scene-calibration pass is built on. It depends only on `scia-core`
-//! (the feature-stream reader and the synthetic feed) and `scia-scenes` (the
-//! scene registry and the abstract canvas); it drives no UI.
+//! that the scene-calibration pass is built on. It depends on `scia-core` (the
+//! feature-stream reader and the synthetic feed), `scia-scenes` (the scene
+//! registry and the abstract canvas) and `scia-telemetry` (the run-record
+//! schema); it drives no UI.
+//!
+//! The run-record schema v1 (JSON Lines) it replays and writes lives in the
+//! shared [`scia_telemetry::record`] crate; the harness serialises through those
+//! structs so its wire form stays byte-identical to the app's `--log-run`.
 //!
 //! # Modules
 //!
-//! * [`records`] — the frozen run-record schema v1 (JSON Lines).
 //! * [`synth`] — deterministic synthetic golden clips.
 //! * [`clip`] / [`corpus`] — the golden-clip corpus and its manifest.
 //! * [`canvas_stats`] — per-hop stats rasterised from a scene's display list.
@@ -28,7 +32,6 @@ pub mod corpus;
 pub mod freeze;
 pub mod hash;
 pub mod metrics;
-pub mod records;
 pub mod replay;
 pub mod synth;
 pub mod util;

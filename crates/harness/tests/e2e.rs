@@ -6,9 +6,9 @@
 use scia_harness::corpus::{ClipEntry, Manifest, verify};
 use scia_harness::hash::sha256_hex;
 use scia_harness::metrics::MetricParams;
-use scia_harness::records::{Record, from_line, to_line};
 use scia_harness::replay::{RunRequest, run};
 use scia_harness::synth::{SynthSpec, synth_spec};
+use scia_telemetry::record::{Record, to_line};
 
 /// A short deterministic clip so the tests stay fast.
 fn short_clip() -> SynthSpec {
@@ -86,7 +86,7 @@ fn run_records_round_trip_through_serde() {
     for rec in &out.records {
         let line = to_line(rec).expect("encode");
         assert!(!line.contains('\n'));
-        let back = from_line(&line).expect("decode");
+        let back = Record::from_line(&line).expect("decode");
         assert_eq!(&back, rec, "record did not round-trip");
     }
 

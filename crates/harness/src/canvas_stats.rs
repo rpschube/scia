@@ -22,7 +22,7 @@
 
 use scia_scenes::{Canvas as SceneCanvas, PALETTE_SLOTS, Palette, Primitive, Rgb};
 
-use crate::records::Canvas as CanvasRec;
+use scia_telemetry::record::CanvasStats as CanvasRec;
 
 /// Grid width (cells across the normalised unit square).
 pub const GRID_W: usize = 64;
