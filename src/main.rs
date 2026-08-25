@@ -111,6 +111,52 @@ fn scene_for_tui(resolved: Option<&str>) -> Option<String> {
     }
 }
 
+/// How an `--input` argument was interpreted by [`classify_input`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InputSource {
+    /// A TCP address to connect to (an `--output --listen` server).
+    Tcp(String),
+    /// A recorded clip file on disk to replay.
+    File(PathBuf),
+}
+
+/// Whether an `--input` argument looks like a socket address (`ip:port` or
+/// `host:port`) rather than a filesystem path — decided syntactically, without
+/// touching the network or the filesystem, so it is unit-tested directly.
+///
+/// An `ip:port` (v4 or bracketed v6) parses straight to a [`std::net::SocketAddr`].
+/// A `host:port` with a DNS name (which does not parse as a `SocketAddr`) is
+/// recognised by shape: the last `:` splits a non-empty host from a numeric
+/// `u16` port. A path with no such trailing `:port` (`clip.bin`,
+/// `/clips/song.bin`, `./take-2`) is not address-like.
+fn looks_like_socket_addr(arg: &str) -> bool {
+    if arg.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    match arg.rsplit_once(':') {
+        Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok(),
+        None => false,
+    }
+}
+
+/// Decide what an `--input` argument names: an address-looking string is a TCP
+/// endpoint (as before); otherwise an existing path is a clip file to replay;
+/// otherwise it is an error naming both interpretations. The address check comes
+/// first so the socket path is unchanged. Pure apart from the path-existence
+/// probe, so the address/garbage arms are unit-tested directly.
+fn classify_input(arg: &str) -> Result<InputSource, String> {
+    if looks_like_socket_addr(arg) {
+        return Ok(InputSource::Tcp(arg.to_string()));
+    }
+    let path = Path::new(arg);
+    if path.exists() {
+        return Ok(InputSource::File(path.to_path_buf()));
+    }
+    Err(format!(
+        "--input '{arg}' is neither a socket address (host:port) nor a path to an existing clip file"
+    ))
+}
+
 /// A live, terminal audio spectrum.
 #[derive(Parser, Debug)]
 #[command(name = "scia", version, about, long_about = None, after_long_help = CONFIG_HELP)]
@@ -266,16 +312,26 @@ struct Cli {
     #[arg(long, value_name = "N", requires = "output")]
     rate: Option<u32>,
 
-    /// Render the full TUI from a remote feature stream at this TCP address
-    /// (e.g. 127.0.0.1:9000) served by another scia running `--output --listen`,
-    /// instead of capturing local audio. Reconnects automatically if the stream
-    /// drops. Mutually exclusive with the local-capture flags.
+    /// Render the full TUI from a feature stream instead of capturing local
+    /// audio. The argument is either a TCP address (e.g. 127.0.0.1:9000) served
+    /// by another scia running `--output --listen` — reconnecting automatically
+    /// if the stream drops — or the path to a recorded clip file on disk (a
+    /// `scia --output binary > clip.bin` capture), replayed live at its recorded
+    /// cadence. An address is tried first; otherwise an existing path replays;
+    /// anything else errors naming both interpretations. Mutually exclusive with
+    /// the local-capture flags.
     #[arg(
         long,
-        value_name = "ADDR",
+        value_name = "ADDR|PATH",
         conflicts_with_all = ["demo", "demo_signal", "demo_bpm", "device", "pipewire", "no_pipewire", "perf_mode", "no_route_watch", "headless", "seconds", "list_devices"]
     )]
     input: Option<String>,
+
+    /// When --input names a clip file (not a TCP address), seamlessly restart it
+    /// at end of file for extended A/B listening. Only valid with a file
+    /// `--input`; an error otherwise.
+    #[arg(long = "input-loop", requires = "input")]
+    input_loop: bool,
 
     /// List every registered scene and built-in preset, then exit.
     #[arg(long)]
@@ -527,8 +583,8 @@ fn main() -> ExitCode {
 
     // Thin frontend: render the full TUI from a remote feature stream instead of
     // a local capture engine.
-    if let Some(addr) = cli.input.clone() {
-        return run_input_mode(&cli, &resolved, addr, cfg.keymap);
+    if let Some(spec) = cli.input.clone() {
+        return run_input_mode(&cli, &resolved, spec, cfg.keymap);
     }
 
     if cli.demo {
@@ -616,11 +672,48 @@ fn run_output_mode(cli: &Cli, resolved: &Resolved, encoding: Encoding) -> ExitCo
     )
 }
 
-/// `--input` mode: render the full TUI from a remote feature stream. The local
-/// feature bus is fed by a background producer that connects to `addr`; the TUI
-/// polls the producer's connection state for its health/quiet display.
-fn run_input_mode(cli: &Cli, resolved: &Resolved, addr: String, keymap: Keymap) -> ExitCode {
-    let (reader, handle) = stream::start_input(addr.clone());
+/// `--input` mode: render the full TUI from a feature stream — a remote socket
+/// or a recorded clip file on disk. The local feature bus is fed by a background
+/// producer (connecting to the address, or replaying the file); the TUI polls
+/// the producer's state for its health/quiet display.
+fn run_input_mode(cli: &Cli, resolved: &Resolved, spec: String, keymap: Keymap) -> ExitCode {
+    let source = match classify_input(&spec) {
+        Ok(source) => source,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+    };
+    // `--input-loop` only means something for a clip file; reject it on a socket
+    // rather than silently ignoring it.
+    if cli.input_loop && matches!(source, InputSource::Tcp(_)) {
+        eprintln!("--input-loop is only valid when --input names a clip file, not a TCP address");
+        return ExitCode::from(2);
+    }
+
+    // Spawn the matching producer and derive the TUI's source/label strings.
+    let (reader, handle, source_str, label) = match source {
+        InputSource::Tcp(addr) => {
+            let (reader, handle) = stream::start_input(addr.clone());
+            let label = format!("INPUT — {addr}");
+            (reader, handle, addr, label)
+        }
+        InputSource::File(path) => {
+            let (reader, handle) = stream::start_input_file(path.clone(), cli.input_loop);
+            // Name the clip by its file name on the local screen — a full path is
+            // both noisy and needless in the label.
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let label = if cli.input_loop {
+                format!("CLIP — {name} (loop)")
+            } else {
+                format!("CLIP — {name}")
+            };
+            (reader, handle, name, label)
+        }
+    };
 
     // A `--scene-file` preset (if any) is loaded before the TUI takes the
     // terminal; `_watcher` must outlive `run` to keep the watch alive.
@@ -642,8 +735,8 @@ fn run_input_mode(cli: &Cli, resolved: &Resolved, addr: String, keymap: Keymap) 
     tracing::info!(target: "scia::tui", presenter = ?presenter_mode, "presenter tier selected");
     let opts = TuiOptions {
         fps: cli.fps,
-        label: Some(format!("INPUT — {addr}")),
-        source: addr,
+        label: Some(label),
+        source: source_str,
         frames: cli.frames,
         debug: cli.debug,
         overlay: resolved.overlay,
@@ -1536,6 +1629,81 @@ mod tests {
             Cli::try_parse_from(["scia", "--output", "json", "--listen", "127.0.0.1:9000"]).is_ok()
         );
         assert!(Cli::try_parse_from(["scia", "--output", "json", "--rate", "30"]).is_ok());
+    }
+
+    #[test]
+    fn socket_addr_shapes_are_recognised_as_addresses() {
+        // ip:port (v4 and bracketed v6) and host:port all read as addresses.
+        for s in [
+            "127.0.0.1:9000",
+            "0.0.0.0:7526",
+            "[::1]:9000",
+            "localhost:9000",
+            "windows-host:7526",
+            "stream-host:1234",
+        ] {
+            assert!(looks_like_socket_addr(s), "{s} should look like an address");
+        }
+    }
+
+    #[test]
+    fn file_paths_are_not_recognised_as_addresses() {
+        // No trailing `:port`, or a non-numeric/oversized port → a path.
+        for s in [
+            "clip.bin",
+            "/clips/song.bin",
+            "./take-2",
+            "recording",
+            "clip:notaport",
+            "host:99999", // > u16::MAX
+            "trailing:",
+        ] {
+            assert!(
+                !looks_like_socket_addr(s),
+                "{s} should not look like an address"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_input_routes_addresses_files_and_garbage() {
+        // An address-looking string is TCP without touching the filesystem.
+        assert_eq!(
+            classify_input("127.0.0.1:9000"),
+            Ok(InputSource::Tcp("127.0.0.1:9000".to_string()))
+        );
+        assert_eq!(
+            classify_input("windows-host:7526"),
+            Ok(InputSource::Tcp("windows-host:7526".to_string()))
+        );
+
+        // An existing, non-address path replays as a file.
+        let mut path = std::env::temp_dir();
+        path.push(format!("scia-classify-{}.bin", std::process::id()));
+        std::fs::write(&path, b"SCIA").expect("write temp clip");
+        let arg = path.to_str().expect("utf8 path");
+        assert_eq!(
+            classify_input(arg),
+            Ok(InputSource::File(path.clone())),
+            "an existing file path replays as a clip"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // Neither an address nor an existing path is a clear error naming both.
+        let err = classify_input("no-such-clip-xyz").expect_err("garbage errors");
+        assert!(err.contains("socket address"), "err: {err}");
+        assert!(err.contains("clip file"), "err: {err}");
+    }
+
+    #[test]
+    fn input_loop_requires_input() {
+        // `--input-loop` on its own is rejected (it requires `--input`).
+        assert!(Cli::try_parse_from(["scia", "--input-loop"]).is_err());
+        // Alongside `--input` it parses (the file-vs-address runtime check is in
+        // run_input_mode).
+        let cli =
+            Cli::try_parse_from(["scia", "--input", "clip.bin", "--input-loop"]).expect("parses");
+        assert!(cli.input_loop);
     }
 
     #[test]
