@@ -207,7 +207,20 @@ fn cmd_run(quality_dir: &Path, args: RunArgs) -> Result<(), String> {
             let (p, label) = load_preset_labeled(path)?;
             (Some(p), Some(label))
         }
-        None => (None, None),
+        // Without a preset the scene id alone decides what runs, and the replay
+        // engine falls back to spectra on an unknown id — a measurement tool
+        // must never silently score the wrong scene, so reject the id here.
+        None => match scia_scenes::scene_info(&args.scene) {
+            Some(_) => (None, None),
+            None => {
+                let known: Vec<&str> = scia_scenes::builtin_scenes().iter().map(|s| s.id).collect();
+                return Err(format!(
+                    "unknown scene '{}' (known: {})",
+                    args.scene,
+                    known.join(", ")
+                ));
+            }
+        },
     };
 
     let req = RunRequest {
