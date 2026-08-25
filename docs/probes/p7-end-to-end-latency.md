@@ -816,3 +816,14 @@ The six prior rounds are kept above in full: they are the record of how the answ
 was found — each clock-model fix was real and read clean on its own terms, and it
 took putting both detectors on one coordinate (round 6) to see that the raw leg,
 not any clock, carried the ~30 ms.
+
+**Confirmed (reference endpoint, shared-mode 48 kHz, 2026-08-25).** The run
+above delivered exactly the predicted result: 25/25 clicks matched on both
+legs, `subset 25/25`, per-click `Δ = 0.00 ms`, and the two medians identical —
+`emit → raw-arrival = emit → publish = 78.69 ms` (spread 78.46–78.79), tee
+dropped-pushes 0. With `output delay (cb→play) ≈ 39.9 ms` (the probe player's
+own render buffering), the endpoint's playback → ring capture transport is
+**≈ 38.8 ms**, and scia's own contribution above ring entry is the measured
+hop gather (≤ one hop, observed 0.00) plus the ~1–3 ms bus poll and up to one
+render frame. The P7 reconciliation is closed; these are the figures
+US-PERF-1 scoring builds on.
