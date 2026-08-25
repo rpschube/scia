@@ -18,6 +18,17 @@ to grow a GPU window and a desktop-wallpaper mode later.
 - Now-playing metadata and album-art palettes from any player
 - A single small binary, permissively licensed
 
+## Make your own scenes
+
+A scene or preset is one self-contained file you drop next to the built-ins — no
+build step. Retune a built-in with a TOML preset, wire the audio to a knob with a
+one-line expression, or write a small sandboxed Luau scene for a wholly new look.
+Start from the guide, [docs/authoring.md](docs/authoring.md), and the two ready
+templates: [templates/preset-template.toml](templates/preset-template.toml) and
+[templates/scene-template.lua](templates/scene-template.lua). The format and
+scripting references are [docs/presets.md](docs/presets.md) and
+[docs/scenes.md](docs/scenes.md).
+
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the

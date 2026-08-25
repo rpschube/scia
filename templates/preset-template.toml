@@ -1,0 +1,94 @@
+# preset-template.toml — a minimal, runnable starting point for your own preset.
+#
+# A preset is rung 0 of the scene engine: one self-contained TOML file that
+# fully describes a scene instance — the scene to draw, its typed parameters, an
+# optional layer stack, feature -> parameter mappings, and a palette. No code.
+#
+# Copy this file into your presets directory, rename it, change [preset].name,
+# and start editing. Every table and key the format understands appears below,
+# either set or shown in a comment.
+#
+# Where this file goes (the same root as config.toml):
+#   Unix:    ~/.config/scia/presets/       (or $XDG_CONFIG_HOME/scia/presets/)
+#   Windows: %APPDATA%\scia\presets\
+# Then run it with:  scia --scene <name>    (the name you set below)
+# Or run it straight from a path and hot-reload on every save:
+#                    scia --demo --scene-file path/to/preset-template.toml
+#
+# The full guide (every field, the expression vocabulary, curves, envelopes and
+# the error format) lives in docs/authoring.md and docs/presets.md.
+
+[preset]
+# Required. The preset's own name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits,
+# dashes; must start alphanumeric). This is the name you pass to `--scene`.
+# Rename it when you copy this file so it does not clash with the template.
+name = "preset-template"
+# Required. A registered scene id — a built-in (run `scia --list-scenes`) or a
+# `.lua` scene you have dropped in. `spectra` is the canonical analyzer and is
+# always present, so this template runs on any install.
+scene = "spectra"
+# Optional. A one-line human description.
+description = "A starter preset driving the spectra analyzer — copy it and make it yours."
+# Optional. A one-word mood; defaults to the scene's own mood.
+mood = "template"
+
+# Optional. Typed parameters for the preset's scene. Every key must exist in
+# that scene's parameter manifest, and every value is a number within the
+# parameter's range; omitted keys keep their manifest default. The keys below
+# are `spectra`'s manifest — change the scene above and these change with it.
+[params]
+# release     0.15   range 0.01..=2.0   extra release time constant (seconds)
+release = 0.15
+# punch_decay 0.25   range 0.01..=2.0   onset-envelope decay time constant (seconds)
+punch_decay = 0.25
+# punch       0.35   range 0.0..=2.0    how much the envelope lifts the low bars
+punch = 0.35
+# gap         0.15   range 0.0..=0.9    gap between bars, as a fraction of a column
+gap = 0.15
+
+# Optional. A layer stack. With NO [[layer]] tables (the default, as here) the
+# preset is exactly one layer: [preset].scene drawn with [params]. Add one or
+# more [[layer]] tables to composite several scenes; each names its own scene,
+# an optional blend (over | add | max, default over) and intensity (0.0..=1.0,
+# default 1.0). [layer.params] is typed against THAT layer's scene and merges
+# over its defaults (manifest default < [params] < [layer.params]). When layers
+# are present, [map] below targets the FIRST layer's scene.
+#
+# [[layer]]
+# scene = "spectra"
+# blend = "add"
+# intensity = 0.8
+# [layer.params]
+# gap = 0.25
+
+# Optional. Feature -> parameter mappings, applied live every frame. Each key is
+# a parameter of the mapped scene; each value is EITHER a response table
+# (feature + curve + envelope) OR a string expression over the feature
+# vocabulary, compiled once at load and evaluated per frame.
+#
+# features (table form): bass | mid | treb | loud | peak | onset | flux | beat | width
+# curves:  linear | pow (needs exponent > 0) | log | step (needs threshold 0..=1)
+# attack_ms / decay_ms >= 0 (default 0 = instant); scale default 1.0; offset default 0.0
+#
+# expression variables (all 0..1; width is raw stereo_correlation, 0 for now):
+#   bass mid treb loud peak onset flux beat beat_conf width
+# `onset` in an expression is an envelope: 1.0 on an onset hop, then a ~250 ms
+# exponential decay. Operators are + - * / % ^ with parentheses, plus fasteval's
+# builtin math functions (sin, cos, abs, min, max, log, ...).
+[map]
+# Table form: lift the low-end punch on every onset — instant attack, a
+# quarter-second decay.
+punch = { feature = "onset", curve = "linear", attack_ms = 0, decay_ms = 250, scale = 0.9, offset = 0.0 }
+# Expression form (shown commented): the same key, driven instead by the onset
+# envelope plus a touch of bass.
+# punch = "onset * 0.7 + bass * 0.2"
+
+# Optional. The palette.
+[palette]
+# static | album-art. `album-art` is accepted and validated but resolves to the
+# host default palette until the album-art card lands.
+source = "static"
+# Optional. When present, exactly 8 "#rrggbb" entries (a leading # and six hex
+# digits); only meaningful with a static source. Omit to use the host default
+# palette.
+slots = ["#0d3b3b", "#1f8f8f", "#3fd0d0", "#ffb020", "#ff6b5b", "#14161c", "#8a8f9c", "#e6e8ee"]
