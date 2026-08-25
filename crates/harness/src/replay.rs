@@ -122,8 +122,9 @@ pub fn run(req: &RunRequest) -> RunOutput {
         Some(p) => p,
         None => {
             let info = scene_info(req.scene).unwrap_or_else(|| {
-                // An unknown scene id still yields a spectra-shaped preset so the
-                // caller gets a clear "no primitives" run rather than a panic.
+                // Total fallback so this path cannot panic; it renders (and
+                // scores) spectra, NOT the requested id — callers must validate
+                // the scene id first (the CLI rejects unknown ids up front).
                 scene_info("spectra").expect("spectra is registered")
             });
             owned_preset = Preset::for_scene(info, palette);
