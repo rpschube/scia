@@ -842,31 +842,27 @@ fn run_loop(
         }
 
         // Input doubles as the frame sleep: poll until this frame's deadline so
-        // keys are handled immediately. An overrunning frame skips straight to
-        // the next frame rather than queuing.
+        // keys are handled immediately. When a draw overruns the interval the
+        // deadline has already passed, so `pump_input` still runs a bounded
+        // zero-timeout drain of the buffered keys (see its docs) rather than
+        // skipping input entirely and stranding every keystroke.
         let deadline = frame_start + interval;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining == Duration::ZERO {
-                break;
+        let mut poll = event::poll;
+        let mut read = event::read;
+        match pump_input(deadline, &mut poll, &mut read, &mut ui)? {
+            PumpOutcome::Quit => {
+                let (p50, p99) = frame_times.percentiles();
+                return Ok(RunSummary {
+                    frames,
+                    p50_frame_ms: p50,
+                    p99_frame_ms: p99,
+                    error: None,
+                });
             }
-            if event::poll(remaining)? {
-                match handle_event(event::read()?, &mut ui) {
-                    Action::Quit => {
-                        let (p50, p99) = frame_times.percentiles();
-                        return Ok(RunSummary {
-                            frames,
-                            p50_frame_ms: p50,
-                            p99_frame_ms: p99,
-                            error: None,
-                        });
-                    }
-                    // A resize or debug toggle: redraw promptly on the next
-                    // frame rather than finishing out the sleep.
-                    Action::Redraw => break,
-                    Action::None => {}
-                }
-            }
+            // A resize or state toggle redraws promptly on the next frame; a
+            // clean deadline exit simply advances the loop. Either way the loop
+            // proceeds to the next frame — the drain, if any, already ran.
+            PumpOutcome::Redraw | PumpOutcome::Deadline => {}
         }
     }
 
@@ -933,6 +929,96 @@ enum Action {
     Redraw,
     /// Quit the loop.
     Quit,
+}
+
+/// The most input events [`pump_input`] will drain in a single overrunning
+/// frame. The overrun drain polls with a zero timeout, so without a bound a
+/// flood of buffered keystrokes (a stuck key, a paste) could keep it spinning
+/// and starve the very redraw that is falling behind. Capping it processes the
+/// backlog steadily — this many per frame — while guaranteeing the phase always
+/// returns; anything past the cap waits in the tty buffer for the next frame.
+const MAX_OVERRUN_EVENTS: usize = 32;
+
+/// How one frame's input phase ([`pump_input`]) ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PumpOutcome {
+    /// A quit was requested; the loop should return immediately.
+    Quit,
+    /// A redraw was requested (a resize or a state toggle); proceed to the next
+    /// frame without finishing out the sleep.
+    Redraw,
+    /// The phase ran to the deadline with nothing forcing an early redraw.
+    Deadline,
+}
+
+/// Run one frame's input phase: poll for events until `deadline`, handling each
+/// as it arrives, and — crucially — guarantee that pending input is drained even
+/// when the frame has already overrun its budget.
+///
+/// The input phase doubles as the frame's sleep. On a healthy frame `deadline`
+/// is still in the future, so this polls with the remaining budget and handles
+/// events as they arrive, breaking at the deadline — behaviour identical to the
+/// pre-fix loop. But when a draw overruns the frame interval the deadline has
+/// already passed on entry, leaving zero remaining budget every frame; the old
+/// code then broke out *before a single poll*, so input was never read and every
+/// keystroke piled up unhandled in the tty buffer. To prevent that, once the
+/// deadline has passed (on entry, or once it passes mid-phase) this switches to
+/// a bounded zero-timeout drain: up to [`MAX_OVERRUN_EVENTS`] iterations of
+/// `poll(Duration::ZERO)` → [`handle_event`], so buffered keys are processed
+/// exactly once per frame even under chronic overrun, with the cap ensuring a
+/// key flood can never spin here forever.
+///
+/// Quit/redraw semantics match the normal path: a `Quit` (in either phase)
+/// returns [`PumpOutcome::Quit`] immediately, leaving any later events for the
+/// caller to abandon; a `Redraw` in the normal phase returns at once, while a
+/// `Redraw` mid-drain finishes the bounded drain before returning
+/// [`PumpOutcome::Redraw`], so no buffered key is skipped on the way out.
+///
+/// `poll` and `read` are seams over [`event::poll`]/[`event::read`] so the phase
+/// is unit-tested with scripted closures and no tty.
+fn pump_input(
+    deadline: Instant,
+    poll: &mut impl FnMut(Duration) -> io::Result<bool>,
+    read: &mut impl FnMut() -> io::Result<Event>,
+    ui: &mut UiState,
+) -> io::Result<PumpOutcome> {
+    // Normal path: while budget remains, poll with it and handle events as they
+    // arrive, breaking at the deadline. Byte-identical to the pre-fix loop.
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining == Duration::ZERO {
+            break;
+        }
+        if poll(remaining)? {
+            match handle_event(read()?, ui) {
+                Action::Quit => return Ok(PumpOutcome::Quit),
+                Action::Redraw => return Ok(PumpOutcome::Redraw),
+                Action::None => {}
+            }
+        }
+    }
+
+    // Overrun path: the deadline has passed. Drain buffered input with a zero
+    // timeout so keys are never stranded, bounded to MAX_OVERRUN_EVENTS so a
+    // flood cannot spin the frame forever — any leftover waits for the next one.
+    // A redraw does not short-circuit the drain: it is remembered and the drain
+    // runs to completion so no queued key is skipped.
+    let mut redraw = false;
+    for _ in 0..MAX_OVERRUN_EVENTS {
+        if !poll(Duration::ZERO)? {
+            break;
+        }
+        match handle_event(read()?, ui) {
+            Action::Quit => return Ok(PumpOutcome::Quit),
+            Action::Redraw => redraw = true,
+            Action::None => {}
+        }
+    }
+    Ok(if redraw {
+        PumpOutcome::Redraw
+    } else {
+        PumpOutcome::Deadline
+    })
 }
 
 /// Holds the frozen snapshot across paused frames.
@@ -2231,5 +2317,142 @@ mod tests {
         );
         assert_eq!(r, HealthReaction::Failed("device gone".to_string()));
         assert!(!reconnecting, "failing clears the reconnecting flag");
+    }
+
+    /// A scripted input source for [`pump_input`]: `poll` reports whether an
+    /// event is queued (ignoring its timeout, so the normal path spins to a real
+    /// short deadline), and `read` pops the next one. Returning the queue lets a
+    /// test assert how many events were consumed.
+    fn scripted(events: Vec<Event>) -> std::cell::RefCell<std::collections::VecDeque<Event>> {
+        std::cell::RefCell::new(events.into_iter().collect())
+    }
+
+    #[test]
+    fn overrun_drain_handles_all_pending_events() {
+        // The deadline is already in the past, so the normal loop breaks at once
+        // and the zero-timeout drain runs. All three queued keys are handled.
+        let q = scripted(vec![
+            press(KeyCode::Char('z')),
+            press(KeyCode::Char('z')),
+            press(KeyCode::Char('z')),
+        ]);
+        let mut poll = |_: Duration| Ok(!q.borrow().is_empty());
+        let mut read = || Ok(q.borrow_mut().pop_front().unwrap());
+        let mut ui = UiState::default();
+        let deadline = Instant::now() - Duration::from_millis(1);
+
+        let outcome = pump_input(deadline, &mut poll, &mut read, &mut ui).unwrap();
+        assert_eq!(outcome, PumpOutcome::Deadline);
+        assert!(q.borrow().is_empty(), "the drain handled all three events");
+
+        // A second call shows no residue: nothing left to drain.
+        let outcome = pump_input(deadline, &mut poll, &mut read, &mut ui).unwrap();
+        assert_eq!(outcome, PumpOutcome::Deadline);
+        assert!(q.borrow().is_empty());
+    }
+
+    #[test]
+    fn overrun_drain_is_capped_per_frame() {
+        // More than the cap is queued: exactly MAX_OVERRUN_EVENTS are handled
+        // this frame and the remainder is left for the next one — no infinite
+        // drain.
+        let total = MAX_OVERRUN_EVENTS + 5;
+        let q = scripted(
+            std::iter::repeat_with(|| press(KeyCode::Char('z')))
+                .take(total)
+                .collect(),
+        );
+        let mut poll = |_: Duration| Ok(!q.borrow().is_empty());
+        let mut read = || Ok(q.borrow_mut().pop_front().unwrap());
+        let mut ui = UiState::default();
+        let deadline = Instant::now() - Duration::from_millis(1);
+
+        let outcome = pump_input(deadline, &mut poll, &mut read, &mut ui).unwrap();
+        assert_eq!(outcome, PumpOutcome::Deadline);
+        assert_eq!(
+            q.borrow().len(),
+            5,
+            "exactly the cap was handled; the remainder waits for the next frame"
+        );
+
+        // The next frame drains what was left.
+        let outcome = pump_input(deadline, &mut poll, &mut read, &mut ui).unwrap();
+        assert_eq!(outcome, PumpOutcome::Deadline);
+        assert!(q.borrow().is_empty(), "the remainder drained next frame");
+    }
+
+    #[test]
+    fn quit_mid_drain_returns_immediately() {
+        // A Quit during the drain returns at once, leaving the events after it
+        // unconsumed.
+        let q = scripted(vec![
+            press(KeyCode::Char('z')),
+            press_ctrl(KeyCode::Char('c')),
+            press(KeyCode::Char('z')),
+            press(KeyCode::Char('z')),
+        ]);
+        let mut poll = |_: Duration| Ok(!q.borrow().is_empty());
+        let mut read = || Ok(q.borrow_mut().pop_front().unwrap());
+        let mut ui = UiState::default();
+        let deadline = Instant::now() - Duration::from_millis(1);
+
+        let outcome = pump_input(deadline, &mut poll, &mut read, &mut ui).unwrap();
+        assert_eq!(outcome, PumpOutcome::Quit);
+        assert_eq!(
+            q.borrow().len(),
+            2,
+            "the two events after the quit are left unconsumed"
+        );
+    }
+
+    #[test]
+    fn redraw_mid_drain_finishes_the_drain() {
+        // A redraw during the drain does not short-circuit: the buffered key
+        // after it is still handled this frame, and the outcome is Redraw.
+        let q = scripted(vec![
+            press(KeyCode::Char('z')),
+            press(KeyCode::Char('?')), // toggles help → Action::Redraw
+            press(KeyCode::Char('z')),
+        ]);
+        let mut poll = |_: Duration| Ok(!q.borrow().is_empty());
+        let mut read = || Ok(q.borrow_mut().pop_front().unwrap());
+        let mut ui = UiState::default();
+        let deadline = Instant::now() - Duration::from_millis(1);
+
+        let outcome = pump_input(deadline, &mut poll, &mut read, &mut ui).unwrap();
+        assert_eq!(outcome, PumpOutcome::Redraw);
+        assert!(q.borrow().is_empty(), "the drain ran on despite the redraw");
+        assert!(ui.help, "the help toggle was applied mid-drain");
+    }
+
+    #[test]
+    fn normal_path_handles_events_then_exits_at_deadline() {
+        // Time remains: the queued key is handled, then with the poll closure
+        // reporting nothing the loop runs to the (short, real) deadline and
+        // exits with Deadline.
+        let q = scripted(vec![press(KeyCode::Char('z'))]);
+        let mut poll = |_: Duration| Ok(!q.borrow().is_empty());
+        let mut read = || Ok(q.borrow_mut().pop_front().unwrap());
+        let mut ui = UiState::default();
+        let deadline = Instant::now() + Duration::from_millis(5);
+
+        let outcome = pump_input(deadline, &mut poll, &mut read, &mut ui).unwrap();
+        assert_eq!(outcome, PumpOutcome::Deadline);
+        assert!(q.borrow().is_empty(), "the queued event was handled");
+    }
+
+    #[test]
+    fn normal_path_redraw_returns_before_the_deadline() {
+        // A redraw-triggering key returns Redraw promptly, without finishing out
+        // the (here, far-off) sleep.
+        let q = scripted(vec![press(KeyCode::Char('?'))]);
+        let mut poll = |_: Duration| Ok(!q.borrow().is_empty());
+        let mut read = || Ok(q.borrow_mut().pop_front().unwrap());
+        let mut ui = UiState::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        let outcome = pump_input(deadline, &mut poll, &mut read, &mut ui).unwrap();
+        assert_eq!(outcome, PumpOutcome::Redraw);
+        assert!(ui.help, "the help toggle was applied");
     }
 }
