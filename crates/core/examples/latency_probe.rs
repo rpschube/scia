@@ -2,7 +2,7 @@
 //! stick for the audio→feature path.
 //!
 //! ```text
-//! latency_probe [--synthetic] [--device NAME] [--output-device NAME]
+//! latency_probe [--synthetic] [--raw-ring] [--device NAME] [--output-device NAME]
 //!               [--clicks N] [--spacing-ms N] [--amp F] [--click-ms F]
 //!               [--threshold F] [--perf-mode] [--list]
 //! ```
@@ -22,6 +22,12 @@
 //! - **Synthetic** (`--synthetic`): drives the engine with a [`SyntheticBackend`]
 //!   click train and its emit log — the same measurement with no audio hardware,
 //!   which is what the CI regression test exercises.
+//! - **Raw-ring** (`--raw-ring`, optionally with `--synthetic`): skips the DSP
+//!   hop grid entirely. It opens the capture backend directly into a
+//!   probe-local sample ring, drains it off-thread, and cross-correlates each
+//!   emitted click against a rectangular template to place its leading edge in
+//!   the captured stream with sub-millisecond (no-hop-quantization) resolution —
+//!   the P7 follow-up that isolates capture transport from hop-gather latency.
 //!
 //! Three intervals are reported as nearest-rank percentiles (ms): emit→publish
 //! (capture + one hop), publish→observe (poll latency), and the end-to-end
@@ -41,10 +47,12 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use scia_core::capture::{DrainTimeline, RAW_CORR_ACCEPT, RING_FRAMES, rect_xcorr_peak};
 use scia_core::{
-    CaptureError, ClickDetector, CpalBackend, Detection, DeviceKind, DeviceSelector, Emission,
-    EmitLog, Engine, EngineConfig, EngineError, FeatureReader, LatencyStats, Matcher, Pacing,
-    PerfModeState, Signal, StreamHealth, SyntheticBackend, list_devices,
+    CaptureBackend, CaptureError, CaptureTarget, ClickDetector, CpalBackend, Detection, DeviceKind,
+    DeviceSelector, Emission, EmitLog, Engine, EngineConfig, EngineError, FeatureReader,
+    LatencyStats, Matcher, Pacing, Percentiles, PerfModeState, SampleConsumer, Signal,
+    StreamHealth, SyntheticBackend, list_devices, sample_ring,
 };
 
 /// Frames per hop the pipeline runs on — fixed at 256 across the codebase.
@@ -79,6 +87,7 @@ fn main() -> ExitCode {
     let mut synthetic = false;
     let mut perf_mode = false;
     let mut do_list = false;
+    let mut raw_ring = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -86,6 +95,7 @@ fn main() -> ExitCode {
             "--synthetic" => synthetic = true,
             "--perf-mode" => perf_mode = true,
             "--list" => do_list = true,
+            "--raw-ring" => raw_ring = true,
             "--device" => {
                 i += 1;
                 match args.get(i) {
@@ -122,9 +132,10 @@ fn main() -> ExitCode {
             },
             "-h" | "--help" => {
                 println!(
-                    "usage: latency_probe [--synthetic] [--device NAME] [--output-device NAME]\n\
-                     \x20                    [--clicks N=25] [--spacing-ms N=400] [--amp F=0.8]\n\
-                     \x20                    [--click-ms F=1.0] [--threshold F=0.3] [--perf-mode] [--list]"
+                    "usage: latency_probe [--synthetic] [--raw-ring] [--device NAME]\n\
+                     \x20                    [--output-device NAME] [--clicks N=25] [--spacing-ms N=400]\n\
+                     \x20                    [--amp F=0.8] [--click-ms F=1.0] [--threshold F=0.3]\n\
+                     \x20                    [--perf-mode] [--list]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -139,7 +150,9 @@ fn main() -> ExitCode {
     if do_list {
         return list();
     }
-    if synthetic {
+    if raw_ring {
+        run_raw_ring(&params, device, output_device, synthetic)
+    } else if synthetic {
         run_synthetic(&params)
     } else {
         run_live(&params, device, output_device, perf_mode)
@@ -299,22 +312,27 @@ fn run_live(
     // Open the click player on the chosen output device.
     let emit_log = Arc::new(EmitLog::new());
     let output_err = Arc::new(AtomicBool::new(false));
-    let (stream, output_label) =
-        match open_click_player(p, output_device.as_deref(), &engine, &emit_log, &output_err) {
-            Ok(pair) => pair,
-            Err(PlayerError::NoDevice(msg)) => {
-                eprintln!("{msg}");
-                return ExitCode::from(3);
-            }
-            Err(PlayerError::Format(msg)) => {
-                eprintln!("{msg}");
-                return ExitCode::from(2);
-            }
-            Err(PlayerError::Backend(msg)) => {
-                eprintln!("could not open the output click player: {msg}");
-                return ExitCode::from(3);
-            }
-        };
+    let (stream, output_label) = match open_click_player(
+        p,
+        output_device.as_deref(),
+        engine.epoch(),
+        &emit_log,
+        &output_err,
+    ) {
+        Ok(pair) => pair,
+        Err(PlayerError::NoDevice(msg)) => {
+            eprintln!("{msg}");
+            return ExitCode::from(3);
+        }
+        Err(PlayerError::Format(msg)) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+        Err(PlayerError::Backend(msg)) => {
+            eprintln!("could not open the output click player: {msg}");
+            return ExitCode::from(3);
+        }
+    };
     if let Err(e) = stream.play() {
         eprintln!("could not start the output click player: {e}");
         return ExitCode::from(3);
@@ -350,7 +368,7 @@ enum PlayerError {
 fn open_click_player(
     p: &Params,
     output_device: Option<&str>,
-    engine: &Engine,
+    epoch: Instant,
     emit_log: &Arc<EmitLog>,
     output_err: &Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, String), PlayerError> {
@@ -389,7 +407,6 @@ fn open_click_player(
     let total_clicks = u64::from(p.clicks);
     let amp = p.amp;
 
-    let epoch = engine.epoch();
     let log = Arc::clone(emit_log);
     let mut frames_written: u64 = 0;
 
@@ -453,6 +470,253 @@ fn open_click_player(
             _ => PlayerError::Backend(e.to_string()),
         })?;
     Ok((stream, label))
+}
+
+// ---------------------------------------------------------------------------
+// Raw-ring mode (P7 follow-up)
+// ---------------------------------------------------------------------------
+
+/// Raw-ring cross-correlation mode: instead of running the full engine and
+/// detecting clicks off the feature stream (which quantizes to the 256-frame
+/// hop grid), open the capture backend directly into a probe-local sample ring,
+/// drain it off-thread, and locate each emitted click's leading edge in the
+/// captured stream by sub-millisecond matched-filter cross-correlation. This
+/// isolates capture transport (playback → the click's samples entering scia's
+/// ring) from the hop-gather latency, which the doc states rather than measures.
+///
+/// `synthetic` swaps the output click player + loopback capture for the
+/// [`SyntheticBackend`] click generator feeding the same ring — the CI-testable
+/// path, and the one `crates/core/tests/latency.rs` exercises through the
+/// library types.
+fn run_raw_ring(
+    p: &Params,
+    capture_device: Option<String>,
+    output_device: Option<String>,
+    synthetic: bool,
+) -> ExitCode {
+    // One epoch shared by the ring clock (drained-sample times) and the click
+    // player's emit timestamps, so both ends are measured on one clock.
+    let epoch = Instant::now();
+    let (sink, mut consumer) = sample_ring(epoch);
+    let emit_log = Arc::new(EmitLog::new());
+
+    // Open the same capture backend the engine would, directly into our ring —
+    // no DSP thread — so the probe sees the exact interleaved samples.
+    let mut backend: Box<dyn CaptureBackend> = if synthetic {
+        Box::new(SyntheticBackend {
+            signal: Signal::Clicks {
+                bpm: 60_000.0 / p.spacing_ms as f32,
+                amp: p.amp,
+            },
+            pacing: Pacing::Realtime,
+            emit_log: Some(Arc::clone(&emit_log)),
+            ..SyntheticBackend::default()
+        })
+    } else {
+        let selector = capture_device
+            .clone()
+            .map_or(DeviceSelector::Default, DeviceSelector::Named);
+        Box::new(CpalBackend {
+            device: selector,
+            prefer_pipewire: true,
+        })
+    };
+
+    let stream = match backend.open(CaptureTarget::SystemMix, sink) {
+        Ok(s) => s,
+        Err(CaptureError::NoDevice) => {
+            eprintln!("no capture device available for raw-ring mode");
+            return ExitCode::from(3);
+        }
+        Err(e) => {
+            eprintln!("could not open capture backend: {e}");
+            return ExitCode::from(3);
+        }
+    };
+    let format = stream.format();
+    // Match the sink's frame accounting to the real width (a no-op for the
+    // stereo synthetic source; correct for a mono loopback).
+    consumer.stats().set_channels(format.channels);
+    let channels = format.channels.max(1) as usize;
+    let sample_rate = format.sample_rate.max(1);
+
+    // Live mode plays the click train on the output device, sharing `epoch`.
+    let output_err = Arc::new(AtomicBool::new(false));
+    let (player, output_label) = if synthetic {
+        (None, "synthetic".to_string())
+    } else {
+        match open_click_player(p, output_device.as_deref(), epoch, &emit_log, &output_err) {
+            Ok((stream, label)) => {
+                if let Err(e) = stream.play() {
+                    eprintln!("could not start the output click player: {e}");
+                    return ExitCode::from(3);
+                }
+                (Some(stream), label)
+            }
+            Err(PlayerError::NoDevice(msg)) => {
+                eprintln!("{msg}");
+                return ExitCode::from(3);
+            }
+            Err(PlayerError::Format(msg)) => {
+                eprintln!("{msg}");
+                return ExitCode::from(2);
+            }
+            Err(PlayerError::Backend(msg)) => {
+                eprintln!("could not open the output click player: {msg}");
+                return ExitCode::from(3);
+            }
+        }
+    };
+
+    // Pre-allocate every analysis buffer from --clicks / --spacing-ms. Live mode
+    // waits a 1 s pre-roll (the click player does) before the first click.
+    let preroll_ms: u64 = if synthetic { 0 } else { 1000 };
+    let observe_ms = preroll_ms + u64::from(p.clicks) * u64::from(p.spacing_ms) + 1000;
+    let cap_frames = (((observe_ms + 500) * u64::from(sample_rate)) / 1000) as usize;
+    let mut mono: Vec<f32> = Vec::with_capacity(cap_frames);
+    let mut scratch: Vec<f32> = Vec::with_capacity(RING_FRAMES * 2);
+    let mut timeline = DrainTimeline::new(sample_rate);
+    timeline.reserve(observe_ms as usize + 16); // ~one drain per 1 ms poll
+
+    // Drain the ring every 1 ms across the observation window, accumulating mono
+    // samples and their capture times; one final drain catches the last tail.
+    let deadline = Instant::now() + Duration::from_millis(observe_ms);
+    while Instant::now() < deadline {
+        drain_once(
+            &mut consumer,
+            &mut scratch,
+            &mut mono,
+            &mut timeline,
+            channels,
+        );
+        sleep(Duration::from_millis(1));
+    }
+    drain_once(
+        &mut consumer,
+        &mut scratch,
+        &mut mono,
+        &mut timeline,
+        channels,
+    );
+
+    drop(player);
+    drop(stream);
+    if output_err.load(Ordering::Acquire) {
+        eprintln!("note: the output click player reported a stream error during the run");
+    }
+
+    // Correlate each emitted click against the raw stream over its own search
+    // window: from the emission to half a click spacing later.
+    let mut emissions: Vec<Emission> = Vec::with_capacity(p.clicks as usize);
+    emit_log.drain(&mut emissions);
+    emissions.sort_by_key(|e| e.emit_ns);
+
+    let click_frames = ((p.click_ms * sample_rate as f32 / 1000.0).ceil() as usize).max(1);
+    let half_spacing_ns = u64::from(p.spacing_ms) / 2 * 1_000_000;
+
+    let mut arrivals_ms: Vec<f32> = Vec::with_capacity(emissions.len());
+    let mut per_click: Vec<(u32, Option<f32>, f32)> = Vec::with_capacity(emissions.len());
+    for e in &emissions {
+        // Search a full spacing wide, centered on the emission. The click's true
+        // arrival is after emit_ns for real capture transport, but on the
+        // near-zero-transport synthetic path the emit stamp (taken before the
+        // chunk is pushed) can precede the sample's continuous-capture modeled
+        // time by a few ms, so the window reaches back half a spacing. A
+        // neighbour click is a full spacing away and cannot be picked up.
+        let lo = timeline.frame_at_or_after(e.emit_ns.saturating_sub(half_spacing_ns)) as usize;
+        let hi = timeline.frame_at_or_after(e.emit_ns + half_spacing_ns) as usize;
+        match rect_xcorr_peak(&mono, click_frames, lo, hi) {
+            Some((offset, peak)) if peak >= RAW_CORR_ACCEPT => {
+                let arrival = timeline.sample_time_ns(offset as u64).unwrap_or(e.emit_ns);
+                let ms = (arrival as i64 - e.emit_ns as i64) as f32 / 1.0e6;
+                arrivals_ms.push(ms);
+                per_click.push((e.index, Some(ms), peak));
+            }
+            other => {
+                let peak = other.map_or(0.0, |(_, pk)| pk);
+                per_click.push((e.index, None, peak));
+            }
+        }
+    }
+
+    // ---- Report ----
+    let emitted = emissions.len() as u32;
+    let matched = arrivals_ms.len() as u32;
+    let hop_ms = f64::from(HOP_FRAMES) * 1000.0 / f64::from(sample_rate);
+    println!(
+        "latency probe: raw-ring {} · capture {} Hz {} ch · output {output_label} · \
+         hop {HOP_FRAMES} ({hop_ms:.2} ms)",
+        if synthetic { "synthetic" } else { "live" },
+        sample_rate,
+        format.channels,
+    );
+    println!(
+        "clicks {emitted} · matched {matched} · missed {}",
+        emitted.saturating_sub(matched),
+    );
+    let pct = Percentiles::nearest_rank(arrivals_ms.clone());
+    println!(
+        "{:<22} {:>7} {:>7} {:>7} {:>7}   (ms)",
+        "", "min", "median", "p95", "max"
+    );
+    println!(
+        "{:<22} {:>7.2} {:>7.2} {:>7.2} {:>7.2}",
+        "emit → raw-arrival", pct.min, pct.median, pct.p95, pct.max,
+    );
+    for (idx, ms, peak) in &per_click {
+        match ms {
+            Some(v) => {
+                println!("  click {idx:>3}: emit → raw-arrival {v:>7.2} ms  (ncc {peak:.3})")
+            }
+            None => println!("  click {idx:>3}: no raw arrival found       (ncc {peak:.3})"),
+        }
+    }
+    println!(
+        "note: emit → raw-arrival is capture transport only — from the click's emission to its \
+         samples entering scia's ring — found by cross-correlation with no hop quantization. \
+         emit → publish is not measured in this mode; the hop grid adds up to one {HOP_FRAMES}-frame \
+         hop ({hop_ms:.2} ms) of gather on top (stated, not measured). Compare raw-arrival against \
+         a normal run's emit → publish to see how much of that interval is capture transport."
+    );
+
+    if emitted == 0 {
+        eprintln!("no clicks were emitted — nothing to measure");
+        return ExitCode::from(4);
+    }
+    if u64::from(matched) * 100 >= u64::from(emitted) * 80 {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("only {matched}/{emitted} clicks correlated (< 80%)");
+        ExitCode::from(4)
+    }
+}
+
+/// Drain everything currently buffered, down-mix it to mono, append it to `mono`,
+/// and record the drain in `timeline`. `drain_ns` is read just before the drain,
+/// so the newest buffered frame sits ~one frame-period before it (see
+/// [`DrainTimeline`]).
+fn drain_once(
+    consumer: &mut SampleConsumer,
+    scratch: &mut Vec<f32>,
+    mono: &mut Vec<f32>,
+    timeline: &mut DrainTimeline,
+    channels: usize,
+) {
+    let drain_ns = consumer.stats().now_ns();
+    let n = consumer.drain_all(scratch);
+    if n == 0 {
+        return;
+    }
+    let frames = n / channels;
+    for f in 0..frames {
+        let base = f * channels;
+        let mut acc = 0.0f32;
+        for c in 0..channels {
+            acc += scratch[base + c];
+        }
+        mono.push(acc / channels as f32);
+    }
+    timeline.record_drain(drain_ns, frames as u64);
 }
 
 // ---------------------------------------------------------------------------

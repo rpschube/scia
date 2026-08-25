@@ -138,3 +138,79 @@ Reading:
   follow-up probe should cross-correlate raw ring samples against the
   emitted click (sub-millisecond, no hop quantization) before the ≤ 33 ms
   US-PERF-1 criterion is scored on this endpoint.
+
+## Raw-ring mode (`--raw-ring`)
+
+The follow-up the open question asks for. It answers a narrower question than the
+main probe — *how much of the emit → publish interval is capture transport,
+before scia's hop grid touches the samples* — and answers it without the
+256-frame hop quantization that blurs the main probe's `emit → publish` number.
+
+**How it differs.** In raw-ring mode the probe does **not** run the engine or the
+DSP hop grid. It opens the same capture backend the engine uses
+(`CaptureBackend::open`) directly into a probe-local sample ring, then drains
+that ring on a 1 ms poll off-thread, accumulating the exact interleaved samples
+(down-mixed to mono) with a per-drain capture timestamp. For each emitted click
+it runs a **normalized matched-filter cross-correlation** of the captured stream
+against the known click template (a rectangular burst of `--click-ms` at
+`--amp`) over a search window one click spacing wide centered on the click's
+`emit_ns` (`emit_ns − spacing/2` … `emit_ns + spacing/2`), and takes the
+correlation argmax as the click's **leading edge in the raw stream**. Resolution
+is one sample (≈ 0.02 ms at 48 kHz), not one hop. (The window reaches back half a
+spacing as well as forward because the synthetic backend stamps `emit_ns` just
+before pushing a chunk, so on the near-zero-transport synthetic path a sample's
+continuous-capture time can fall a few ms *before* the emission; a neighbour
+click is a full spacing away and cannot be picked up, and real transport always
+lands to the right of `emit_ns`.)
+
+**Timestamp bookkeeping.** The frames a poll drains are the most-recently
+captured frames still in the ring, so the newest sits about one frame-period
+before the poll's clock read and the oldest about `frames` frame-periods before
+it. The probe places a drain's oldest frame at `drain_ns − frames ×
+ns_per_frame` and steps one frame-period per frame; the ring clock is the same
+epoch `FeatureSnapshot.timestamp_ns` and the click player's `emit_ns` use, so
+`emit → raw-arrival` is a difference on one clock. The residual error is a single
+poll interval of jitter on `drain_ns` (sub-millisecond quanta are negligible).
+
+**How to run.**
+
+```
+# Real machine — plays clicks, captures them back, correlates the raw ring:
+latency_probe --raw-ring --clicks 25
+latency_probe --raw-ring --output-device "NAME"   # pick the output endpoint
+
+# No audio hardware — the CI-testable path (synthetic click backend):
+latency_probe --raw-ring --synthetic --clicks 10
+```
+
+The report prints, per click and as nearest-rank percentiles, one new interval:
+
+- **emit → raw-arrival** — from the click's emission to the moment its samples
+  enter scia's ring, by cross-correlation. This is **capture transport only**;
+  it is the part of the main probe's `emit → publish` that happens *before* scia.
+
+The probe keeps the same exit-code contract as the main mode (`0` when ≥ 80 % of
+emitted clicks correlate, `4` otherwise; `2`/`3` for usage / no device).
+
+**What it measures, and what it cannot.** Raw-arrival tells how much of the
+~41 ms residual is capture transport. It does **not** measure `emit → publish`
+(no hop grid runs in this mode); the hop-gather term is *stated, not measured* —
+a click waits up to one 256-frame hop (5.33 ms at 48 kHz) to be gathered, so a
+normal run's `emit → publish ≈ raw-arrival + up-to-one-hop`. Comparing a
+raw-ring run's `emit → raw-arrival` against a normal run's `emit → publish` on
+the same endpoint decomposes the residual: whatever raw-arrival accounts for is
+capture buffering, and the rest is the hop grid plus any output-timestamp error.
+It also does not correct for the output player's own render buffering — subtract
+the main probe's `output delay (cb→play)` from raw-arrival, as with `emit →
+observe`, to reason about the moment a real player's audio is already in the mix.
+
+**Synthetic self-test.** `--raw-ring --synthetic` (and the
+`crates/core/tests/latency.rs` regression that drives the same library logic)
+feeds the synthetic click generator into the ring with no hardware. A synthetic
+click is a single-frame impulse in otherwise-silent audio, so its correlation
+peak is unambiguous and `emit → raw-arrival` collapses to the drain/push cadence
+— a few milliseconds, and slightly *negative* because the emit stamp precedes the
+push while the sample time is on the continuous-capture model. The test asserts
+≥ 80 % correlated and a loose two-sided median bound (±10 ms), proving the
+correlation and timeline machinery end-to-end. Real-hardware raw-arrival numbers
+land here later via the orchestrator.

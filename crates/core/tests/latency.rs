@@ -8,9 +8,11 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use scia_core::capture::{DrainTimeline, RAW_CORR_ACCEPT, rect_xcorr_peak};
 use scia_core::{
-    ClickDetector, Detection, Emission, EmitLog, Engine, EngineConfig, LatencyStats, Matcher,
-    Pacing, Signal, StreamFormat, SyntheticBackend,
+    CaptureBackend, CaptureTarget, ClickDetector, Detection, Emission, EmitLog, Engine,
+    EngineConfig, LatencyStats, Matcher, Pacing, Percentiles, SampleConsumer, Signal, StreamFormat,
+    SyntheticBackend, sample_ring,
 };
 
 /// Observer poll interval. Committed at 1 ms; temporarily set to 10 ms to
@@ -134,6 +136,157 @@ fn synthetic_end_to_end_latency_is_within_budget() {
         "median emit→observe {} ms should be < 40 ms",
         stats.emit_to_observe.median
     );
+}
+
+/// Raw-ring cross-correlation mode (P7 follow-up), end to end through the
+/// library types — the CI-testable path for the probe's `--raw-ring --synthetic`
+/// mode. It opens the synthetic click backend directly into a probe-local sample
+/// ring (no DSP thread), drains it off-thread, and locates each emitted click's
+/// leading edge in the captured stream by cross-correlation, with no hop
+/// quantization. Because there is no capture hardware and no hop grid, the
+/// measured emit → raw-arrival is just the drain/push cadence — a few
+/// milliseconds — which proves the correlation + timeline machinery works.
+#[test]
+fn synthetic_raw_ring_correlation_is_within_budget() {
+    let clicks: u32 = 5;
+    let spacing_ms: u32 = 200;
+    let amp = 0.8f32;
+    let click_ms = 1.0f32;
+
+    let epoch = Instant::now();
+    let (sink, mut consumer) = sample_ring(epoch);
+    let emit_log = Arc::new(EmitLog::new());
+    let mut backend = SyntheticBackend {
+        format: StreamFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        },
+        signal: Signal::Clicks {
+            bpm: 60_000.0 / spacing_ms as f32,
+            amp,
+        },
+        pacing: Pacing::Realtime,
+        emit_log: Some(Arc::clone(&emit_log)),
+    };
+    let stream = backend
+        .open(CaptureTarget::SystemMix, sink)
+        .expect("synthetic backend opens");
+    let format = stream.format();
+    consumer.stats().set_channels(format.channels);
+    let channels = format.channels.max(1) as usize;
+    let sample_rate = format.sample_rate.max(1);
+
+    // Pre-allocate the analysis buffers from the click plan.
+    let observe_ms = u64::from(clicks) * u64::from(spacing_ms) + 1000;
+    let cap_frames = (((observe_ms + 500) * u64::from(sample_rate)) / 1000) as usize;
+    let mut mono: Vec<f32> = Vec::with_capacity(cap_frames);
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut timeline = DrainTimeline::new(sample_rate);
+    timeline.reserve(observe_ms as usize + 16);
+
+    // Drain every 1 ms across the observation window, then one final drain.
+    let deadline = Instant::now() + Duration::from_millis(observe_ms);
+    while Instant::now() < deadline {
+        drain_once(
+            &mut consumer,
+            &mut scratch,
+            &mut mono,
+            &mut timeline,
+            channels,
+        );
+        sleep(Duration::from_millis(1));
+    }
+    drain_once(
+        &mut consumer,
+        &mut scratch,
+        &mut mono,
+        &mut timeline,
+        channels,
+    );
+
+    drop(stream);
+
+    let mut emissions: Vec<Emission> = Vec::new();
+    emit_log.drain(&mut emissions);
+    emissions.sort_by_key(|e| e.emit_ns);
+
+    let click_frames = ((click_ms * sample_rate as f32 / 1000.0).ceil() as usize).max(1);
+    let half_spacing_ns = u64::from(spacing_ms) / 2 * 1_000_000;
+
+    let mut arrivals_ms: Vec<f32> = Vec::new();
+    for e in &emissions {
+        // Search a full spacing wide, centered on the emission: the click's true
+        // arrival is after emit_ns for real transport, but on the near-zero-
+        // transport synthetic path the pre-push emit stamp can precede the
+        // sample's (continuous-capture) modeled time by a few ms, so the window
+        // reaches back half a spacing. A neighbour click is a full spacing away
+        // and cannot intrude.
+        let lo = timeline.frame_at_or_after(e.emit_ns.saturating_sub(half_spacing_ns)) as usize;
+        let hi = timeline.frame_at_or_after(e.emit_ns + half_spacing_ns) as usize;
+        if let Some((offset, peak)) = rect_xcorr_peak(&mono, click_frames, lo, hi) {
+            if peak >= RAW_CORR_ACCEPT {
+                let arrival = timeline.sample_time_ns(offset as u64).unwrap_or(e.emit_ns);
+                arrivals_ms.push((arrival as i64 - e.emit_ns as i64) as f32 / 1.0e6);
+            }
+        }
+    }
+
+    let matched = arrivals_ms.len() as u32;
+    let emitted = emissions.len() as u32;
+    let pct = Percentiles::nearest_rank(arrivals_ms.clone());
+    println!(
+        "raw-ring: clicks {emitted} · matched {matched} · \
+         emit→raw-arrival median {:.2} ms (min {:.2}, p95 {:.2}, max {:.2})",
+        pct.median, pct.min, pct.p95, pct.max
+    );
+
+    assert!(
+        emitted >= clicks,
+        "expected at least {clicks} emitted clicks, got {emitted}"
+    );
+    // The impulse's correlation is unambiguous against synthetic silence, so
+    // every emitted click should correlate; require the same ≥80 % the probe's
+    // exit code enforces.
+    assert!(
+        u64::from(matched) * 100 >= u64::from(emitted) * 80,
+        "only {matched}/{emitted} clicks correlated (< 80%)"
+    );
+    // No hardware and no hop grid: raw-arrival is just the drain/push cadence
+    // (a few ms, and slightly negative because the synthetic backend stamps
+    // emit_ns before the chunk is pushed while the sample time is on the
+    // continuous-capture model — see the probe doc). A loose two-sided bound
+    // proves the machinery without being flaky on shared runners.
+    assert!(
+        pct.median.abs() < 10.0,
+        "median emit→raw-arrival {:.2} ms should be within ±10 ms of zero",
+        pct.median
+    );
+}
+
+/// Drain everything buffered, down-mix to mono, append to `mono`, and record the
+/// drain's clock reading — the raw-ring probe's per-poll step.
+fn drain_once(
+    consumer: &mut SampleConsumer,
+    scratch: &mut Vec<f32>,
+    mono: &mut Vec<f32>,
+    timeline: &mut DrainTimeline,
+    channels: usize,
+) {
+    let drain_ns = consumer.stats().now_ns();
+    let n = consumer.drain_all(scratch);
+    if n == 0 {
+        return;
+    }
+    let frames = n / channels;
+    for f in 0..frames {
+        let base = f * channels;
+        let mut acc = 0.0f32;
+        for c in 0..channels {
+            acc += scratch[base + c];
+        }
+        mono.push(acc / channels as f32);
+    }
+    timeline.record_drain(drain_ns, frames as u64);
 }
 
 /// Tracks how much of the published hop stream the observer actually sampled.
