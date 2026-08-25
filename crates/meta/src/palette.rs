@@ -71,7 +71,8 @@ use image::imageops::FilterType;
 /// All colours are 24-bit sRGB `[r, g, b]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtPalette {
-    /// The most populous colour in the artwork — the visual "key" colour.
+    /// The most salient colour in the artwork (population × vibrancy; plain
+    /// population on genuinely neutral art) — the visual "key" colour.
     pub dominant: [u8; 3],
     /// Further colours that are perceptually distinct from the dominant and
     /// from each other, ordered by salience (population × vibrancy). May be
