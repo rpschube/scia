@@ -433,6 +433,141 @@ impl fmt::Display for LatencyStats {
     }
 }
 
+/// One click measured **both** ways in a single dual-tap run: from one emission,
+/// `emit → raw-arrival` (the click's samples entering scia's ring, found by
+/// cross-correlation on the teed capture stream) and `emit → publish` (the hop
+/// that carries it, detected off the feature stream). Both are milliseconds
+/// relative to the same emission, on the same capture-delivery clock, from the
+/// same running engine — which is what lets the subset invariant be checked
+/// within one process (see [`DualTapStats`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DualTapSample {
+    /// The click's emission index.
+    pub index: u32,
+    /// `emit → raw-arrival` in ms (capture transport into the ring).
+    pub emit_to_raw_arrival_ms: f32,
+    /// `emit → publish` in ms (through the hop that carries the click).
+    pub emit_to_publish_ms: f32,
+}
+
+impl DualTapSample {
+    /// The hop-gather term: `emit → publish` minus `emit → raw-arrival` — the
+    /// latency between a sample entering the ring and the hop that gathers it
+    /// being published. Physically in `0 ..= one hop`.
+    #[must_use]
+    pub fn hop_gather_ms(&self) -> f32 {
+        self.emit_to_publish_ms - self.emit_to_raw_arrival_ms
+    }
+
+    /// Whether raw-arrival is a subset of publish for this click within `eps_ms`
+    /// (`raw-arrival ≤ publish`). This is the **hard** invariant: a sample enters
+    /// the ring strictly before any hop that carries it is published, so within one
+    /// run this cannot fail unless a clock lies. A violation localizes a defect.
+    #[must_use]
+    pub fn subset_holds(&self, eps_ms: f32) -> bool {
+        self.emit_to_raw_arrival_ms <= self.emit_to_publish_ms + eps_ms
+    }
+
+    /// Whether publish sits within one hop of raw-arrival (`publish ≤ raw-arrival +
+    /// hop_ms`) inside `eps_ms`. Physically the gather adds at most one hop; on
+    /// real hardware a detection landing a hop late (a partial hop's peak missing
+    /// the threshold) can exceed it by up to another hop without any clock being
+    /// wrong — read it together with [`subset_holds`](DualTapSample::subset_holds).
+    #[must_use]
+    pub fn within_one_hop(&self, hop_ms: f32, eps_ms: f32) -> bool {
+        self.emit_to_publish_ms <= self.emit_to_raw_arrival_ms + hop_ms + eps_ms
+    }
+}
+
+/// The dual-tap verdict over all clicks measured both ways in one run: the two
+/// intervals and the hop-gather delta as [`Percentiles`], plus how many clicks
+/// satisfy each half of the subset invariant
+/// `raw-arrival ≤ publish ≤ raw-arrival + one hop`. Because both ends come from
+/// one engine on one capture-delivery clock, the invariant holds by construction;
+/// a break is a localizable defect, which is exactly the discriminator the P7
+/// dual-tap probe exists to report.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DualTapStats {
+    /// Clicks measured both ways.
+    pub count: u32,
+    /// `emit → raw-arrival` distribution (ms).
+    pub raw_arrival: Percentiles,
+    /// `emit → publish` distribution (ms).
+    pub publish: Percentiles,
+    /// `publish − raw-arrival` (the hop-gather term) distribution (ms).
+    pub hop_gather: Percentiles,
+    /// One hop in ms, the invariant's upper span.
+    pub hop_ms: f32,
+    /// Tolerance the invariant was checked within (ms).
+    pub eps_ms: f32,
+    /// Clicks satisfying `raw-arrival ≤ publish` (the hard subset invariant).
+    pub subset_holds: u32,
+    /// Clicks satisfying `publish ≤ raw-arrival + one hop`.
+    pub within_one_hop: u32,
+}
+
+impl DualTapStats {
+    /// Summarize `samples` against a `hop_ms` upper span, checking the invariant
+    /// within `eps_ms`.
+    #[must_use]
+    pub fn from_samples(samples: &[DualTapSample], hop_ms: f32, eps_ms: f32) -> Self {
+        let raw_arrival =
+            Percentiles::nearest_rank(samples.iter().map(|s| s.emit_to_raw_arrival_ms).collect());
+        let publish =
+            Percentiles::nearest_rank(samples.iter().map(|s| s.emit_to_publish_ms).collect());
+        let hop_gather =
+            Percentiles::nearest_rank(samples.iter().map(DualTapSample::hop_gather_ms).collect());
+        let subset_holds = samples.iter().filter(|s| s.subset_holds(eps_ms)).count() as u32;
+        let within_one_hop = samples
+            .iter()
+            .filter(|s| s.within_one_hop(hop_ms, eps_ms))
+            .count() as u32;
+        Self {
+            count: samples.len() as u32,
+            raw_arrival,
+            publish,
+            hop_gather,
+            hop_ms,
+            eps_ms,
+            subset_holds,
+            within_one_hop,
+        }
+    }
+
+    /// Whether the full subset invariant held for every measured click: at least
+    /// one click, and all of them within both bounds.
+    #[must_use]
+    pub fn all_hold(&self) -> bool {
+        self.count > 0 && self.subset_holds == self.count && self.within_one_hop == self.count
+    }
+}
+
+impl fmt::Display for DualTapStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "{:<22} {:>7} {:>7} {:>7} {:>7}   (ms)",
+            "", "min", "median", "p95", "max"
+        )?;
+        let row = |f: &mut fmt::Formatter<'_>, label: &str, p: &Percentiles| -> fmt::Result {
+            writeln!(
+                f,
+                "{label:<22} {:>7.2} {:>7.2} {:>7.2} {:>7.2}",
+                p.min, p.median, p.p95, p.max
+            )
+        };
+        row(f, "emit → raw-arrival", &self.raw_arrival)?;
+        row(f, "emit → publish", &self.publish)?;
+        row(f, "hop gather (Δ)", &self.hop_gather)?;
+        write!(
+            f,
+            "invariant  raw-arrival ≤ publish ≤ raw-arrival + one hop ({:.2} ms): \
+             subset {}/{} · within-one-hop {}/{}",
+            self.hop_ms, self.subset_holds, self.count, self.within_one_hop, self.count
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,5 +722,45 @@ mod tests {
         let rendered = stats.to_string();
         assert_eq!(rendered.lines().count(), 5);
         assert!(rendered.contains("emit → observe"));
+    }
+
+    #[test]
+    fn dual_tap_stats_scores_the_subset_invariant() {
+        let hop_ms = 5.33f32;
+        let eps = 0.2f32;
+        let samples = vec![
+            // Well inside the sandwich: raw < publish < raw + hop.
+            DualTapSample {
+                index: 0,
+                emit_to_raw_arrival_ms: 100.0,
+                emit_to_publish_ms: 103.0,
+            },
+            // Raw == publish (gather ~0): still holds.
+            DualTapSample {
+                index: 1,
+                emit_to_raw_arrival_ms: 100.0,
+                emit_to_publish_ms: 100.0,
+            },
+        ];
+        let stats = DualTapStats::from_samples(&samples, hop_ms, eps);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.subset_holds, 2);
+        assert_eq!(stats.within_one_hop, 2);
+        assert!(stats.all_hold());
+        // Hop-gather values are {3.0, 0.0}: min 0, max 3.
+        assert!((stats.hop_gather.min - 0.0).abs() < 1e-3);
+        assert!((stats.hop_gather.max - 3.0).abs() < 1e-3);
+
+        // A run where raw-arrival sits ABOVE publish (the impossible inversion the
+        // probe hunts) breaks the subset half and fails `all_hold`.
+        let broken = vec![DualTapSample {
+            index: 0,
+            emit_to_raw_arrival_ms: 108.7,
+            emit_to_publish_ms: 79.3,
+        }];
+        let stats = DualTapStats::from_samples(&broken, hop_ms, eps);
+        assert_eq!(stats.subset_holds, 0);
+        assert!(!stats.all_hold());
+        assert!(stats.to_string().contains("subset 0/1"));
     }
 }

@@ -28,6 +28,14 @@
 //!   emitted click against a rectangular template to place its leading edge in
 //!   the captured stream with sub-millisecond (no-hop-quantization) resolution —
 //!   the P7 follow-up that isolates capture transport from hop-gather latency.
+//! - **Dual-tap** (`--dual-tap`, optionally with `--synthetic`): runs the FULL
+//!   engine (hops publish as normal) with a tee on the capture sink, and measures
+//!   BOTH `emit → raw-arrival` (cross-correlation on the teed raw samples, exact
+//!   per-push mapping) and `emit → publish` (hop detection) from the same clicks
+//!   in one process on one clock. It prints their per-click delta and the subset
+//!   invariant verdict `raw-arrival ≤ publish ≤ raw-arrival + one hop` — the
+//!   definitive discriminator for the cross-mode constant the two separate modes
+//!   could never settle.
 //!
 //! Three intervals are reported as nearest-rank percentiles (ms): emit→publish
 //! (capture + one hop), publish→observe (poll latency), and the end-to-end
@@ -49,13 +57,18 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use scia_core::capture::{
     DrainTimeline, RAW_CORR_ACCEPT, RING_FRAMES, drain_into_timeline, rect_xcorr_peak,
+    tee_drain_into_timeline,
 };
 use scia_core::{
     CaptureBackend, CaptureError, CaptureTarget, ClickDetector, CpalBackend, Detection, DeviceKind,
-    DeviceSelector, Emission, EmitLog, Engine, EngineConfig, EngineError, FeatureReader,
-    LatencyStats, Matcher, Pacing, Percentiles, PerfModeState, Signal, StreamHealth,
-    SyntheticBackend, list_devices, sample_ring,
+    DeviceSelector, DualTapSample, DualTapStats, Emission, EmitLog, Engine, EngineConfig,
+    EngineError, FeatureReader, LatencyStats, Matcher, Pacing, Percentiles, PerfModeState, Signal,
+    StreamHealth, SyntheticBackend, list_devices, sample_ring,
 };
+
+/// Tolerance the dual-tap invariant is scored within (ms) — a few frame-periods,
+/// covering sub-sample correlation placement and ms rounding on the two clocks.
+const DUAL_TAP_EPS_MS: f32 = 0.5;
 
 /// Frames per hop the pipeline runs on — fixed at 256 across the codebase.
 const HOP_FRAMES: u32 = 256;
@@ -90,6 +103,7 @@ fn main() -> ExitCode {
     let mut perf_mode = false;
     let mut do_list = false;
     let mut raw_ring = false;
+    let mut dual_tap = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -98,6 +112,7 @@ fn main() -> ExitCode {
             "--perf-mode" => perf_mode = true,
             "--list" => do_list = true,
             "--raw-ring" => raw_ring = true,
+            "--dual-tap" => dual_tap = true,
             "--device" => {
                 i += 1;
                 match args.get(i) {
@@ -134,7 +149,7 @@ fn main() -> ExitCode {
             },
             "-h" | "--help" => {
                 println!(
-                    "usage: latency_probe [--synthetic] [--raw-ring] [--device NAME]\n\
+                    "usage: latency_probe [--synthetic] [--raw-ring] [--dual-tap] [--device NAME]\n\
                      \x20                    [--output-device NAME] [--clicks N=25] [--spacing-ms N=400]\n\
                      \x20                    [--amp F=0.8] [--click-ms F=1.0] [--threshold F=0.3]\n\
                      \x20                    [--perf-mode] [--list]"
@@ -152,7 +167,12 @@ fn main() -> ExitCode {
     if do_list {
         return list();
     }
-    if raw_ring {
+    if dual_tap && raw_ring {
+        return usage_err("--dual-tap and --raw-ring are mutually exclusive");
+    }
+    if dual_tap {
+        run_dual_tap(&params, device, output_device, synthetic)
+    } else if raw_ring {
         run_raw_ring(&params, device, output_device, synthetic)
     } else if synthetic {
         run_synthetic(&params)
@@ -714,6 +734,276 @@ fn run_raw_ring(
         ExitCode::SUCCESS
     } else {
         eprintln!("only {matched}/{emitted} clicks correlated (< 80%)");
+        ExitCode::from(4)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dual-tap mode (P7 final instrument)
+// ---------------------------------------------------------------------------
+
+/// Dual-tap mode: run the full engine with a tee on the capture sink and measure
+/// BOTH `emit → raw-arrival` (cross-correlation on the teed raw samples, exact
+/// per-push mapping) and `emit → publish` (hop detection off the feature stream)
+/// from the SAME clicks in ONE process on ONE clock. This is the discriminator
+/// the doc's third reconciliation round is owed: the two figures could never come
+/// from one process before (the DSP consumes the ring, so the modes were mutually
+/// exclusive), so a rock-constant ~27 ms gap between separate runs could not be
+/// told apart from an instrumentation bug. Here the invariant
+/// `raw-arrival ≤ publish ≤ raw-arrival + one hop` is checked WITHIN one run: if
+/// it holds, the per-open capture difference is real; if it breaks, a model still
+/// lies and the defect is localizable.
+///
+/// `synthetic` swaps the loopback capture + output player for the
+/// [`SyntheticBackend`] click generator as the engine's capture backend — the
+/// CI-testable path the `crates/core/tests/latency.rs` regression mirrors.
+fn run_dual_tap(
+    p: &Params,
+    capture_device: Option<String>,
+    output_device: Option<String>,
+    synthetic: bool,
+) -> ExitCode {
+    let emit_log = Arc::new(EmitLog::new());
+
+    // The engine's capture backend: synthetic click train, or the real loopback.
+    let backend: Box<dyn CaptureBackend> = if synthetic {
+        Box::new(SyntheticBackend {
+            signal: Signal::Clicks {
+                bpm: 60_000.0 / p.spacing_ms as f32,
+                amp: p.amp,
+            },
+            pacing: Pacing::Realtime,
+            emit_log: Some(Arc::clone(&emit_log)),
+            ..SyntheticBackend::default()
+        })
+    } else {
+        let selector = capture_device
+            .clone()
+            .map_or(DeviceSelector::Default, DeviceSelector::Named);
+        Box::new(CpalBackend {
+            device: selector,
+            prefer_pipewire: true,
+        })
+    };
+
+    let (engine, mut reader, mut tee) =
+        match Engine::start_with_dual_tap(backend, EngineConfig::default()) {
+            Ok(triple) => triple,
+            Err(EngineError::Capture(CaptureError::NoDevice)) => {
+                eprintln!("no capture device available for dual-tap mode");
+                eprintln!(
+                    "on plain ALSA the default input is a microphone; the system mix needs \
+                     PipeWire or a named loopback/monitor device (see --list)"
+                );
+                return ExitCode::from(3);
+            }
+            Err(e) => {
+                eprintln!("could not start capture: {e}");
+                return ExitCode::from(3);
+            }
+        };
+    if let StreamHealth::Errored(msg) = engine.health() {
+        eprintln!("warning: capture stream reported an error at open: {msg}");
+    }
+
+    let format = engine.format();
+    let channels = format.channels.max(1) as usize;
+    let sample_rate = format.sample_rate.max(1);
+
+    // Live mode plays the click train on the output device, sharing the engine's
+    // epoch so emissions and both measured ends are on one clock.
+    let output_err = Arc::new(AtomicBool::new(false));
+    let (player, output_label) = if synthetic {
+        (None, "synthetic".to_string())
+    } else {
+        match open_click_player(
+            p,
+            output_device.as_deref(),
+            engine.epoch(),
+            &emit_log,
+            &output_err,
+        ) {
+            Ok((stream, label)) => {
+                if let Err(e) = stream.play() {
+                    eprintln!("could not start the output click player: {e}");
+                    return ExitCode::from(3);
+                }
+                (Some(stream), label)
+            }
+            Err(PlayerError::NoDevice(msg)) => {
+                eprintln!("{msg}");
+                return ExitCode::from(3);
+            }
+            Err(PlayerError::Format(msg)) => {
+                eprintln!("{msg}");
+                return ExitCode::from(2);
+            }
+            Err(PlayerError::Backend(msg)) => {
+                eprintln!("could not open the output click player: {msg}");
+                return ExitCode::from(3);
+            }
+        }
+    };
+
+    // Pre-allocate the raw-arrival analysis buffers. Live mode's click player
+    // waits a 1 s pre-roll before the first click.
+    let preroll_ms: u64 = if synthetic { 0 } else { 1000 };
+    let observe_ms = preroll_ms + u64::from(p.clicks) * u64::from(p.spacing_ms) + 2000;
+    let flush_ms = (u64::from(p.spacing_ms) / 2).max(120);
+    let cap_frames = (((observe_ms + flush_ms + 500) * u64::from(sample_rate)) / 1000) as usize;
+    let mut mono: Vec<f32> = Vec::with_capacity(cap_frames);
+    let mut scratch: Vec<f32> = Vec::with_capacity(RING_FRAMES * 2);
+    let mut timeline = DrainTimeline::new(sample_rate);
+    timeline.reserve(observe_ms as usize + 16);
+
+    // One 1 ms poll loop does BOTH jobs on one thread: feed the observer (for the
+    // publish side) and drain the tee (for the raw-arrival side), so the two
+    // measurements track the same clicks in lockstep.
+    let half_spacing_ns = u64::from(p.spacing_ms) / 2 * 1_000_000;
+    let mut detector = ClickDetector::new(p.threshold, half_spacing_ns);
+    let mut detections: Vec<Detection> = Vec::new();
+    let total_ms = observe_ms + flush_ms;
+    let deadline = Instant::now() + Duration::from_millis(total_ms);
+    let mut last_gen: Option<u64> = None;
+    while Instant::now() < deadline {
+        let snapshot = *reader.latest();
+        if last_gen != Some(snapshot.generation) {
+            last_gen = Some(snapshot.generation);
+            if let Some(d) = detector.observe(&snapshot, engine.now_ns()) {
+                detections.push(d);
+            }
+        }
+        tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+        sleep(Duration::from_millis(1));
+    }
+    // One final drain catches the tail before capture is torn down.
+    tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+
+    let engine_stats = engine.stats();
+    let dropped_pushes = tee.dropped_pushes();
+
+    drop(player);
+    if output_err.load(Ordering::Acquire) {
+        eprintln!("note: the output click player reported a stream error during the run");
+    }
+    engine.stop();
+
+    // ---- Correlate both ends against the same emissions ----
+    let mut emissions: Vec<Emission> = Vec::new();
+    emit_log.drain(&mut emissions);
+    emissions.sort_by_key(|e| e.emit_ns);
+
+    // Publish side: pair emissions to detections in order.
+    let matched = Matcher::new(half_spacing_ns).match_events(&emissions, &detections);
+    let publish_stats = LatencyStats::from_matched(&matched);
+
+    // Raw-arrival side: cross-correlate each emitted click against the teed stream.
+    let click_frames = ((p.click_ms * sample_rate as f32 / 1000.0).ceil() as usize).max(1);
+    let mut raw_by_index: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    let mut raw_matched = 0u32;
+    for e in &emissions {
+        let lo = timeline.frame_at_or_after(e.emit_ns.saturating_sub(half_spacing_ns)) as usize;
+        let hi = timeline.frame_at_or_after(e.emit_ns + half_spacing_ns) as usize;
+        if let Some((offset, peak)) = rect_xcorr_peak(&mono, click_frames, lo, hi) {
+            if peak >= RAW_CORR_ACCEPT {
+                let arrival = timeline.sample_time_ns(offset as u64).unwrap_or(e.emit_ns);
+                let ms = (arrival as i64 - e.emit_ns as i64) as f32 / 1.0e6;
+                raw_by_index.insert(e.index, ms);
+                raw_matched += 1;
+            }
+        }
+    }
+
+    // Join: a click measured BOTH ways becomes one dual-tap sample.
+    let mut samples: Vec<DualTapSample> = Vec::new();
+    for s in &matched.samples {
+        if let Some(&raw_ms) = raw_by_index.get(&s.index) {
+            let publish_ms = (s.publish_ns.saturating_sub(s.emit_ns)) as f32 / 1.0e6;
+            samples.push(DualTapSample {
+                index: s.index,
+                emit_to_raw_arrival_ms: raw_ms,
+                emit_to_publish_ms: publish_ms,
+            });
+        }
+    }
+    samples.sort_by_key(|s| s.index);
+
+    let hop_ms = (f64::from(HOP_FRAMES) * 1000.0 / f64::from(sample_rate)) as f32;
+    let stats = DualTapStats::from_samples(&samples, hop_ms, DUAL_TAP_EPS_MS);
+
+    // ---- Report ----
+    let emitted = emissions.len() as u32;
+    println!(
+        "latency probe: dual-tap {} · capture {} Hz {} ch · output {output_label} · \
+         hop {HOP_FRAMES} ({hop_ms:.2} ms)",
+        if synthetic { "synthetic" } else { "live" },
+        sample_rate,
+        format.channels,
+    );
+    let backlog_ms = |frames: u64| frames as f64 * 1000.0 / f64::from(sample_rate);
+    println!(
+        "clicks {emitted} · publish-matched {} · raw-matched {raw_matched} · both {} · \
+         tee dropped-pushes {dropped_pushes} ({:.2} ms)",
+        publish_stats.count,
+        stats.count,
+        backlog_ms(dropped_pushes * u64::from(format.channels)),
+    );
+    if dropped_pushes > 0 {
+        eprintln!(
+            "note: the tee dropped {dropped_pushes} whole packet(s) — the raw-arrival drain did \
+             not keep up; treat the raw-arrival numbers as suspect."
+        );
+    }
+    print!("{stats}");
+    println!();
+    for s in &samples {
+        let mark = if s.subset_holds(DUAL_TAP_EPS_MS) && s.within_one_hop(hop_ms, DUAL_TAP_EPS_MS) {
+            "ok"
+        } else if !s.subset_holds(DUAL_TAP_EPS_MS) {
+            "SUBSET-BREAK"
+        } else {
+            "over-one-hop"
+        };
+        println!(
+            "  click {:>3}: raw-arrival {:>8.2}  publish {:>8.2}  Δ {:>7.2} ms  [{mark}]",
+            s.index,
+            s.emit_to_raw_arrival_ms,
+            s.emit_to_publish_ms,
+            s.hop_gather_ms(),
+        );
+    }
+    println!(
+        "engine: pushes {} · dropped {} · xruns {} · hops {}/{} (processed/synthesized)",
+        engine_stats.pushes,
+        engine_stats.dropped_frames,
+        engine_stats.xruns,
+        engine_stats.hops_processed,
+        engine_stats.hops_synthesized,
+    );
+    println!(
+        "note: both ends are from ONE running engine on ONE capture-delivery clock. \
+         emit → raw-arrival is the click's samples entering scia's ring (exact per-push mapping off \
+         the tee); emit → publish is the hop that carries it (delivery-anchored). The subset \
+         invariant raw-arrival ≤ publish ≤ raw-arrival + one hop ({hop_ms:.2} ms) therefore holds by \
+         construction — a SUBSET-BREAK (raw-arrival above publish inside one run) is impossible for \
+         two honest clocks and localizes a model defect; an over-one-hop click is a detection landing \
+         a hop late, not a clock bug. Subtract output delay (cb→play, live) to reason about a real \
+         player's audio already in the mix."
+    );
+
+    // Exit contract mirrors the other modes: success when ≥ 80 % of emitted clicks
+    // were measured both ways.
+    if emitted == 0 {
+        eprintln!("no clicks were emitted — nothing to measure");
+        return ExitCode::from(4);
+    }
+    if u64::from(stats.count) * 100 >= u64::from(emitted) * 80 {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "only {}/{emitted} clicks measured both ways (< 80%)",
+            stats.count
+        );
         ExitCode::from(4)
     }
 }

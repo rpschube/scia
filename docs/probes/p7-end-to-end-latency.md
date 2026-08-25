@@ -412,3 +412,102 @@ push while the sample time is on the continuous-capture model. The test asserts
 ≥ 80 % correlated and a loose two-sided median bound (±10 ms), proving the
 correlation and timeline machinery end-to-end. Real-hardware raw-arrival numbers
 land here later via the orchestrator.
+
+## Dual-tap mode (`--dual-tap`)
+
+The final P7 instrument, and what settles the cross-mode constant the three
+reconciliation rounds above could not. Every prior figure came from a **separate
+process**: the DSP thread consumes the sample ring, so raw-ring mode (which drains
+the ring itself) and normal mode (which lets the DSP drain it) are mutually
+exclusive — they can never run at once. That is exactly why a rock-constant
+~27–29 ms gap between a raw-ring run's `emit → raw-arrival` (≈ 108.7 ms) and a
+separate normal run's `emit → publish` (≈ 79.3 ms) could not be told apart from an
+instrumentation artifact: the two numbers were two different WASAPI loopback opens
+on a shared-mode endpoint, and nothing forced them onto one capture-delivery
+instant.
+
+Dual-tap removes the separateness. It runs the **full engine** — the DSP drains
+the primary ring and publishes hops exactly as in normal mode — and adds a **tee**
+at the capture sink: on each push, the delivered packet is *also* copied into a
+second lightweight ring, together with that push's delivery time (`last_push_ns`)
+and running frame count. The DSP never sees the tee; the probe reads it. So one
+running engine, one capture stream, one clock, yields **both** measurements from
+the **same** clicks:
+
+- `emit → publish` — the hop that carries each click, detected off the feature
+  stream, delivery-anchored exactly as shipped.
+- `emit → raw-arrival` — each click's samples entering scia's ring, by
+  cross-correlation on the teed raw samples.
+
+**Exact per-push mapping.** Because every push logs its own `(delivery_ns,
+frames, cumulative_frames)`, the probe maps a matched click's sample index to its
+capture-delivery time *exactly* — one timeline segment per push, no occupancy or
+backlog inference at all. This also retires round 2's open question about the
+`last_push_ns`/commit ordering: the delivery time and the frame count are captured
+together at the push, not read back from separate atomics and reconciled later.
+
+**The invariant it checks, in one run.** A sample enters the ring strictly before
+any hop that carries it can be gathered and published, and the hop grid adds at
+most one 256-frame hop of gather, so
+
+```
+emit → raw-arrival  ≤  emit → publish  ≤  emit → raw-arrival + one hop (5.33 ms)
+```
+
+must hold **per click and in summary**. Both ends are now on the one
+capture-delivery clock in one process, so this holds *by construction*. The probe
+prints the verdict explicitly (`subset N/N · within-one-hop N/N`) and marks each
+click `ok` / `SUBSET-BREAK` / `over-one-hop`.
+
+**How to run.**
+
+```
+# Real machine — full engine + loopback capture + output click player, teed:
+latency_probe --dual-tap --clicks 25
+latency_probe --dual-tap --output-device "NAME"   # pick the output endpoint
+
+# No audio hardware — the CI-testable path (synthetic click backend):
+latency_probe --dual-tap --synthetic --clicks 12
+```
+
+The report prints the two intervals and their per-click hop-gather delta (Δ) as
+percentiles, the invariant verdict, a per-click table, and the tee's dropped-push
+count (`0` when the 1 ms drain kept up; nonzero means the raw-arrival numbers are
+suspect).
+
+**Reading the verdict — the two branches of the dichotomy.** The on-hardware
+command is `latency_probe --dual-tap --clicks 25` on the endpoint under test. Read
+the `subset` count first:
+
+- **subset N/N holds** (every click `raw-arrival ≤ publish`, and the Δ column sits
+  in `0 … 5.33 ms`): the two modes' models are both honest, and the ~27 ms that
+  separated the *earlier separate runs* was a genuine **per-open capture-transport
+  difference** between two independent shared-mode loopback opens — not a clock
+  bug. Dual-tap has shown the invariant holding inside one process, so the residual
+  is a real property of the endpoint's buffering across opens, and the doc records
+  the per-open difference as real. In this branch `Δ` (median) is the true
+  hop-gather term to subtract when scoring US-PERF-1: `emit → publish` is
+  `raw-arrival` plus that Δ, both from one run.
+- **a SUBSET-BREAK appears** (some click reads `raw-arrival` *above* `publish`
+  within the one run): impossible for two honest clocks, so one mode's model still
+  lies — and now the defect is **localizable**, because both figures came from the
+  same push stream on the same clock. Compare the offending click's teed
+  raw-arrival reconstruction against the hop's delivery stamp for the same frames;
+  the break is in whichever of the two derives the wrong time from the shared
+  `last_push_ns`/occupancy data. An `over-one-hop` click (publish more than one hop
+  above raw-arrival) with `subset` still intact is the softer case: a detection
+  landing a hop late because a partial hop's peak missed the threshold, not a clock
+  bug — it does not break the dichotomy.
+
+**Synthetic self-test.** `--dual-tap --synthetic` (and the
+`synthetic_dual_tap_invariant_holds_in_one_run` regression in
+`crates/core/tests/latency.rs`) drives the whole instrument with no hardware: the
+synthetic click backend feeds the engine, the tee reconstructs raw-arrival, the
+observer reads publish, and the test asserts `subset N/N`, `within-one-hop N/N`,
+and that each Δ lies in `0 … one hop`. On the synthetic path `emit → publish`
+collapses to ~0 (the emit stamp is taken at the chunk push, which is also the
+delivery instant) and `emit → raw-arrival` is a few milliseconds *negative* (the
+continuous-capture sample time precedes the pre-push emit stamp), so Δ is the pure
+hop-gather term — the invariant holds with room to spare, proving the tee, the
+exact mapping, and the joined measurement end-to-end. Real-hardware dual-tap
+numbers land here later via the orchestrator.
