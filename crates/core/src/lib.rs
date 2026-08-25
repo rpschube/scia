@@ -52,7 +52,8 @@ pub use beat::{BeatCandidate, BeatDebug, BeatEstimate, BeatTracker};
 pub use bus::{FeatureReader, FeatureWriter, feature_bus};
 pub use capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, RING_FRAMES, SampleConsumer,
-    SampleSink, SinkStats, StreamFormat, StreamHealth, sample_ring,
+    SampleSink, SinkStats, StreamFormat, StreamHealth, TeeConsumer, sample_ring,
+    sample_ring_with_tee, tee_drain_into_timeline,
 };
 pub use dsp::{DspConfig, HopProcessor};
 pub use engine::{Engine, EngineConfig, EngineError, EngineStats, PerfModeState};
@@ -62,8 +63,8 @@ pub use fullscreen::{
     detector as fullscreen_detector,
 };
 pub use latency::{
-    ClickDetector, Detection, Emission, EmitLog, LatencyStats, Matched, Matcher, Percentiles,
-    Sample,
+    ClickDetector, Detection, DualTapSample, DualTapStats, Emission, EmitLog, LatencyStats,
+    Matched, Matcher, Percentiles, Sample,
 };
 pub use onset::{OnsetConfig, OnsetDetector};
 pub use spectrum::{SpectrumAnalyzer, SpectrumConfig};

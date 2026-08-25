@@ -147,6 +147,12 @@ impl SinkStats {
 pub struct SampleSink {
     producer: rtrb::Producer<f32>,
     stats: Arc<SinkStats>,
+    /// The dual-tap tee (P7). `None` on every production path — the engine's
+    /// normal [`sample_ring`] / [`sample_ring_with_stats`] leave it unset, so the
+    /// push hot path is byte-for-byte unchanged (one never-taken `Option` branch).
+    /// [`sample_ring_with_tee`] installs it for the dual-tap probe, which then reads
+    /// the teed packets while the DSP consumes the primary ring untouched.
+    tee: Option<TeeProducer>,
 }
 
 impl SampleSink {
@@ -200,6 +206,17 @@ impl SampleSink {
                 second.copy_from_slice(&src[split..]);
                 chunk.commit_all();
             }
+        }
+
+        // Dual-tap tee (P7): append this whole delivered packet — its samples, the
+        // delivery time already computed above (`now` == this push's
+        // `last_push_ns`), and the running teed-frame count — into the probe's
+        // second ring, leaving the primary ring the DSP drains untouched. A single
+        // `memcpy` into a preallocated ring plus a few atomics; `None` on every
+        // production path, so this is a never-taken branch there.
+        if let Some(tee) = &mut self.tee {
+            let whole = (interleaved.len() / channels) * channels;
+            tee.record(&interleaved[..whole], channels, now);
         }
 
         let pushed = (to_write / channels) as u64;
@@ -322,9 +339,27 @@ pub(crate) fn sample_ring_with_stats(stats: Arc<SinkStats>) -> (SampleSink, Samp
         SampleSink {
             producer,
             stats: Arc::clone(&stats),
+            tee: None,
         },
         SampleConsumer { consumer, stats },
     )
+}
+
+/// Create a sample ring with the P7 dual-tap tee installed: the returned
+/// [`SampleSink`] feeds the primary ring for the DSP **and** tees every delivered
+/// packet into a second ring the returned [`TeeConsumer`] reads, so one running
+/// engine yields both `emit → publish` (off the DSP's hops) and
+/// `emit → raw-arrival` (off the teed samples) from the same clicks. The tee is
+/// additive: the primary [`SampleConsumer`] the DSP owns is identical to the one
+/// [`sample_ring`] returns, and the push path is unchanged except for the extra
+/// tee copy. Used only by the dual-tap probe; every production path uses the
+/// tee-less constructors above.
+#[must_use]
+pub fn sample_ring_with_tee(epoch: Instant) -> (SampleSink, SampleConsumer, TeeConsumer) {
+    let (mut sink, consumer) = sample_ring(epoch);
+    let (producer, tee_consumer) = new_tee();
+    sink.tee = Some(producer);
+    (sink, consumer, tee_consumer)
 }
 
 /// Health of a live capture stream, read back through
@@ -753,6 +788,280 @@ pub fn rect_xcorr_peak(
     best
 }
 
+// ---------------------------------------------------------------------------
+// Dual-tap tee (P7 dual-tap latency probe)
+// ---------------------------------------------------------------------------
+//
+// The tee lets one running engine report both `emit → publish` (off the DSP's
+// hops) and `emit → raw-arrival` (off the raw captured samples) from the same
+// clicks, in one process on one clock — the discriminator the doc's third
+// reconciliation round is owed. The `SampleSink::push` hot path, when a tee is
+// installed, copies each delivered packet into a second SPSC sample ring and logs
+// one [`PushRecord`] — the packet's frame count, its delivery time
+// (`last_push_ns`), and the running teed-frame count — into a wait-free
+// [`PushLog`]. The DSP keeps draining the primary ring untouched. Because every
+// push logs its own exact `(delivery_ns, cumulative_frames)`, the probe maps a
+// captured sample index to its capture-delivery time **exactly**, with no
+// occupancy inference — retiring round-2's `last_push_ns`/commit-ordering
+// question (the pair is captured atomically at the push, not read back and
+// reconciled later).
+
+/// Ring capacity in `f32` slots for the tee's sample ring — the same as the
+/// primary capture ring. A probe draining it on the same 1 ms poll the DSP runs
+/// at never fills it; on the rare full a whole packet is dropped and counted
+/// (never half-written), exactly as the primary ring drops on overflow, so a
+/// logged record always has its samples present and the two stay aligned.
+const TEE_RING_SLOTS: usize = RING_FRAMES * RING_CHANNELS;
+
+/// Fixed [`PushLog`] slot count. Overwrite-oldest beyond it (the
+/// [`EmitLog`](crate::latency::EmitLog) pattern), but sized far above the number
+/// of undrained pushes the sample ring can hold (its capacity over any realistic
+/// packet size), so a continuously-drained probe run never wraps unread records
+/// and the record stream stays aligned with the sample stream.
+const PUSH_LOG_SLOTS: usize = 16_384;
+
+/// One teed capture packet's bookkeeping: how many frames it delivered, when its
+/// newest frame was delivered (`last_push_ns` on the ring epoch), and the running
+/// count of teed frames through the end of this packet. The `(delivery_ns,
+/// cumulative_frames)` pair is what makes the probe's index→time mapping exact:
+/// the packet covers teed global frames `cumulative_frames − frames ..
+/// cumulative_frames`, its newest frame was delivered at `delivery_ns`, and each
+/// earlier frame one frame-period before the next.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PushRecord {
+    /// Frames delivered by this push (interleaved samples ÷ channels).
+    pub frames: u32,
+    /// Delivery time of the push's newest frame (ns on the ring epoch) — the
+    /// `last_push_ns` the sink stamped for this push.
+    pub delivery_ns: u64,
+    /// Cumulative teed frames through the end of this push. Strictly increasing.
+    pub cumulative_frames: u64,
+}
+
+/// One atomic [`PushRecord`] slot, split so the record is written and read
+/// wait-free and without `unsafe` (mirrors [`crate::latency::EmitLog`]'s slot).
+#[derive(Default)]
+struct PushSlot {
+    frames: AtomicU32,
+    delivery_ns: AtomicU64,
+    cumulative_frames: AtomicU64,
+}
+
+/// A wait-free single-producer / single-consumer log of [`PushRecord`]s. The
+/// producer is the capture push (real-time; allocation-free, three relaxed
+/// stores plus one release store); the consumer is the probe's drain, off the
+/// hot path. Overwrite-oldest past [`PUSH_LOG_SLOTS`] (never reached in a
+/// drained run). Shared as an [`Arc`], one clone in each half — the same sharing
+/// discipline [`SinkStats`] uses.
+pub struct PushLog {
+    slots: Box<[PushSlot]>,
+    write: AtomicU64,
+    read: AtomicU64,
+}
+
+impl PushLog {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(PUSH_LOG_SLOTS);
+        slots.resize_with(PUSH_LOG_SLOTS, PushSlot::default);
+        Self {
+            slots: slots.into_boxed_slice(),
+            write: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one push. Wait-free and allocation-free; single producer only.
+    fn push(&self, rec: PushRecord) {
+        let w = self.write.load(Ordering::Relaxed);
+        let slot = &self.slots[(w as usize) % PUSH_LOG_SLOTS];
+        slot.frames.store(rec.frames, Ordering::Relaxed);
+        slot.delivery_ns.store(rec.delivery_ns, Ordering::Relaxed);
+        slot.cumulative_frames
+            .store(rec.cumulative_frames, Ordering::Relaxed);
+        // Release so a consumer that reads `write` with Acquire sees the fields.
+        self.write.store(w.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Append every record logged since the last drain to `out`, in push order.
+    /// Single consumer only.
+    fn drain(&self, out: &mut Vec<PushRecord>) {
+        let w = self.write.load(Ordering::Acquire);
+        let mut r = self.read.load(Ordering::Relaxed);
+        while r < w {
+            let slot = &self.slots[(r as usize) % PUSH_LOG_SLOTS];
+            out.push(PushRecord {
+                frames: slot.frames.load(Ordering::Relaxed),
+                delivery_ns: slot.delivery_ns.load(Ordering::Relaxed),
+                cumulative_frames: slot.cumulative_frames.load(Ordering::Relaxed),
+            });
+            r += 1;
+        }
+        self.read.store(r, Ordering::Relaxed);
+    }
+}
+
+/// The producer half of the tee, held inside a [`SampleSink`]. On each push it
+/// copies the delivered packet into its sample ring and logs a [`PushRecord`].
+struct TeeProducer {
+    samples: rtrb::Producer<f32>,
+    log: Arc<PushLog>,
+    /// Producer-owned running count of teed frames (only frames actually written
+    /// to the sample ring; a dropped push does not advance it, so the count always
+    /// matches the teed sample stream).
+    cumulative_frames: u64,
+    /// Whole packets dropped because the sample ring was full — surfaced to the
+    /// probe so a run that did not keep up is visible, never silently mis-aligned.
+    dropped_pushes: Arc<AtomicU64>,
+}
+
+impl TeeProducer {
+    /// Tee one whole-frame packet delivered at `delivery_ns`. All-or-nothing: if
+    /// the whole packet fits it is copied and logged; otherwise the packet is
+    /// dropped and counted, so a logged record's samples are always present and
+    /// its newest frame is genuinely the packet's newest (the delivery anchor).
+    /// Wait-free and allocation-free.
+    fn record(&mut self, interleaved: &[f32], channels: usize, delivery_ns: u64) {
+        let frames = interleaved.len() / channels;
+        if frames == 0 {
+            return;
+        }
+        if self.samples.slots() < interleaved.len() {
+            self.dropped_pushes.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if let Ok(mut chunk) = self.samples.write_chunk(interleaved.len()) {
+            let (first, second) = chunk.as_mut_slices();
+            let split = first.len();
+            first.copy_from_slice(&interleaved[..split]);
+            second.copy_from_slice(&interleaved[split..]);
+            chunk.commit_all();
+        } else {
+            self.dropped_pushes.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.cumulative_frames += frames as u64;
+        self.log.push(PushRecord {
+            frames: frames as u32,
+            delivery_ns,
+            cumulative_frames: self.cumulative_frames,
+        });
+    }
+}
+
+/// The consumer half of the tee, handed to the dual-tap probe. It reads the teed
+/// samples and per-push records the running engine's capture pushes produce,
+/// while the engine's DSP drains the primary ring unaware of it. Drive it through
+/// [`tee_drain_into_timeline`].
+pub struct TeeConsumer {
+    samples: rtrb::Consumer<f32>,
+    log: Arc<PushLog>,
+    dropped_pushes: Arc<AtomicU64>,
+    /// Reused record buffer, pre-reserved so a drain never allocates.
+    records: Vec<PushRecord>,
+}
+
+impl TeeConsumer {
+    /// Whole packets the tee dropped because its sample ring was full. `0` when
+    /// the probe's drain kept up with capture (the only regime a valid run uses);
+    /// nonzero means the run did not keep up and its raw-arrival numbers are
+    /// suspect — the direct read-out the probe surfaces.
+    #[must_use]
+    pub fn dropped_pushes(&self) -> u64 {
+        self.dropped_pushes.load(Ordering::Relaxed)
+    }
+}
+
+/// Create the tee's SPSC sample ring and per-push log, returning the producer
+/// half (installed in a [`SampleSink`]) and the consumer half (handed to the
+/// probe).
+fn new_tee() -> (TeeProducer, TeeConsumer) {
+    let (producer, consumer) = rtrb::RingBuffer::<f32>::new(TEE_RING_SLOTS);
+    let log = Arc::new(PushLog::new());
+    let dropped_pushes = Arc::new(AtomicU64::new(0));
+    // A single 1 ms drain sees only a handful of pushes; reserve well above that
+    // so the reused buffer never grows on the drain path.
+    let records = Vec::with_capacity(1024);
+    (
+        TeeProducer {
+            samples: producer,
+            log: Arc::clone(&log),
+            cumulative_frames: 0,
+            dropped_pushes: Arc::clone(&dropped_pushes),
+        },
+        TeeConsumer {
+            samples: consumer,
+            log,
+            dropped_pushes,
+            records,
+        },
+    )
+}
+
+/// Drain every teed packet available from `tee` into `mono` (down-mixed) and
+/// `timeline`, reconstructing each packet's capture-delivery times **exactly**
+/// from its own logged `(delivery_ns, frames)` — one [`DrainTimeline`] segment per
+/// push, so there is no occupancy/backlog inference at all. Returns the frames
+/// appended this call. Shared by the `latency_probe` example and the synthetic
+/// dual-tap regression so both reconstruct through one code path.
+///
+/// A logged record always has its samples present in the ring (the push writes
+/// the whole packet before logging it, and logs only when the write succeeds), so
+/// each record's `frames × channels` samples read exactly. `scratch` is reused as
+/// the interleaved read buffer (cleared per packet); pre-sizing it and `mono` to
+/// the capture length keeps the drain allocation-free.
+pub fn tee_drain_into_timeline(
+    tee: &mut TeeConsumer,
+    scratch: &mut Vec<f32>,
+    mono: &mut Vec<f32>,
+    timeline: &mut DrainTimeline,
+    channels: usize,
+) -> usize {
+    let channels = channels.max(1);
+    // Move the reusable record buffer out so the sample consumer and the record
+    // buffer are not both borrowed through `tee` at once; restored at the end.
+    let mut records = std::mem::take(&mut tee.records);
+    records.clear();
+    tee.log.drain(&mut records);
+    let mut appended = 0usize;
+    for rec in &records {
+        let need = rec.frames as usize * channels;
+        if need == 0 {
+            continue;
+        }
+        if tee.samples.slots() < need {
+            // The samples for a logged record are always present; a shortfall would
+            // mean the log wrapped past the sample ring (never in a drained run).
+            // Stop rather than mis-align; the leftover records reappear next drain.
+            break;
+        }
+        scratch.clear();
+        if let Ok(chunk) = tee.samples.read_chunk(need) {
+            let (first, second) = chunk.as_slices();
+            scratch.extend_from_slice(first);
+            scratch.extend_from_slice(second);
+            chunk.commit_all();
+        } else {
+            break;
+        }
+        for f in 0..rec.frames as usize {
+            let base = f * channels;
+            let mut acc = 0.0f32;
+            for c in 0..channels {
+                acc += scratch[base + c];
+            }
+            mono.push(acc / channels as f32);
+        }
+        // Exact per-push segment: the packet's newest frame was delivered at
+        // `delivery_ns`, `frames` frames span back one frame-period each. This is
+        // the same arithmetic the drain reconstruction uses, but with the anchor
+        // captured exactly at the push (no backlog term), so the mapping is exact.
+        timeline.record_drain(rec.delivery_ns, u64::from(rec.frames));
+        appended += rec.frames as usize;
+    }
+    tee.records = records;
+    appended
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,6 +1296,149 @@ mod tests {
             peak <= 1.0,
             "NCC {peak} exceeded 1.0 — normalization denominator drifted"
         );
+    }
+
+    #[test]
+    fn push_log_roundtrip_preserves_order_and_monotonicity() {
+        let log = PushLog::new();
+        log.push(PushRecord {
+            frames: 100,
+            delivery_ns: 1_000,
+            cumulative_frames: 100,
+        });
+        log.push(PushRecord {
+            frames: 50,
+            delivery_ns: 1_200,
+            cumulative_frames: 150,
+        });
+        let mut out = Vec::new();
+        log.drain(&mut out);
+        assert_eq!(out.len(), 2);
+        // Records come back in push order, cumulative strictly up, delivery non-down.
+        assert_eq!(out[0].cumulative_frames, 100);
+        assert_eq!(out[1].cumulative_frames, 150);
+        assert!(out[0].cumulative_frames < out[1].cumulative_frames);
+        assert!(out[0].delivery_ns <= out[1].delivery_ns);
+        // A second drain with nothing new appends nothing.
+        log.drain(&mut out);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn tee_samples_byte_identical_and_mapping_reflects_delivery() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let rate = 48_000u32;
+        let npf = 1.0e9 / f64::from(rate);
+        let epoch = Instant::now();
+        let (mut sink, _primary, mut tee) = sample_ring_with_tee(epoch);
+        sink.stats().set_channels(1); // mono: the downmix is the identity
+
+        // A startup gap: nothing is pushed for the first 30 ms, so the first
+        // packet's delivery time is well past the epoch and the reconstruction must
+        // reflect it (not model contiguous capture from t=0). Irregular packet
+        // sizes exercise the per-push segment boundaries.
+        sleep(Duration::from_millis(30));
+        let sizes = [300usize, 128, 501, 64, 777];
+        let mut pushed_all: Vec<f32> = Vec::new();
+        let mut schedule: Vec<(u64, u64)> = Vec::new(); // (delivery_ns, frames)
+        for (i, &n) in sizes.iter().enumerate() {
+            // Distinct per-sample values so byte-identity is meaningful.
+            let pkt: Vec<f32> = (0..n).map(|j| (i * 1000 + j) as f32 * 1.0e-4).collect();
+            sink.push(&pkt);
+            // Single-threaded direct push: `last_push_ns` now holds exactly the
+            // delivery time this push logged into the tee.
+            let d = sink.stats().last_push_ns.load(Ordering::Acquire);
+            schedule.push((d, n as u64));
+            pushed_all.extend_from_slice(&pkt);
+            sleep(Duration::from_millis(2));
+        }
+        let total: u64 = sizes.iter().map(|&n| n as u64).sum();
+
+        let mut scratch: Vec<f32> = Vec::with_capacity(2048);
+        let mut mono: Vec<f32> = Vec::with_capacity(total as usize);
+        let mut timeline = DrainTimeline::new(rate);
+        timeline.reserve(sizes.len());
+        let appended = tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, 1);
+
+        assert_eq!(appended as u64, total, "every teed frame drained");
+        assert_eq!(tee.dropped_pushes(), 0, "the tee kept up, nothing dropped");
+        // Byte-identical: the mono downmix of a mono stream is the pushed stream.
+        assert_eq!(mono, pushed_all, "teed samples differ from what was pushed");
+
+        // Exact index→time mapping vs the recorded schedule. For each packet the
+        // newest frame maps to (within one frame-period of) its logged delivery
+        // time, and the oldest to delivery − frames·frame-period — the delivery
+        // anchor, per push, with no occupancy inference.
+        let one_frame = npf.ceil() as i64 + 1;
+        let mut start = 0u64;
+        for (idx, &(d, n)) in schedule.iter().enumerate() {
+            let newest = start + n - 1;
+            let oldest = start;
+            let t_new = timeline.sample_time_ns(newest).expect("newest time");
+            let t_old = timeline.sample_time_ns(oldest).expect("oldest time");
+            assert!(
+                (t_new as i64 - d as i64).abs() <= one_frame,
+                "packet {idx}: newest frame time {t_new} not within a frame of delivery {d}"
+            );
+            let exp_old = d.saturating_sub((n as f64 * npf).round() as u64);
+            assert!(
+                (t_old as i64 - exp_old as i64).abs() <= one_frame,
+                "packet {idx}: oldest frame time {t_old} not at delivery − span ({exp_old})"
+            );
+            start += n;
+        }
+        // The startup gap is reflected: the very first captured frame is placed
+        // tens of ms in, not near the epoch — a gapless-from-zero model would have
+        // put it near 0.
+        let first = timeline.sample_time_ns(0).expect("first frame time");
+        assert!(
+            first > 15_000_000,
+            "first frame time {first} ns ignored the startup gap (should be ~30 ms in)"
+        );
+    }
+
+    #[test]
+    fn tee_drops_whole_packets_when_full_but_stays_aligned() {
+        // Overfill the tee sample ring without draining: once full, whole packets
+        // are dropped and counted, and the records that DID land still map their
+        // samples exactly (never a half-written packet).
+        let epoch = Instant::now();
+        let (mut sink, _primary, mut tee) = sample_ring_with_tee(epoch);
+        sink.stats().set_channels(1);
+
+        let pkt = vec![0.5f32; 4096];
+        let mut pushes = 0u64;
+        // TEE_RING_SLOTS / 4096 packets fill it; push well past that.
+        for _ in 0..(TEE_RING_SLOTS / 4096 + 8) {
+            sink.push(&pkt);
+            pushes += 1;
+        }
+        assert!(
+            tee.dropped_pushes() > 0,
+            "expected some whole-packet drops after overfilling the tee"
+        );
+        assert!(
+            tee.dropped_pushes() < pushes,
+            "not every packet should drop"
+        );
+
+        let mut scratch: Vec<f32> = Vec::with_capacity(8192);
+        let mut mono: Vec<f32> = Vec::with_capacity(TEE_RING_SLOTS);
+        let mut timeline = DrainTimeline::new(48_000);
+        timeline.reserve(pushes as usize);
+        let appended = tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, 1);
+
+        // Every teed frame is a whole packet's worth, all samples 0.5, and the
+        // drained frame count equals the frames of the packets that were logged.
+        let teed_packets = pushes - tee.dropped_pushes();
+        assert_eq!(
+            appended as u64,
+            teed_packets * 4096,
+            "aligned to whole packets"
+        );
+        assert!(mono.iter().all(|&s| (s - 0.5).abs() < 1e-6));
     }
 
     #[test]

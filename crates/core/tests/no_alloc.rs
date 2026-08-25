@@ -7,6 +7,7 @@ mod support {
 }
 
 use scia_core::backends::convert::{Downmix, f32_id, i16_to_f32};
+use scia_core::capture::{DrainTimeline, sample_ring_with_tee, tee_drain_into_timeline};
 use scia_core::spectrum::{SpectrumAnalyzer, SpectrumConfig};
 use scia_core::{HopProcessor, StreamFormat, sample_ring};
 use std::time::Instant;
@@ -205,6 +206,47 @@ fn beat_tracker_induction_does_not_allocate() {
     assert!(
         stray_count == 0,
         "beat induction path allocated {} time(s):\n{}",
+        stray_count,
+        strays.join("\n---\n")
+    );
+}
+
+#[test]
+fn tee_push_path_does_not_allocate() {
+    // With the P7 dual-tap tee installed, the capture push writes the packet into
+    // the tee's second ring and logs one per-push record — that extra work must
+    // also stay allocation-free after warm-up (a memcpy plus atomics). Drain the
+    // tee each iteration into pre-sized buffers so the tee ring never fills and the
+    // real write+log path (not the drop path) is what is measured.
+    let hop = 256usize;
+    let channels = 2usize;
+
+    let (mut sink, _primary, mut tee) = sample_ring_with_tee(Instant::now());
+    sink.stats().set_channels(2);
+    let chunk = vec![0.3f32; hop * channels];
+
+    // Pre-size every drain buffer so the reconstruction never grows one.
+    let mut scratch: Vec<f32> = Vec::with_capacity(hop * channels * 4);
+    let mut mono: Vec<f32> = Vec::with_capacity(hop * 300);
+    let mut timeline = DrainTimeline::new(48_000);
+    timeline.reserve(300);
+
+    // Warm up: prime the tee ring, the drain buffers, and the segment list.
+    for _ in 0..5 {
+        sink.push(&chunk);
+        tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+    }
+
+    let ((), stray_count, strays) = watch(|| {
+        for _ in 0..200 {
+            sink.push(&chunk);
+            tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+        }
+    });
+
+    assert!(
+        stray_count == 0,
+        "tee push+drain path allocated {} time(s):\n{}",
         stray_count,
         strays.join("\n---\n")
     );

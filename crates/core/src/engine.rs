@@ -22,7 +22,7 @@ use crate::beat::BeatDebug;
 use crate::bus::{FeatureReader, feature_bus};
 use crate::capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, SinkStats, StreamFormat,
-    StreamHealth, sample_ring, sample_ring_with_stats,
+    StreamHealth, TeeConsumer, sample_ring, sample_ring_with_stats, sample_ring_with_tee,
 };
 use crate::dsp::{DspConfig, DspCounters, DspThread, RingSwap};
 use crate::features::Activity;
@@ -583,11 +583,51 @@ impl Engine {
     /// Returns [`EngineError::Capture`] if the backend cannot open, or
     /// [`EngineError::Spawn`] if a thread cannot be created.
     pub fn start(
-        mut backend: Box<dyn CaptureBackend>,
+        backend: Box<dyn CaptureBackend>,
         config: EngineConfig,
     ) -> Result<(Engine, FeatureReader), EngineError> {
+        let (engine, reader, _tee) = Self::start_inner(backend, config, false)?;
+        Ok((engine, reader))
+    }
+
+    /// Start the engine with the P7 dual-tap tee installed on the capture sink,
+    /// returning the [`TeeConsumer`] alongside the usual pair. The engine runs
+    /// exactly as [`start`](Engine::start) does — the DSP drains the primary ring
+    /// and publishes hops normally — while every delivered capture packet is also
+    /// teed for the dual-tap probe, so one run yields both `emit → publish` (off
+    /// the hops) and `emit → raw-arrival` (off the teed samples) on one clock. The
+    /// tee rides only the initial capture sink; a runtime reopen (device switch or
+    /// fault recovery) rebuilds the sink without it, which is a non-issue for the
+    /// probe (a reopen mid-measurement already invalidates the run).
+    ///
+    /// # Errors
+    /// Same as [`start`](Engine::start).
+    pub fn start_with_dual_tap(
+        backend: Box<dyn CaptureBackend>,
+        config: EngineConfig,
+    ) -> Result<(Engine, FeatureReader, TeeConsumer), EngineError> {
+        let (engine, reader, tee) = Self::start_inner(backend, config, true)?;
+        // `dual_tap = true` always yields a tee.
+        Ok((
+            engine,
+            reader,
+            tee.expect("dual-tap start returns a tee consumer"),
+        ))
+    }
+
+    fn start_inner(
+        mut backend: Box<dyn CaptureBackend>,
+        config: EngineConfig,
+        dual_tap: bool,
+    ) -> Result<(Engine, FeatureReader, Option<TeeConsumer>), EngineError> {
         let epoch = Instant::now();
-        let (sink, consumer) = sample_ring(epoch);
+        let (sink, consumer, tee) = if dual_tap {
+            let (sink, consumer, tee) = sample_ring_with_tee(epoch);
+            (sink, consumer, Some(tee))
+        } else {
+            let (sink, consumer) = sample_ring(epoch);
+            (sink, consumer, None)
+        };
         let stats = Arc::clone(sink.stats());
 
         let stream = backend.open(config.target, sink)?;
@@ -716,6 +756,7 @@ impl Engine {
                 pause,
             },
             reader,
+            tee,
         ))
     }
 

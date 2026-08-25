@@ -8,11 +8,13 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use scia_core::capture::{DrainTimeline, RAW_CORR_ACCEPT, drain_into_timeline, rect_xcorr_peak};
+use scia_core::capture::{
+    DrainTimeline, RAW_CORR_ACCEPT, drain_into_timeline, rect_xcorr_peak, tee_drain_into_timeline,
+};
 use scia_core::{
-    CaptureBackend, CaptureTarget, ClickDetector, Detection, Emission, EmitLog, Engine,
-    EngineConfig, LatencyStats, Matcher, Pacing, Percentiles, Signal, StreamFormat,
-    SyntheticBackend, sample_ring,
+    CaptureBackend, CaptureTarget, ClickDetector, Detection, DualTapSample, DualTapStats, Emission,
+    EmitLog, Engine, EngineConfig, LatencyStats, Matcher, Pacing, Percentiles, Signal,
+    StreamFormat, SyntheticBackend, sample_ring,
 };
 
 /// Observer poll interval. Committed at 1 ms; temporarily set to 10 ms to
@@ -279,6 +281,156 @@ fn synthetic_raw_ring_correlation_is_within_budget() {
         "median emit→raw-arrival {:.2} ms should be within ±10 ms of zero",
         pct.median
     );
+}
+
+/// Synthetic dual-tap end-to-end (P7 final instrument), through the library types
+/// — the CI-testable path for the probe's `--dual-tap --synthetic` mode. One
+/// running engine tees every capture packet while its DSP publishes hops as
+/// normal, so BOTH `emit → raw-arrival` (cross-correlation on the teed samples,
+/// exact per-push mapping) and `emit → publish` (hop detection) are measured from
+/// the SAME clicks in ONE process on ONE clock. The test asserts the subset
+/// invariant `raw-arrival ≤ publish ≤ raw-arrival + one hop` holds for every click
+/// measured both ways, and that the per-click delta IS the hop-gather term (within
+/// `0 ..= one hop`) — the by-construction guarantee the whole instrument rests on.
+#[test]
+fn synthetic_dual_tap_invariant_holds_in_one_run() {
+    let clicks: u32 = 12;
+    let spacing_ms: u32 = 200;
+    let amp = 0.8f32;
+    let click_ms = 1.0f32;
+    let threshold = 0.3f32;
+
+    let emit_log = Arc::new(EmitLog::new());
+    let backend = SyntheticBackend {
+        format: StreamFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        },
+        signal: Signal::Clicks {
+            bpm: 60_000.0 / spacing_ms as f32,
+            amp,
+        },
+        pacing: Pacing::Realtime,
+        emit_log: Some(Arc::clone(&emit_log)),
+    };
+
+    let (engine, mut reader, mut tee) =
+        Engine::start_with_dual_tap(Box::new(backend), EngineConfig::default())
+            .expect("dual-tap engine start");
+
+    let format = engine.format();
+    let channels = format.channels.max(1) as usize;
+    let sample_rate = format.sample_rate.max(1);
+
+    // Pre-allocate the raw-arrival buffers.
+    let observe_ms = u64::from(clicks) * u64::from(spacing_ms) + 2000;
+    let flush_ms = u64::from(spacing_ms) / 2;
+    let cap_frames = (((observe_ms + flush_ms + 500) * u64::from(sample_rate)) / 1000) as usize;
+    let mut mono: Vec<f32> = Vec::with_capacity(cap_frames);
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut timeline = DrainTimeline::new(sample_rate);
+    timeline.reserve(observe_ms as usize + 16);
+
+    // One 1 ms loop feeds the observer (publish side) and drains the tee
+    // (raw-arrival side) in lockstep.
+    let half_spacing_ns = u64::from(spacing_ms) / 2 * 1_000_000;
+    let mut detector = ClickDetector::new(threshold, half_spacing_ns);
+    let mut detections: Vec<Detection> = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(observe_ms + flush_ms);
+    let mut last_gen: Option<u64> = None;
+    while Instant::now() < deadline {
+        let snapshot = *reader.latest();
+        if last_gen != Some(snapshot.generation) {
+            last_gen = Some(snapshot.generation);
+            if let Some(d) = detector.observe(&snapshot, engine.now_ns()) {
+                detections.push(d);
+            }
+        }
+        tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+        sleep(Duration::from_millis(1));
+    }
+    tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+
+    let dropped_pushes = tee.dropped_pushes();
+    engine.stop();
+
+    // The unbounded 1 ms tee drain keeps up, so no whole packet is dropped.
+    assert_eq!(
+        dropped_pushes, 0,
+        "the tee dropped {dropped_pushes} packet(s) — the drain fell behind"
+    );
+
+    let mut emissions: Vec<Emission> = Vec::new();
+    emit_log.drain(&mut emissions);
+    emissions.sort_by_key(|e| e.emit_ns);
+
+    // Publish side.
+    let matched = Matcher::new(half_spacing_ns).match_events(&emissions, &detections);
+
+    // Raw-arrival side.
+    let click_frames = ((click_ms * sample_rate as f32 / 1000.0).ceil() as usize).max(1);
+    let mut raw_by_index: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    for e in &emissions {
+        let lo = timeline.frame_at_or_after(e.emit_ns.saturating_sub(half_spacing_ns)) as usize;
+        let hi = timeline.frame_at_or_after(e.emit_ns + half_spacing_ns) as usize;
+        if let Some((offset, peak)) = rect_xcorr_peak(&mono, click_frames, lo, hi) {
+            if peak >= RAW_CORR_ACCEPT {
+                let arrival = timeline.sample_time_ns(offset as u64).unwrap_or(e.emit_ns);
+                raw_by_index.insert(e.index, (arrival as i64 - e.emit_ns as i64) as f32 / 1.0e6);
+            }
+        }
+    }
+
+    // Join into per-click dual-tap samples.
+    let mut samples: Vec<DualTapSample> = Vec::new();
+    for s in &matched.samples {
+        if let Some(&raw_ms) = raw_by_index.get(&s.index) {
+            samples.push(DualTapSample {
+                index: s.index,
+                emit_to_raw_arrival_ms: raw_ms,
+                emit_to_publish_ms: (s.publish_ns.saturating_sub(s.emit_ns)) as f32 / 1.0e6,
+            });
+        }
+    }
+
+    let hop_ms = (256.0 * 1000.0 / f64::from(sample_rate)) as f32;
+    let eps_ms = 0.5f32;
+    let stats = DualTapStats::from_samples(&samples, hop_ms, eps_ms);
+
+    println!(
+        "dual-tap: clicks {} · both {} · subset {}/{} · within-hop {}/{}\n{stats}",
+        emissions.len(),
+        stats.count,
+        stats.subset_holds,
+        stats.count,
+        stats.within_one_hop,
+        stats.count,
+    );
+
+    // Enough clicks measured both ways to characterize the invariant.
+    assert!(
+        stats.count >= 6,
+        "only {} clicks measured both ways — too few to characterize the invariant",
+        stats.count
+    );
+    // The whole instrument: in ONE run on ONE clock the subset invariant holds for
+    // every click, and the per-click delta IS the hop-gather term (within one hop).
+    assert!(
+        stats.all_hold(),
+        "subset invariant broke in one run: subset {}/{}, within-one-hop {}/{}",
+        stats.subset_holds,
+        stats.count,
+        stats.within_one_hop,
+        stats.count
+    );
+    for s in &samples {
+        let delta = s.hop_gather_ms();
+        assert!(
+            delta >= -eps_ms && delta <= hop_ms + eps_ms,
+            "click {}: hop-gather Δ {delta:.2} ms is outside 0..=one hop ({hop_ms:.2} ms)",
+            s.index
+        );
+    }
 }
 
 /// Under-drain regression: a drain that runs a constant distance behind the
