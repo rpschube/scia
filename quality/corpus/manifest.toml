@@ -1,0 +1,8 @@
+[[clip]]
+id = "synth-music"
+genre = "synthetic"
+path = "clips/synth-music.ndjson"
+duration_s = 30.0
+sha256 = "7268f375d7506e6b3884f9585a928a534f469c4f0008d61b058854c15eaadd92"
+notes = "deterministic synthetic clip: music @ 112 bpm, 48000 hz, 2ch"
+generated = true

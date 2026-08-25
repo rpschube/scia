@@ -1,0 +1,5 @@
+# Generated synthetic clips are regenerated on demand (manifest `generated =
+# true`) and hash-verified by `scia-harness corpus verify`, so they are not
+# committed. Real recorded genre clips (committed fixtures, `generated = false`)
+# are added explicitly by the maintainer and are not matched here.
+/synth-music.ndjson

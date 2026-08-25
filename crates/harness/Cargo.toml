@@ -1,0 +1,21 @@
+[package]
+name = "scia-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Scene-quality harness: golden-clip replay, objective display-list metrics and an A/B rig."
+
+[[bin]]
+name = "scia-harness"
+path = "src/main.rs"
+
+[dependencies]
+scia-core = { path = "../core", version = "0.0.0" }
+scia-scenes = { path = "../scenes", version = "0.0.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+clap = { version = "4", features = ["derive"] }
