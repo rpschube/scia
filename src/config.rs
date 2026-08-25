@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use serde::Deserialize;
 
-use scia_tui::{ChromeMode, InputAction, Keymap, parse_chord};
+use scia_tui::{ChromeMode, InputAction, Keymap, NowPlayingMode, parse_chord};
 
 use crate::PresenterTier;
 
@@ -52,6 +52,7 @@ struct RawDefaults {
     demo_bpm: Option<f32>,
     chrome: Option<String>,
     device: Option<String>,
+    now_playing: Option<String>,
 }
 
 /// The config-file `[defaults]` after validation. Each is `None` when the file
@@ -75,6 +76,9 @@ pub struct FileDefaults {
     pub chrome: Option<ChromeMode>,
     /// Default (pinned) capture device name; `None` follows the system default.
     pub device: Option<String>,
+    /// Default now-playing source policy. `None` leaves the built-in default
+    /// ([`NowPlayingMode::MediaThenSources`]) in force.
+    pub now_playing: Option<NowPlayingMode>,
 }
 
 /// The fully loaded config: validated defaults, the resolved keymap, and any
@@ -124,6 +128,8 @@ pub struct CliLayer {
     pub chrome: Option<ChromeMode>,
     /// `--device NAME`.
     pub device: Option<String>,
+    /// `--now-playing MODE`.
+    pub now_playing: Option<NowPlayingMode>,
 }
 
 /// The resolved options after applying precedence: built-in defaults < config <
@@ -150,6 +156,9 @@ pub struct Resolved {
     /// The capture device name to open, if any; `None` follows the system
     /// default.
     pub device: Option<String>,
+    /// The now-playing source policy: what the now-playing surfaces name, and in
+    /// what order. Always resolved (CLI > config > the built-in default).
+    pub now_playing: NowPlayingMode,
 }
 
 /// Merge the CLI layer over the file defaults over the built-in defaults.
@@ -184,6 +193,7 @@ pub fn resolve(cli: CliLayer, file: &FileDefaults) -> Resolved {
         demo_bpm: cli.demo_bpm.or(file.demo_bpm).unwrap_or(DEFAULT_DEMO_BPM),
         chrome: cli.chrome.or(file.chrome).unwrap_or_default(),
         device: cli.device.or_else(|| file.device.clone()),
+        now_playing: cli.now_playing.or(file.now_playing).unwrap_or_default(),
     }
 }
 
@@ -252,6 +262,17 @@ pub fn parse(text: &str) -> Config {
         })
     });
 
+    // Validate the now-playing source policy against the same names the flag
+    // accepts.
+    let now_playing = raw.defaults.now_playing.as_deref().and_then(|name| {
+        NowPlayingMode::parse(name).or_else(|| {
+            warnings.push(format!(
+                "config: unknown now_playing `{name}`; ignoring (valid: media-then-sources, media, sources, off)"
+            ));
+            None
+        })
+    });
+
     let defaults = FileDefaults {
         scene: raw.defaults.scene,
         presenter,
@@ -261,6 +282,7 @@ pub fn parse(text: &str) -> Config {
         demo_bpm: raw.defaults.demo_bpm,
         chrome,
         device: raw.defaults.device,
+        now_playing,
     };
 
     // Apply the [keys] overrides on top of the built-in map.
@@ -466,6 +488,7 @@ mod tests {
             demo_bpm: Some(90.0),
             chrome: Some(ChromeMode::Instrument),
             device: Some("Speakers".to_string()),
+            now_playing: Some(NowPlayingMode::Sources),
         };
 
         // No flags: the config layer wins over the built-in defaults.
@@ -479,6 +502,7 @@ mod tests {
                 demo_bpm: None,
                 chrome: None,
                 device: None,
+                now_playing: None,
             },
             &file,
         );
@@ -497,6 +521,11 @@ mod tests {
             Some("Speakers"),
             "the config device applies with no flag"
         );
+        assert_eq!(
+            from_config.now_playing,
+            NowPlayingMode::Sources,
+            "the config now_playing applies with no flag"
+        );
 
         // Flags present: they beat the config layer.
         let from_flags = resolve(
@@ -509,10 +538,16 @@ mod tests {
                 demo_bpm: Some(140.0),
                 chrome: Some(ChromeMode::Playful),
                 device: Some("Headset".to_string()),
+                now_playing: Some(NowPlayingMode::Off),
             },
             &file,
         );
         assert_eq!(from_flags.scene.as_deref(), Some("starfall"));
+        assert_eq!(
+            from_flags.now_playing,
+            NowPlayingMode::Off,
+            "the --now-playing flag beats the config"
+        );
         assert_eq!(
             from_flags.device.as_deref(),
             Some("Headset"),
@@ -541,6 +576,7 @@ mod tests {
                 demo_bpm: None,
                 chrome: None,
                 device: None,
+                now_playing: None,
             },
             &FileDefaults::default(),
         );
@@ -562,6 +598,11 @@ mod tests {
             bare.chrome,
             ChromeMode::Invisible,
             "the built-in default is invisible"
+        );
+        assert_eq!(
+            bare.now_playing,
+            NowPlayingMode::MediaThenSources,
+            "the built-in default names media then sources"
         );
     }
 
@@ -633,6 +674,7 @@ mod tests {
                 demo_bpm: None,
                 chrome: None,
                 device: None,
+                now_playing: None,
             },
             &cfg.defaults,
         );
@@ -648,6 +690,7 @@ mod tests {
                 demo_bpm: None,
                 chrome: None,
                 device: Some("Line In".to_string()),
+                now_playing: None,
             },
             &cfg.defaults,
         );
@@ -679,7 +722,46 @@ mod tests {
             demo_bpm: None,
             chrome: None,
             device: None,
+            now_playing: None,
         }
+    }
+
+    #[test]
+    fn now_playing_parses_each_mode() {
+        for (name, mode) in [
+            ("media-then-sources", NowPlayingMode::MediaThenSources),
+            ("media", NowPlayingMode::Media),
+            ("sources", NowPlayingMode::Sources),
+            ("off", NowPlayingMode::Off),
+        ] {
+            let cfg = parse(&format!("[defaults]\nnow_playing = \"{name}\"\n"));
+            assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+            assert_eq!(cfg.defaults.now_playing, Some(mode));
+        }
+    }
+
+    #[test]
+    fn unknown_now_playing_warns_and_drops() {
+        let cfg = parse("[defaults]\nnow_playing = \"everything\"\n");
+        assert_eq!(cfg.defaults.now_playing, None);
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(cfg.warnings[0].contains("everything"));
+    }
+
+    #[test]
+    fn now_playing_defaults_to_media_then_sources() {
+        // Absent everywhere, it resolves to the built-in default.
+        let resolved = resolve(empty_cli(), &FileDefaults::default());
+        assert_eq!(resolved.now_playing, NowPlayingMode::MediaThenSources);
+    }
+
+    #[test]
+    fn config_now_playing_beats_the_default() {
+        let file = FileDefaults {
+            now_playing: Some(NowPlayingMode::Off),
+            ..FileDefaults::default()
+        };
+        assert_eq!(resolve(empty_cli(), &file).now_playing, NowPlayingMode::Off);
     }
 
     #[test]

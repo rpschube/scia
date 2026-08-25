@@ -16,7 +16,7 @@ use crate::chrome::ChromeState;
 use crate::devicepick::DevicePicker;
 use crate::keymap::{InputAction, Keymap};
 use crate::mapping_ui::MappingUi;
-use crate::nowplaying::{self, NowPlayingState};
+use crate::nowplaying::{self, NowPlayingMode, NowPlayingState};
 use crate::palette;
 use crate::tuning::TuningStrip;
 
@@ -104,6 +104,16 @@ pub struct UiState {
     /// The now-playing metadata the loop keeps current from the backend event
     /// stream. Empty (nothing playing) by default.
     pub now_playing: NowPlayingState,
+    /// What the now-playing surfaces may name, and in what order (config
+    /// `[defaults] now_playing` / `--now-playing`). Governs both the ambient
+    /// chrome line and the `n` panel. Defaults to
+    /// [`MediaThenSources`](NowPlayingMode::MediaThenSources).
+    pub now_playing_mode: NowPlayingMode,
+    /// The friendly name of the app currently dominating the output mix, when the
+    /// audio-source observer has one and the mode consults it. `None` when nothing
+    /// audible is playing, or the mode never names a source. This is the "game
+    /// with no media session" attribution.
+    pub source_app: Option<String>,
     /// The now-playing track line, when the metadata backend has one. `None`
     /// until the now-playing metadata seam is wired in; [`track_line`] is the one
     /// accessor the chrome reads, so wiring the value here lights every chrome
@@ -176,6 +186,24 @@ impl UiState {
     pub fn track_line(&self) -> Option<&str> {
         self.track.as_deref()
     }
+
+    /// Whether the now-playing surfaces should show a media session, per the
+    /// [`now_playing_mode`](UiState::now_playing_mode).
+    #[must_use]
+    pub fn now_playing_shows_media(&self) -> bool {
+        self.now_playing_mode.shows_media()
+    }
+
+    /// The dominant audio-source name to name in the now-playing surfaces, or
+    /// `None` when there is none or the mode does not consult sources.
+    #[must_use]
+    pub fn now_playing_source(&self) -> Option<&str> {
+        if self.now_playing_mode.observes_sources() {
+            self.source_app.as_deref()
+        } else {
+            None
+        }
+    }
 }
 
 /// Compute the frame layout: the header row, the optional body area, and the
@@ -217,7 +245,14 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
         draw_scene_nav(buf, body, &ui.scene_nav);
         // The now-playing panel paints over the body like the meter bridge.
         if ui.show_now_playing {
-            nowplaying::draw_now_playing(buf, body, &ui.now_playing, ui.palette_applied);
+            nowplaying::draw_now_playing(
+                buf,
+                body,
+                &ui.now_playing,
+                ui.palette_applied,
+                ui.now_playing_shows_media(),
+                ui.now_playing_source(),
+            );
         }
         // The help overlay is the topmost body layer; inert unless toggled on.
         draw_help(buf, body, ui);

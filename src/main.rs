@@ -38,7 +38,9 @@ use scia_core::{
     Signal, StreamHealth, SyntheticBackend, list_devices,
 };
 use scia_scenes::{Preset, PresetWatcher, ReloadEvent, load_preset};
-use scia_tui::{ChromeMode, Keymap, PresenterMode, RunError, Tier, TuiOptions, run};
+use scia_tui::{
+    ChromeMode, Keymap, NowPlayingMode, PresenterMode, RunError, Tier, TuiOptions, run,
+};
 
 use config::Resolved;
 
@@ -50,11 +52,13 @@ CONFIG:
   missing file is not an error.
     Unix:     $XDG_CONFIG_HOME/scia/config.toml  (else ~/.config/scia/config.toml)
     Windows:  %APPDATA%\\scia\\config.toml
-  [defaults]  scene, presenter, overlay, perf_mode, demo_bpm, chrome, device
+  [defaults]  scene, presenter, overlay, perf_mode, demo_bpm, chrome, device,
+              now_playing
               (scene = spectra (default) | any --list-scenes name | bars for the
               legacy spectrum-bars renderer;
               presenter = octant | sextant | quadrant | half | kitty | sixel;
               chrome = invisible | instrument | playful | utilitarian;
+              now_playing = media-then-sources (default) | media | sources | off;
               device = exact capture device name; all overridden by their flags)
   [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
               quit, chrome, now_playing, palette, tuning, mapping, devices. A
@@ -226,6 +230,14 @@ struct Cli {
     #[arg(long, value_enum, value_name = "MODE")]
     chrome: Option<ChromeArg>,
 
+    /// What the now-playing surfaces name: `media-then-sources` (a playing media
+    /// session, else the app feeding the mix — a game — by name), `media` (media
+    /// sessions only), `sources` (the audio source only), or `off`. Overrides the
+    /// config `[defaults] now_playing`; the built-in default is
+    /// `media-then-sources`.
+    #[arg(long = "now-playing", value_enum, value_name = "MODE")]
+    now_playing: Option<NowPlayingArg>,
+
     /// Headless machine-readable output: emit versioned per-frame feature
     /// frames (the FeatureSnapshot contract) instead of running the TUI. `json`
     /// writes NDJSON (one frame object per line); `binary` writes a
@@ -236,7 +248,7 @@ struct Cli {
         long,
         value_enum,
         value_name = "FORMAT",
-        conflicts_with_all = ["input", "headless", "scene", "scene_file", "presenter", "chrome", "overlay", "debug"]
+        conflicts_with_all = ["input", "headless", "scene", "scene_file", "presenter", "chrome", "now_playing", "overlay", "debug"]
     )]
     output: Option<OutputFormat>,
 
@@ -357,6 +369,33 @@ impl ChromeArg {
     }
 }
 
+/// The now-playing source policies selectable with `--now-playing` (or the
+/// config `[defaults] now_playing`). Mirrors [`scia_tui::NowPlayingMode`] so clap
+/// owns the flag parsing without the TUI crate taking a clap dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum NowPlayingArg {
+    /// A playing media session, else the dominant audio source by name.
+    MediaThenSources,
+    /// Media sessions only; never name a bare audio source.
+    Media,
+    /// The dominant audio source only; never show media metadata.
+    Sources,
+    /// Show nothing.
+    Off,
+}
+
+impl NowPlayingArg {
+    /// The [`NowPlayingMode`] this flag value selects.
+    fn mode(self) -> NowPlayingMode {
+        match self {
+            NowPlayingArg::MediaThenSources => NowPlayingMode::MediaThenSources,
+            NowPlayingArg::Media => NowPlayingMode::Media,
+            NowPlayingArg::Sources => NowPlayingMode::Sources,
+            NowPlayingArg::Off => NowPlayingMode::Off,
+        }
+    }
+}
+
 /// The synthetic waveform choices for `--demo`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum DemoSignal {
@@ -433,6 +472,7 @@ fn main() -> ExitCode {
             demo_bpm: cli.demo_bpm,
             chrome: cli.chrome.map(ChromeArg::mode),
             device: cli.device.clone(),
+            now_playing: cli.now_playing.map(NowPlayingArg::mode),
         },
         &cfg.defaults,
     );
@@ -570,6 +610,7 @@ fn run_input_mode(cli: &Cli, resolved: &Resolved, addr: String, keymap: Keymap) 
         initial_notice,
         keymap,
         chrome: resolved.chrome,
+        now_playing_mode: resolved.now_playing,
         scene_file: cli.scene_file.clone(),
         config_dir: config::config_dir(),
         device: DeviceSelector::Default,
@@ -770,6 +811,7 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         initial_notice,
         keymap,
         chrome: resolved.chrome,
+        now_playing_mode: resolved.now_playing,
         scene_file: cli.scene_file.clone(),
         config_dir: config::config_dir(),
         device: DeviceSelector::Default,
@@ -945,6 +987,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         initial_notice,
         keymap,
         chrome: resolved.chrome,
+        now_playing_mode: resolved.now_playing,
         scene_file: cli.scene_file.clone(),
         config_dir: config::config_dir(),
         device: selector,
@@ -1269,6 +1312,31 @@ mod tests {
     #[test]
     fn unknown_presenter_flag_is_rejected() {
         assert!(Cli::try_parse_from(["scia", "--presenter", "megatier"]).is_err());
+    }
+
+    #[test]
+    fn now_playing_flag_parses_each_mode() {
+        for (arg, expected) in [
+            ("media-then-sources", NowPlayingArg::MediaThenSources),
+            ("media", NowPlayingArg::Media),
+            ("sources", NowPlayingArg::Sources),
+            ("off", NowPlayingArg::Off),
+        ] {
+            let cli = Cli::try_parse_from(["scia", "--now-playing", arg]).expect("parses");
+            assert_eq!(cli.now_playing, Some(expected));
+            assert_eq!(cli.now_playing.unwrap().mode(), expected.mode());
+        }
+    }
+
+    #[test]
+    fn unknown_now_playing_flag_is_rejected() {
+        assert!(Cli::try_parse_from(["scia", "--now-playing", "everything"]).is_err());
+    }
+
+    #[test]
+    fn now_playing_conflicts_with_output() {
+        // A TUI-only concept has no meaning under headless output.
+        assert!(Cli::try_parse_from(["scia", "--output", "json", "--now-playing", "off"]).is_err());
     }
 
     #[test]

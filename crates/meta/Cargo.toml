@@ -26,13 +26,14 @@ async-channel = "2"
 futures-lite = "2"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
-# The Windows now-playing backend (SMTC). Windows-only: this dependency never
-# enters a non-Windows build, so Linux and macOS builds are untouched. Licensed
-# MIT OR Apache-2.0 (clears cargo-deny). Only the WinRT namespaces the SMTC
-# backend touches are enabled, plus `Win32_System_Com` for the multithreaded
-# apartment init the WinRT event delivery needs, and
-# `Win32_Foundation` + `Win32_System_Threading` for the `meta_probe` example's
-# `GetProcessHandleCount` leak check (the library itself uses neither).
+# The Windows now-playing backend (SMTC) and the audio-source observer.
+# Windows-only: this dependency never enters a non-Windows build, so Linux and
+# macOS builds are untouched. Licensed MIT OR Apache-2.0 (clears cargo-deny).
+# WinRT namespaces drive the SMTC backend; `Win32_Media_Audio` +
+# `Win32_System_Threading` drive the source observer (audio-session enumeration
+# + PID→process-name mapping); `Win32_System_Com` provides the multithreaded
+# apartment init both need; `Win32_Foundation` + `Win32_System_Threading` also
+# serve the `meta_probe` example's `GetProcessHandleCount` leak check.
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
@@ -40,6 +41,8 @@ features = [
     "Foundation_Collections",
     "Media_Control",
     "Storage_Streams",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
     "Win32_System_Com",
     "Win32_Foundation",
     "Win32_System_Threading",

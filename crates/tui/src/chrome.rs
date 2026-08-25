@@ -264,19 +264,26 @@ pub(crate) fn render(buf: &mut Buffer, body: Rect, snap: &FeatureSnapshot, ui: &
     }
 }
 
-/// The now-playing text: the wired track line when present, otherwise the source
-/// label the header shows today (a demo label, or `live · <format>`). `None` when
-/// there is genuinely nothing to name — no track, no label, no source — so the
-/// chrome shows nothing rather than a bare placeholder.
+/// The now-playing text for the ambient chrome, in priority order:
 ///
-/// This is the single track-line seam: [`UiState::track_line`] returns `None`
-/// until the metadata branch wires the real now-playing value in, at which point
-/// it flows through here for every mode with no further change.
+/// 1. The **now-playing attribution** resolved under the configured
+///    [`NowPlayingMode`](crate::NowPlayingMode): a playing media session's track
+///    line, or the dominant audio source's name (`♪ <app>`) — the game case — or
+///    nothing, exactly as the mode dictates.
+/// 2. Failing that, the demo label the header shows.
+/// 3. Failing that, the live-capture source (`live · <format>`).
+///
+/// `None` only when there is genuinely nothing to name, so the chrome shows
+/// nothing rather than a bare placeholder. The attribution sits above the demo /
+/// capture-format fallbacks, which are orthogonal banners the mode does not
+/// govern; `off` therefore silences attribution without hiding the capture label.
 fn now_playing(ui: &UiState) -> Option<String> {
-    if let Some(track) = ui.track_line() {
-        if !track.is_empty() {
-            return Some(track.to_string());
-        }
+    if let Some(line) = crate::nowplaying::resolve_now_playing(
+        ui.now_playing_mode,
+        ui.track_line(),
+        ui.now_playing_source(),
+    ) {
+        return Some(line);
     }
     if let Some(label) = ui.label.as_deref() {
         if !label.is_empty() {
@@ -668,6 +675,81 @@ mod tests {
             row(&buf, 2, 40).trim(),
             "",
             "the invisible line vanishes once fully faded"
+        );
+    }
+
+    #[test]
+    fn chrome_playing_media_beats_dominant_source() {
+        // Default mode, a playing media track and a dominant audio app both set:
+        // the chrome line shows the media track, not the source.
+        let ui = UiState {
+            track: Some("Song — Artist".to_string()),
+            source_app: Some("Hell Let Loose".to_string()),
+            now_playing_mode: crate::NowPlayingMode::MediaThenSources,
+            chrome: ChromeState::new(ChromeMode::Invisible),
+            ..UiState::default()
+        };
+        let (body, mut buf) = body_buf(60, 3);
+        render(&mut buf, body, &snap_playing(), &ui);
+        let line = row(&buf, 2, 60);
+        assert!(line.contains("Song — Artist"), "media wins: {line:?}");
+        assert!(
+            !line.contains("Hell Let Loose"),
+            "the source is not named while media plays: {line:?}"
+        );
+    }
+
+    #[test]
+    fn chrome_names_source_when_no_media() {
+        // The game case: no media session, but a dominant audio source.
+        let ui = UiState {
+            source_app: Some("Hell Let Loose".to_string()),
+            now_playing_mode: crate::NowPlayingMode::MediaThenSources,
+            chrome: ChromeState::new(ChromeMode::Invisible),
+            ..UiState::default()
+        };
+        let (body, mut buf) = body_buf(60, 3);
+        render(&mut buf, body, &snap_playing(), &ui);
+        assert!(
+            row(&buf, 2, 60).contains("♪ Hell Let Loose"),
+            "the dominant source is named when no media plays"
+        );
+    }
+
+    #[test]
+    fn chrome_sources_mode_skips_media() {
+        // Sources-only: even a playing media track is skipped for the app name.
+        let ui = UiState {
+            track: Some("Song — Artist".to_string()),
+            source_app: Some("Hell Let Loose".to_string()),
+            now_playing_mode: crate::NowPlayingMode::Sources,
+            chrome: ChromeState::new(ChromeMode::Invisible),
+            ..UiState::default()
+        };
+        let (body, mut buf) = body_buf(60, 3);
+        render(&mut buf, body, &snap_playing(), &ui);
+        let line = row(&buf, 2, 60);
+        assert!(line.contains("♪ Hell Let Loose"), "source shown: {line:?}");
+        assert!(!line.contains("Song"), "media skipped: {line:?}");
+    }
+
+    #[test]
+    fn chrome_off_mode_shows_no_attribution() {
+        // Off: neither media nor source is named. With no demo label or capture
+        // source to fall back to, the chrome line is blank.
+        let ui = UiState {
+            track: Some("Song — Artist".to_string()),
+            source_app: Some("Hell Let Loose".to_string()),
+            now_playing_mode: crate::NowPlayingMode::Off,
+            chrome: ChromeState::new(ChromeMode::Invisible),
+            ..UiState::default()
+        };
+        let (body, mut buf) = body_buf(60, 3);
+        render(&mut buf, body, &snap_playing(), &ui);
+        assert_eq!(
+            row(&buf, 2, 60).trim(),
+            "",
+            "off silences the now-playing attribution entirely"
         );
     }
 

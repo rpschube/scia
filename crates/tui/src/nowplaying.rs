@@ -34,7 +34,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 use scia_meta::{
     ArtPalette, MetaEvent, MetaHandle, NowPlaying, PaletteCache, PlaybackStatus, PositionInfo,
-    PreviewImage, decode_preview,
+    PreviewImage, SourceEvent, decode_preview, source,
 };
 use scia_scenes::{PALETTE_SLOTS, Palette, Rgb};
 
@@ -44,6 +44,120 @@ use crate::palette;
 /// preview. Ample for a coarse cell mosaic; small enough to keep the decode
 /// cheap and the state light.
 const PREVIEW_MAX: u32 = 64;
+
+// ---------------------------------------------------------------------------
+// Now-playing source policy (US config: `[defaults] now_playing`)
+// ---------------------------------------------------------------------------
+
+/// What the now-playing surfaces (the ambient chrome line and the `n` panel) may
+/// name, and in what order. User-configurable via `[defaults] now_playing` and
+/// the `--now-playing` flag; the default is [`MediaThenSources`].
+///
+/// The distinction is between a **media session** (rich metadata — title, artist,
+/// art — from SMTC/MPRIS) and an **audio source** (the app feeding the output
+/// mix by name only, from the OS mixer; the case a game hits, publishing no media
+/// session).
+///
+/// [`MediaThenSources`]: NowPlayingMode::MediaThenSources
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NowPlayingMode {
+    /// Prefer a playing media session; when there is none, name the dominant
+    /// audio source. The default.
+    #[default]
+    MediaThenSources,
+    /// Only ever show a media session; never name a bare audio source.
+    Media,
+    /// Only ever name the dominant audio source; never show media metadata.
+    Sources,
+    /// Show nothing: neither media nor source attribution.
+    Off,
+}
+
+impl NowPlayingMode {
+    /// Every mode, in config-listing order.
+    pub const ALL: [NowPlayingMode; 4] = [
+        NowPlayingMode::MediaThenSources,
+        NowPlayingMode::Media,
+        NowPlayingMode::Sources,
+        NowPlayingMode::Off,
+    ];
+
+    /// The config / flag name for this mode.
+    #[must_use]
+    pub fn config_str(self) -> &'static str {
+        match self {
+            NowPlayingMode::MediaThenSources => "media-then-sources",
+            NowPlayingMode::Media => "media",
+            NowPlayingMode::Sources => "sources",
+            NowPlayingMode::Off => "off",
+        }
+    }
+
+    /// Parse a config / flag value (case-insensitive). Unknown names yield `None`
+    /// so the caller can warn and fall back to the default.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<NowPlayingMode> {
+        let name = name.trim().to_ascii_lowercase();
+        NowPlayingMode::ALL
+            .into_iter()
+            .find(|m| m.config_str() == name)
+    }
+
+    /// Whether this mode ever shows a media session (title/artist/art).
+    #[must_use]
+    pub fn shows_media(self) -> bool {
+        matches!(
+            self,
+            NowPlayingMode::MediaThenSources | NowPlayingMode::Media
+        )
+    }
+
+    /// Whether this mode ever names a bare audio source, so the observer is worth
+    /// running.
+    #[must_use]
+    pub fn observes_sources(self) -> bool {
+        matches!(
+            self,
+            NowPlayingMode::MediaThenSources | NowPlayingMode::Sources
+        )
+    }
+}
+
+/// Resolve the now-playing *attribution* line under a mode: the single seam both
+/// the ambient chrome and the panel headline read.
+///
+/// `track` is the playing media session's line (`title — artist`), already gated
+/// to a genuinely playing session upstream; `source_app` is the friendly name of
+/// the dominant audio source. The priority is media, then a `♪`-prefixed source
+/// name, per the mode:
+///
+/// - [`Off`](NowPlayingMode::Off) → always `None`.
+/// - [`Media`](NowPlayingMode::Media) → the track, or `None`.
+/// - [`Sources`](NowPlayingMode::Sources) → the source name, or `None` (media is
+///   skipped even when present).
+/// - [`MediaThenSources`](NowPlayingMode::MediaThenSources) → the track when
+///   present, else the source name, else `None`.
+///
+/// Pure, so the priority is unit-tested directly.
+#[must_use]
+pub fn resolve_now_playing(
+    mode: NowPlayingMode,
+    track: Option<&str>,
+    source_app: Option<&str>,
+) -> Option<String> {
+    let track = track.filter(|s| !s.is_empty());
+    let source_line = || {
+        source_app
+            .filter(|s| !s.is_empty())
+            .map(|app| format!("♪ {app}"))
+    };
+    match mode {
+        NowPlayingMode::Off => None,
+        NowPlayingMode::Media => track.map(str::to_owned),
+        NowPlayingMode::Sources => source_line(),
+        NowPlayingMode::MediaThenSources => track.map(str::to_owned).or_else(source_line),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -220,6 +334,12 @@ pub struct MetaRuntime {
     backend: Option<MetaHandle>,
     /// Backend events (track changes, artwork, cleared).
     events: Receiver<MetaEvent>,
+    /// The audio-source observer handle; `None` when the now-playing mode never
+    /// names a source (so no observer is started). Dropping it stops and joins
+    /// its thread.
+    source: Option<MetaHandle>,
+    /// Dominant-audio-source events, when the observer is running.
+    source_events: Receiver<SourceEvent>,
     /// Decode jobs to the worker. `Option` so [`Drop`] can close the channel
     /// before joining the worker.
     jobs: Option<Sender<DecodeJob>>,
@@ -230,14 +350,22 @@ pub struct MetaRuntime {
 }
 
 impl MetaRuntime {
-    /// Start the platform backend and the decode worker.
+    /// Start the platform metadata backend, the decode worker, and — when
+    /// `observe_sources` is set — the audio-source observer.
     ///
     /// Absence is normal: on a platform with no backend, or with no media
-    /// session, no events arrive and the state stays empty.
+    /// session, no events arrive and the state stays empty. The source observer
+    /// is started only when the now-playing mode can name a source, so an
+    /// `off`/`media` run never pays for the mixer poll.
     #[must_use]
-    pub fn spawn() -> Self {
+    pub fn spawn(observe_sources: bool) -> Self {
         let (event_tx, events) = mpsc::channel::<MetaEvent>();
         let backend = start_backend(event_tx);
+
+        // The source observer only runs when the mode consults it; otherwise the
+        // channel is created but stays empty (its sender is dropped at once).
+        let (source_tx, source_events) = mpsc::channel::<SourceEvent>();
+        let source = observe_sources.then(|| source::start(source_tx));
 
         let (job_tx, job_rx) = mpsc::channel::<DecodeJob>();
         let (result_tx, results) = mpsc::channel::<ArtResult>();
@@ -249,6 +377,8 @@ impl MetaRuntime {
         Self {
             backend,
             events,
+            source,
+            source_events,
             jobs: Some(job_tx),
             results,
             worker,
@@ -258,6 +388,12 @@ impl MetaRuntime {
     /// Try to receive the next backend event without blocking.
     pub fn try_event(&self) -> Option<MetaEvent> {
         self.events.try_recv().ok()
+    }
+
+    /// Try to receive the next audio-source event without blocking. Always empty
+    /// when the observer was not started (the mode does not name sources).
+    pub fn try_source_event(&self) -> Option<SourceEvent> {
+        self.source_events.try_recv().ok()
     }
 
     /// Try to receive the next finished decode without blocking.
@@ -275,9 +411,10 @@ impl MetaRuntime {
 
 impl Drop for MetaRuntime {
     fn drop(&mut self) {
-        // Stop the OS backend first (this joins its own threads), then close the
+        // Stop the OS backends first (each joins its own threads), then close the
         // job channel so the worker's `recv` ends, and join the worker.
         self.backend.take();
+        self.source.take();
         self.jobs.take();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -340,12 +477,31 @@ const ART_CELLS_H: u16 = 9;
 /// Paint the now-playing panel over the body, like the meter bridge. The caller
 /// draws it only when the toggle is on; this still guards a degenerate body and
 /// degrades to one line on a small pane.
-pub fn draw_now_playing(buf: &mut Buffer, body: Rect, nps: &NowPlayingState, applied: bool) {
+///
+/// `show_media` and `source_app` carry the now-playing mode's decision (see
+/// [`NowPlayingMode`]): when `show_media` is false, or there is no media session
+/// (the game case — no SMTC/MPRIS session exists), the panel names the dominant
+/// audio `source_app` instead, falling back to "nothing playing" when there is
+/// neither. Media, when shown, keeps its rich panel (art, progress, status tag).
+pub fn draw_now_playing(
+    buf: &mut Buffer,
+    body: Rect,
+    nps: &NowPlayingState,
+    applied: bool,
+    show_media: bool,
+    source_app: Option<&str>,
+) {
     if body.width == 0 || body.height == 0 {
         return;
     }
-    let Some(np) = &nps.current else {
-        render_np_line(buf, body, " ♪ nothing playing ");
+    // No media to show (mode suppresses it, or none is present): name the audio
+    // source when there is one, else the normal "nothing playing" idle state.
+    let media = show_media.then_some(nps.current.as_ref()).flatten();
+    let Some(np) = media else {
+        match source_app.filter(|s| !s.is_empty()) {
+            Some(app) => render_np_line(buf, body, &format!(" ♪ {app} ")),
+            None => render_np_line(buf, body, " ♪ nothing playing "),
+        }
         return;
     };
 
@@ -845,7 +1001,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        draw_now_playing(&mut buf, area, &nps, false);
+        draw_now_playing(&mut buf, area, &nps, false, true, None);
 
         // The status tag reads clearly as a word, on the title row next to it.
         let title_row = row_text(&buf, 0, 40);
@@ -867,7 +1023,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        draw_now_playing(&mut buf, area, &nps, false);
+        draw_now_playing(&mut buf, area, &nps, false, true, None);
         let title_row = row_text(&buf, 0, 40);
         assert!(
             title_row.contains("stopped"),
@@ -883,11 +1039,138 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        draw_now_playing(&mut buf, area, &nps, false);
+        draw_now_playing(&mut buf, area, &nps, false, true, None);
         let all = buffer_text(&buf);
         assert!(
             !all.contains("paused") && !all.contains("stopped"),
             "a playing session carries no status tag: {all:?}"
         );
+    }
+
+    // ---- NowPlayingMode + resolve_now_playing -----------------------------
+
+    #[test]
+    fn mode_parses_and_defaults() {
+        assert_eq!(
+            NowPlayingMode::parse("media-then-sources"),
+            Some(NowPlayingMode::MediaThenSources)
+        );
+        assert_eq!(
+            NowPlayingMode::parse("  MEDIA "),
+            Some(NowPlayingMode::Media)
+        );
+        assert_eq!(
+            NowPlayingMode::parse("sources"),
+            Some(NowPlayingMode::Sources)
+        );
+        assert_eq!(NowPlayingMode::parse("off"), Some(NowPlayingMode::Off));
+        assert_eq!(NowPlayingMode::parse("nonsense"), None);
+        assert_eq!(NowPlayingMode::default(), NowPlayingMode::MediaThenSources);
+        // Round-trips through its config string.
+        for m in NowPlayingMode::ALL {
+            assert_eq!(NowPlayingMode::parse(m.config_str()), Some(m));
+        }
+    }
+
+    #[test]
+    fn resolve_playing_media_beats_dominant_source() {
+        // Default mode with both a playing track and a dominant app: media wins.
+        let got = resolve_now_playing(
+            NowPlayingMode::MediaThenSources,
+            Some("Song — Artist"),
+            Some("Hell Let Loose"),
+        );
+        assert_eq!(got.as_deref(), Some("Song — Artist"));
+    }
+
+    #[test]
+    fn resolve_falls_through_to_source_when_no_media() {
+        let got = resolve_now_playing(
+            NowPlayingMode::MediaThenSources,
+            None,
+            Some("Hell Let Loose"),
+        );
+        assert_eq!(got.as_deref(), Some("♪ Hell Let Loose"));
+    }
+
+    #[test]
+    fn resolve_media_mode_never_names_a_source() {
+        // Media-only: a dominant source is ignored even with no media session.
+        assert_eq!(
+            resolve_now_playing(NowPlayingMode::Media, None, Some("Hell Let Loose")),
+            None
+        );
+        assert_eq!(
+            resolve_now_playing(NowPlayingMode::Media, Some("Song"), Some("Game")).as_deref(),
+            Some("Song")
+        );
+    }
+
+    #[test]
+    fn resolve_sources_mode_skips_media() {
+        // Sources-only: even a playing media session is skipped for the app name.
+        let got = resolve_now_playing(NowPlayingMode::Sources, Some("Song — Artist"), Some("Game"));
+        assert_eq!(got.as_deref(), Some("♪ Game"));
+        // With no source it is None, ignoring the media session entirely.
+        assert_eq!(
+            resolve_now_playing(NowPlayingMode::Sources, Some("Song — Artist"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_off_shows_nothing() {
+        assert_eq!(
+            resolve_now_playing(NowPlayingMode::Off, Some("Song"), Some("Game")),
+            None
+        );
+    }
+
+    // ---- Panel source-attribution rendering -------------------------------
+
+    #[test]
+    fn panel_names_the_source_when_no_media_session() {
+        // The game case: no media session, but a dominant audio source.
+        let nps = NowPlayingState::default();
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        draw_now_playing(&mut buf, area, &nps, false, true, Some("Hell Let Loose"));
+        let all = buffer_text(&buf);
+        assert!(
+            all.contains("Hell Let Loose"),
+            "the panel names the dominant source: {all:?}"
+        );
+        assert!(
+            !all.contains("nothing playing"),
+            "a named source replaces the idle line: {all:?}"
+        );
+    }
+
+    #[test]
+    fn panel_suppresses_media_when_show_media_false() {
+        // Sources-only mode: even a playing media session is not shown; the source
+        // name is what appears.
+        let nps = NowPlayingState {
+            current: Some(np("Song", "s", PlaybackStatus::Playing)),
+            ..Default::default()
+        };
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        draw_now_playing(&mut buf, area, &nps, false, false, Some("Game"));
+        let all = buffer_text(&buf);
+        assert!(all.contains("Game"), "source shown: {all:?}");
+        assert!(
+            !all.contains("Song"),
+            "media suppressed when show_media is false: {all:?}"
+        );
+    }
+
+    #[test]
+    fn panel_idle_line_when_nothing_at_all() {
+        let nps = NowPlayingState::default();
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        draw_now_playing(&mut buf, area, &nps, false, true, None);
+        assert!(buffer_text(&buf).contains("nothing playing"));
     }
 }

@@ -41,6 +41,11 @@
 //! - [`smtc`] — Windows, via the System Media Transport Controls. Compiled only
 //!   on Windows.
 //!
+//! A third, sibling observer reports the app *feeding the output mix* even when
+//! it publishes no media session (a game): [`source`], on the same
+//! thread/[`MetaHandle`] contract, emitting [`SourceEvent`]s. It is real on
+//! Windows (audio-session enumeration) and an honest stub elsewhere.
+//!
 //! Both produce the same [`MetaEvent`] stream from the same shared types. Two
 //! platform-neutral helper modules support the SMTC backend and are unit-tested
 //! off-platform:
@@ -72,6 +77,14 @@ pub const NAME: &str = env!("CARGO_PKG_NAME");
 
 pub mod artwork;
 pub mod select;
+
+/// Audio-source attribution: name the app feeding the output mix even when it
+/// publishes no media session (a game). A sibling of the metadata backends, on
+/// its own thread behind the same handle contract. Real on Windows, an honest
+/// stub elsewhere (see the module docs).
+pub mod source;
+
+pub use source::{DominantSelector, SourceEvent, SourceSample, friendly_name};
 
 /// The Windows System Media Transport Controls backend. Compiled only on
 /// Windows; the shared `types`/`select`/`artwork` surface it drives is
