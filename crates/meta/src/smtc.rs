@@ -75,7 +75,7 @@ use windows::core::{Error as WinError, HSTRING, Result as WinResult};
 
 use crate::artwork::{
     ArtAction, ArtCampaignTracker, ArtworkDriver, ArtworkStep, CampaignOutcome, FetchStage,
-    RetryPolicy,
+    PrevArt, RetryPolicy, art_hash,
 };
 use crate::select::{SessionSnapshot, select_winner};
 use crate::types::{MetaEvent, MetaHandle, NowPlaying, PlaybackStatus};
@@ -245,6 +245,11 @@ struct BackendState {
     /// Per-track artwork-campaign bookkeeping: enables exactly one follow-up
     /// campaign when a player swaps its thumbnail after the first gave up.
     art: ArtCampaignTracker,
+    /// The most recently *emitted* artwork identity per source app (hash +
+    /// album). Seeds each campaign's [`ArtworkDriver`] so a fetch that re-serves
+    /// the previous track's thumbnail during the lag window is spotted as
+    /// suspect-stale instead of being emitted under the new track.
+    last_emitted: HashMap<String, PrevArt>,
 }
 
 impl BackendState {
@@ -255,6 +260,7 @@ impl BackendState {
             last_track: None,
             cleared: false,
             art: ArtCampaignTracker::new(),
+            last_emitted: HashMap::new(),
         }
     }
 
@@ -477,6 +483,8 @@ fn evaluate(
     // without bound across long sessions.
     let live: std::collections::HashSet<&str> = snaps.iter().map(|s| s.app_id.as_str()).collect();
     state.activity.retain(|k, _| live.contains(k.as_str()));
+    // Same bound for the emitted-art map: drop identities for apps that are gone.
+    state.last_emitted.retain(|k, _| live.contains(k.as_str()));
 
     let Some(winner_idx) = select_winner(&snaps) else {
         emit_cleared(ctx.out, state);
@@ -524,8 +532,17 @@ fn evaluate(
         }
     ));
     state.art.begin(&track_key, action);
-    let (outcome, pending) = run_artwork_campaign(winner_session, &winner_app, &track_key, ctx);
+    // Seed the campaign with the previous emission for this app so it can tell a
+    // lagging same-bytes thumbnail apart from the real new art.
+    let prev_art = state.last_emitted.get(&winner_app).cloned();
+    let (outcome, pending, emitted) =
+        run_artwork_campaign(winner_session, &winner_app, &track_key, ctx, prev_art);
     state.art.finish(outcome);
+    // Remember what we actually put on screen (confirmed or best-effort stale),
+    // so the next track's campaign has a yardstick for the lag check.
+    if let Some(id) = emitted {
+        state.last_emitted.insert(winner_app.clone(), id);
+    }
     pending
 }
 
@@ -545,19 +562,24 @@ fn emit_cleared(out: &Sender<MetaEvent>, state: &mut BackendState) {
 /// a stale artwork fetch). It also bails if the stop flag is set.
 ///
 /// Returns the campaign's [`CampaignOutcome`] (so the caller's
-/// [`ArtCampaignTracker`] knows whether art was obtained) and any [`Internal`]
-/// message that superseded it.
+/// [`ArtCampaignTracker`] knows whether art was obtained), any [`Internal`]
+/// message that superseded it, and — when it emitted — the emitted-art identity
+/// ([`PrevArt`]: hash + album) so the caller can seed the next track's lag check.
 fn run_artwork_campaign(
     session: &Session,
     app_id: &str,
     track_key: &str,
     ctx: &Ctx,
-) -> (CampaignOutcome, Option<Internal>) {
-    let mut driver = ArtworkDriver::new(ctx.policy);
+    prev_art: Option<PrevArt>,
+) -> (CampaignOutcome, Option<Internal>, Option<PrevArt>) {
+    let mut driver = ArtworkDriver::with_prev_art(ctx.policy, prev_art);
     let mut attempt: u32 = 0;
+    // The album reported by the most recent fetch's media properties; paired with
+    // the emitted bytes' hash to form the identity the next campaign compares to.
+    let mut fetched_album: Option<String> = None;
     loop {
         if ctx.stop.load(Ordering::Relaxed) {
-            return (CampaignOutcome::Abandoned, None);
+            return (CampaignOutcome::Abandoned, None, None);
         }
         match driver.next_step() {
             ArtworkStep::Emit(bytes) => {
@@ -565,32 +587,58 @@ fn run_artwork_campaign(
                     "artwork: emit track_key={track_key} bytes={}",
                     bytes.len()
                 ));
+                let id = PrevArt {
+                    hash: art_hash(&bytes),
+                    album: fetched_album.clone(),
+                };
                 let _ = ctx.out.send(MetaEvent::Artwork {
                     track_key: track_key.to_string(),
                     bytes,
                     source_app: Some(app_id.to_string()),
                 });
-                return (CampaignOutcome::Emitted, None);
+                return (CampaignOutcome::Emitted, None, Some(id));
+            }
+            ArtworkStep::EmitStale(bytes) => {
+                // Best-effort: the thumbnail lagged the whole campaign, so emit
+                // the previous track's art rather than nothing. No label — the
+                // event is identical to a confirmed one; the re-campaign (kept
+                // armed by the EmittedStale outcome) heals it on the next
+                // properties event.
+                ctx.trace(format_args!(
+                    "artwork: emit-stale track_key={track_key} bytes={} (thumbnail lagged; re-campaign armed)",
+                    bytes.len()
+                ));
+                let id = PrevArt {
+                    hash: art_hash(&bytes),
+                    album: fetched_album.clone(),
+                };
+                let _ = ctx.out.send(MetaEvent::Artwork {
+                    track_key: track_key.to_string(),
+                    bytes,
+                    source_app: Some(app_id.to_string()),
+                });
+                return (CampaignOutcome::EmittedStale, None, Some(id));
             }
             ArtworkStep::GiveUp => {
                 ctx.trace(format_args!(
                     "artwork: give-up track_key={track_key} after {attempt} attempt(s)"
                 ));
-                return (CampaignOutcome::GaveUp, None);
+                return (CampaignOutcome::GaveUp, None, None);
             }
             ArtworkStep::Fetch { delay } => {
                 // Wait the debounce/backoff, but bail out early if a new marker
                 // arrives — the callbacks never block, so this is the only place
                 // a fresh change is observed mid-campaign.
                 match ctx.rx.recv_timeout(delay) {
-                    Ok(msg) => return (CampaignOutcome::Abandoned, Some(msg)),
+                    Ok(msg) => return (CampaignOutcome::Abandoned, Some(msg), None),
                     Err(RecvTimeoutError::Disconnected) => {
-                        return (CampaignOutcome::Abandoned, None);
+                        return (CampaignOutcome::Abandoned, None, None);
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                 }
                 attempt += 1;
-                let result = fetch_artwork_once(session);
+                let (result, album) = fetch_artwork_once(session);
+                fetched_album = album;
                 let bytes: Option<&[u8]> = match &result {
                     FetchResult::Bytes(b) => {
                         ctx.trace(format_args!(
@@ -615,7 +663,7 @@ fn run_artwork_campaign(
                         None
                     }
                 };
-                driver.record(bytes);
+                driver.record(bytes, fetched_album.as_deref());
             }
         }
     }
@@ -645,21 +693,28 @@ fn read_now_playing(session: &Session, app_id: &str, status: PlaybackStatus) -> 
 /// failure is tagged with its [`FetchStage`] so a probe can report exactly which
 /// step broke; a missing thumbnail or an empty stream are the ordinary
 /// not-ready-yet misses that drive a retry.
-fn fetch_artwork_once(session: &Session) -> FetchResult {
+///
+/// Also returns the album read from the *same* properties snapshot as the
+/// thumbnail (`None` if the properties call itself failed or the field is
+/// empty). Reading both from one snapshot is what makes the lag detectable: on a
+/// late-swapping player the album has already advanced to the new track while the
+/// thumbnail still points at the old one, so the pairing exposes the mismatch.
+fn fetch_artwork_once(session: &Session) -> (FetchResult, Option<String>) {
     let props = match session
         .TryGetMediaPropertiesAsync()
         .and_then(|op| op.join())
     {
         Ok(p) => p,
-        Err(e) => return FetchResult::Failed(FetchStage::Props, e),
+        Err(e) => return (FetchResult::Failed(FetchStage::Props, e), None),
     };
+    let album = props.AlbumTitle().ok().and_then(hstr_opt);
     let thumb: IRandomAccessStreamReference = match props.Thumbnail() {
         Ok(t) => t,
         // No thumbnail published (or the getter erred): a miss that drives a
         // retry. Tagged with the stage so a probe sees the exact HRESULT.
-        Err(e) => return FetchResult::Failed(FetchStage::Thumbnail, e),
+        Err(e) => return (FetchResult::Failed(FetchStage::Thumbnail, e), album),
     };
-    read_stream_ref(&thumb)
+    (read_stream_ref(&thumb), album)
 }
 
 /// RAII guard closing an [`IRandomAccessStreamWithContentType`] on every path
