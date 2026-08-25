@@ -19,7 +19,10 @@ scia --output binary               # binary frames to stdout, no UI
 scia --output json --listen ADDR   # serve frames to every client on a TCP socket
 scia --output json --rate 30       # cap the frame cadence (frames per second)
 scia --demo --output json          # drive the stream from the synthetic feed
+scia --output binary > clip.bin    # record a clip to a file
 scia --input ADDR                  # render the full UI from a remote stream
+scia --input clip.bin              # render the full UI by replaying a clip file
+scia --input clip.bin --input-loop # ...looping the clip for extended listening
 ```
 
 - `--output <json|binary>` runs headless: no scene, chrome or overlay is drawn.
@@ -32,16 +35,49 @@ scia --input ADDR                  # render the full UI from a remote stream
   one-time header first. Only valid with `--output`.
 - `--rate <N>` sets the target frames per second (default 60, clamped to
   `1..=1000`). Only valid with `--output`. See [Idle cadence](#idle-cadence).
-- `--input <ADDR>` connects to a remote `scia --output --listen` and renders the
-  full UI — scenes, chrome, overlays — from the received frames instead of
-  capturing local audio. The encoding is auto-detected. A dropped connection is
-  retried automatically with a bounded backoff while the UI shows its normal
-  reconnecting/quiet state; it never freezes or exits on a blip.
+- `--input <ADDR|PATH>` renders the full UI — scenes, chrome, overlays — from a
+  feature stream instead of capturing local audio. The argument is dispatched by
+  shape: a **socket address** (`ip:port` or `host:port`) connects to a remote
+  `scia --output --listen`, as before; otherwise an **existing file path**
+  replays a recorded clip from disk; anything else is an error naming both
+  interpretations. The encoding is auto-detected either way. A dropped socket
+  connection is retried automatically with a bounded backoff while the UI shows
+  its normal reconnecting/quiet state; it never freezes or exits on a blip.
+- `--input-loop` (with a file `--input` only) seamlessly restarts the clip at
+  end of file, for extended A/B listening. It is an error alongside a socket
+  `--input`.
 
 `--output` and `--input` are mutually exclusive, and each conflicts with the
 flags that do not apply to it (`--output` with the UI-only flags; `--input` with
 the local-capture flags). `--listen` and `--rate` are only accepted with
-`--output`.
+`--output`; `--input-loop` only with `--input`.
+
+## Recording and replaying a clip
+
+The clip format is exactly the `--output binary` wire form (the framing below)
+written to a file — no separate container. Record by redirecting the binary
+stream, and replay by pointing `--input` at the file:
+
+```text
+scia --output binary > clip.bin          # record (live capture)
+scia --demo --output binary > clip.bin   # record the synthetic feed (no audio hardware)
+scia --input clip.bin                     # replay it in the full UI
+scia --input clip.bin --input-loop        # replay on a loop
+```
+
+Replay is paced by the clip's own inter-frame timestamps, so it renders at the
+cadence it was recorded — live, not as fast as the file reads — including the
+idle keepalive stretches. Each frame's `timestamp_ns` is restamped to the local
+receive clock on replay (as for a socket `--input`) so the UI's frame-age reads
+correctly; the `generation` counter is preserved. At end of file the scene
+settles to idle on the quiet keepalive and the UI shows the same disconnected
+state as a dropped socket; with `--input-loop` the clip instead restarts
+seamlessly. A file that is not a scia stream (bad magic, or a schema this build
+does not speak) is reported as a stream error rather than replayed.
+
+This makes the harness's printed A/B commands (`scia --input <clip> --scene <s>
+--preset <p>`) directly runnable, and is the listening path for the scene-quality
+calibration sessions.
 
 ## Frame schema
 
