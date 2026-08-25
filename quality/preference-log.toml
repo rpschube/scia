@@ -1,0 +1,31 @@
+[[verdict]]
+date = "2026-08-25"
+by = "maintainer"
+scene = "spectra"
+clip = "*"
+winner = "neither"
+why = "too sensitive overall"
+
+[[verdict]]
+date = "2026-08-25"
+by = "maintainer"
+scene = "*"
+clip = "*"
+winner = "neither"
+why = "every scene other than spectra is not sensitive enough"
+
+[[verdict]]
+date = "2026-08-25"
+by = "maintainer"
+scene = "*"
+clip = "*"
+winner = "neither"
+why = "most scenes don't fill enough of the canvas — motion/energy should fill the frame (tiled/field-type scenes are fine)"
+
+[[verdict]]
+date = "2026-08-25"
+by = "maintainer"
+scene = "*"
+clip = "*"
+winner = "neither"
+why = "album-art palettes lean too grey — bias vibrant unless the art is truly neutral"
