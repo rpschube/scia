@@ -3,6 +3,7 @@
 //! capture stalls the grid keeps advancing with synthesized silence so the
 //! render side always has a fresh, real-time snapshot.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::bands::{BandConfig, BandSplitter};
 use crate::beat::{BeatDebug, BeatTracker};
 use crate::bus::FeatureWriter;
-use crate::capture::{SampleConsumer, SinkStats, StreamFormat};
+use crate::capture::{PushRecord, SampleConsumer, SinkStats, StreamFormat};
 use crate::features::{Activity, FEATURE_SCHEMA_VERSION, FeatureSnapshot};
 use crate::onset::{OnsetConfig, OnsetDetector};
 use crate::spectrum::{SpectrumAnalyzer, SpectrumConfig};
@@ -648,6 +649,11 @@ pub(crate) fn run(mut thread: DspThread) {
     // Wire the diagnostic beat-debug mirror: the induction pass writes the
     // tracker's stats into the shared cell the engine exposes. Off the hop path.
     processor.set_beat_debug_sink(Arc::clone(&thread.beat_debug));
+    // Maps each real hop's newest frame to the exact delivery time of the push that
+    // carried it (see [`DeliveryMap`]), replacing the uniform `last_push_ns −
+    // occupancy` inference that read early under a real backend's bursty delivery.
+    let mut delivery = DeliveryMap::new();
+    let hop_frames = thread.config.hop_frames as u64;
     let mut silent_deadline: Option<Instant> = None;
     // The instant of the last hop that carried signal. Everything since is quiet;
     // its age drives the state machine and `quiet_ms`. Seeded to "now" so a
@@ -670,6 +676,9 @@ pub(crate) fn run(mut thread: DspThread) {
         // reopen window renders as a short starved quiet, never a freeze.
         if let Some((new_consumer, new_format)) = thread.swap.try_take() {
             thread.consumer = new_consumer;
+            // The swapped-in consumer is a fresh ring with a fresh delivery log,
+            // both numbered from frame 0; rewind the map to match.
+            delivery.reset();
             if new_format != thread.format {
                 // A renegotiated format: rebuild the FFT/analyzer/bands/onset
                 // for the new rate, keeping the generation monotonic.
@@ -711,13 +720,12 @@ pub(crate) fn run(mut thread: DspThread) {
                     break;
                 }
                 let dropped = thread.stats.dropped_frames.load(Ordering::Relaxed);
-                // Delivery-anchored publish clock, as in the Active branch: the
-                // hop's newest frame was delivered `buffered - needed` frames
-                // before the writer's newest (`last_push_ns`).
+                // Delivery-anchored publish clock, as in the Active branch: stamp
+                // the hop's newest frame with the delivery time of the push that
+                // actually carried it (exact per-push mapping, see `DeliveryMap`).
                 let now = thread.stats.now_ns();
-                let last_push = thread.stats.last_push_ns.load(Ordering::Acquire);
-                let after_frames = ((buffered - needed) / channels) as u64;
-                let timestamp = hop_delivery_ns(now, last_push, after_frames, ns_per_frame);
+                delivery.ingest(&thread.consumer);
+                let timestamp = delivery.hop_stamp(hop_frames, ns_per_frame, now);
                 let Some(mut snapshot) = processor.process_idle(
                     &mut thread.consumer,
                     thread.format,
@@ -727,6 +735,7 @@ pub(crate) fn run(mut thread: DspThread) {
                 ) else {
                     break;
                 };
+                delivery.advance(hop_frames);
                 if snapshot.rms >= idle_resume_rms && !snapshot.starved {
                     // Playback resumed: this hop went through the full path.
                     last_non_quiet = Instant::now();
@@ -811,21 +820,20 @@ pub(crate) fn run(mut thread: DspThread) {
         if buffered >= needed {
             let dropped = thread.stats.dropped_frames.load(Ordering::Relaxed);
             // Delivery-anchored publish clock: stamp the hop with the
-            // capture-delivery time of its newest frame, not the DSP's own
-            // processing wall-clock. The hop we are about to pop leaves
-            // `buffered - needed` newer frames in the ring, so its newest frame
-            // was delivered that many frames before the writer's newest
-            // (`last_push_ns`). This is the same capture-delivery clock the P7
-            // raw-ring probe anchors on, so a click's `emit → publish` and its
-            // `emit → raw-arrival` are measured against one reference by
-            // construction (see `hop_delivery_ns`).
+            // capture-delivery time of its newest frame — the exact delivery time of
+            // the push that carried it (see `DeliveryMap`), not the DSP's own
+            // processing wall-clock, and not a `last_push_ns − occupancy` inference
+            // that reads early when a real backend delivers in faster-than-realtime
+            // bursts. This is the same capture-delivery clock the P7 raw-ring/tee
+            // mapping anchors on, so a click's `emit → publish` and its
+            // `emit → raw-arrival` are measured against one reference by construction.
             let now = thread.stats.now_ns();
-            let last_push = thread.stats.last_push_ns.load(Ordering::Acquire);
-            let after_frames = ((buffered - needed) / channels) as u64;
-            let timestamp = hop_delivery_ns(now, last_push, after_frames, ns_per_frame);
+            delivery.ingest(&thread.consumer);
+            let timestamp = delivery.hop_stamp(hop_frames, ns_per_frame, now);
             if let Some(mut snapshot) =
                 processor.try_process(&mut thread.consumer, thread.format, timestamp, dropped)
             {
+                delivery.advance(hop_frames);
                 let loud = snapshot.rms >= resume_rms && !snapshot.starved;
                 if loud {
                     last_non_quiet = Instant::now();
@@ -908,47 +916,124 @@ pub(crate) fn run(mut thread: DspThread) {
     }
 }
 
-/// The capture-delivery time (ns on the ring epoch) of the newest frame in a hop
-/// the DSP just gathered — the timestamp a real (non-synthesized) snapshot is
-/// published with.
+/// Maps a hop's newest frame to the capture-delivery time of the push that
+/// **actually** delivered it, from the primary ring's per-push delivery log
+/// ([`crate::capture::SampleSink::delivery`]) — the exact mapping the P7 dual-tap
+/// tee uses, applied to the production hop stamp.
 ///
 /// A snapshot's `timestamp_ns` marks *when its audio was captured*, not when the
-/// DSP thread happened to process it (which folds in scheduling jitter and the
-/// time the hop sat in the ring). The writer's newest delivered frame entered the
-/// ring at `last_push_ns`; the hop's newest frame is `buffered_after_frames`
-/// frames older, because that many newer frames remain in the ring after the pop.
-/// So its delivery time is `last_push_ns − buffered_after_frames × ns_per_frame`.
+/// DSP thread happened to process it. The earlier model inferred that time as
+/// `last_push_ns − ring_occupancy × ns_per_frame` — the writer's newest frame
+/// entered at `last_push_ns` and the hop's newest frame is the occupancy-after-pop
+/// number of frames older. That inference is exact only when the ring's occupancy
+/// was delivered at a *uniform* nominal frame rate. A real backend does not deliver
+/// uniformly: WASAPI shared-mode loopback under timer coalescing hands over several
+/// packets in a faster-than-realtime burst, so the occupancy spans pushes whose
+/// wall-clock spacing is shorter than `frames × ns_per_frame`. Spreading the
+/// occupancy uniformly back from `last_push_ns` across those bursts then places the
+/// hop's newest frame *earlier* than it truly arrived — a constant that, on the
+/// field endpoint, ran ≈ 29.4 ms (≈ 1410 frames) and pushed `emit → publish`
+/// *below* the raw-ring `emit → raw-arrival`, breaking the subset invariant a
+/// sample-enters-before-its-hop-publishes ordering guarantees.
 ///
-/// This is deliberately the *same* capture-delivery clock the P7 raw-ring probe
-/// anchors on (`last_push_ns` minus ring occupancy — see
-/// [`crate::capture::DrainTimeline`]). With both ends on it, a click's
-/// `emit → publish` and its `emit → raw-arrival` measure one reference: ring
-/// entry precedes the hop that gathers it, so
-/// `emit → raw-arrival ≤ emit → publish ≤ emit → raw-arrival + one hop` holds by
-/// construction, not by luck. Anchoring on the DSP's `now_ns()` at pull instead
-/// (the pre-fix model) stamped the *processing* time, which is `now ≥ delivery`
-/// and so drifts above delivery by the ring residence — a systematic term that
-/// does not belong in a capture timestamp.
+/// This map instead consumes the delivery log in lockstep with the frames the DSP
+/// pops: [`advance`](DeliveryMap::advance) after each real hop, [`ingest`] before
+/// each stamp, and [`hop_newest_delivery`] locates the push covering the hop's
+/// newest frame and returns `delivery_ns − (push_newest − frame) × ns_per_frame` —
+/// exact per push, immune to the cadence between pushes, so it tracks the same
+/// capture-delivery instant the raw-ring/tee mapping does and the subset invariant
+/// holds by construction on any backend.
 ///
-/// A startup gap (a WASAPI loopback whose first packet lands tens of ms into the
-/// stream, then delivers pre-rolled endpoint audio) shifts `last_push_ns` later
-/// by the gap, so every stamp tracks the *actual* delivery — unlike a gapless
-/// `epoch + index/rate` model, which would ignore the gap and read early by it.
-///
-/// Falls back to `now_ns` before the first push (`last_push_ns == 0`, no frame to
-/// anchor on) and clamps to `≤ now_ns` so a stamp can never read into the future
-/// if a push lands between the occupancy read and this call.
-fn hop_delivery_ns(
-    now_ns: u64,
-    last_push_ns: u64,
-    buffered_after_frames: u64,
-    ns_per_frame: f64,
-) -> u64 {
-    if last_push_ns == 0 {
-        return now_ns;
+/// [`ingest`]: DeliveryMap::ingest
+/// [`hop_newest_delivery`]: DeliveryMap::hop_newest_delivery
+pub(crate) struct DeliveryMap {
+    /// Logged pushes not yet fully consumed, in push order. Each record's
+    /// `cumulative_frames` is the running total *through* that push, so the record
+    /// covering global frame `g` is the first whose `cumulative_frames > g`.
+    records: VecDeque<PushRecord>,
+    /// Reused drain buffer, so [`ingest`](DeliveryMap::ingest) never allocates in
+    /// steady state.
+    scratch: Vec<PushRecord>,
+    /// Frames the DSP has popped from the current ring — the base of the next hop.
+    consumed: u64,
+}
+
+impl DeliveryMap {
+    /// An empty map with room reserved for the pushes a ring can hold undrained, so
+    /// the steady-state hot path neither allocates nor reallocates.
+    fn new() -> Self {
+        // The primary ring holds at most `RING_FRAMES`; even implausibly small
+        // packets leave far fewer pending pushes than this. Reserving it keeps the
+        // queue and drain buffer allocation-free across a run.
+        const PENDING_RESERVE: usize = 1024;
+        Self {
+            records: VecDeque::with_capacity(PENDING_RESERVE),
+            scratch: Vec::with_capacity(PENDING_RESERVE),
+            consumed: 0,
+        }
     }
-    let back_ns = (buffered_after_frames as f64 * ns_per_frame).round() as u64;
-    last_push_ns.saturating_sub(back_ns).min(now_ns)
+
+    /// Reset to a fresh ring: drop every pending record and rewind the frame
+    /// cursor. Called when the DSP adopts a swapped-in consumer (a reopen builds a
+    /// new ring and a new delivery log that both start at frame 0).
+    fn reset(&mut self) {
+        self.records.clear();
+        self.scratch.clear();
+        self.consumed = 0;
+    }
+
+    /// Drain any newly-logged pushes into the pending queue. Cheap: one wait-free
+    /// log drain plus a move of the new records; allocation-free once the reserve
+    /// is warm.
+    fn ingest(&mut self, consumer: &SampleConsumer) {
+        self.scratch.clear();
+        consumer.drain_delivery(&mut self.scratch);
+        self.records.extend(self.scratch.drain(..));
+    }
+
+    /// The capture-delivery time of the newest frame of the hop about to be popped
+    /// (the hop consumes frames `consumed .. consumed + hop_frames`, so its newest
+    /// is `consumed + hop_frames − 1`). Returns `None` when no logged push covers
+    /// that frame yet — the caller then falls back to the processing clock. In
+    /// normal operation the frame is readable only because its push committed, and
+    /// the push logged its record before that commit, so a covering record is
+    /// present whenever the hop is.
+    fn hop_newest_delivery(&self, hop_frames: u64, ns_per_frame: f64) -> Option<u64> {
+        let target = self.consumed + hop_frames - 1;
+        for rec in &self.records {
+            if rec.cumulative_frames > target {
+                // `rec` covers frames `cumulative_frames − frames .. cumulative_frames`;
+                // its newest is `cumulative_frames − 1`, delivered at `delivery_ns`,
+                // and `target` is `(newest − target)` frame-periods older.
+                let newest = rec.cumulative_frames - 1;
+                let back = ((newest - target) as f64 * ns_per_frame).round() as u64;
+                return Some(rec.delivery_ns.saturating_sub(back));
+            }
+        }
+        None
+    }
+
+    /// Account for a popped hop: advance the frame cursor and drop pushes now fully
+    /// consumed from the front of the queue.
+    fn advance(&mut self, hop_frames: u64) {
+        self.consumed += hop_frames;
+        while let Some(front) = self.records.front() {
+            if front.cumulative_frames <= self.consumed {
+                self.records.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Stamp for the hop about to be popped: its newest frame's exact delivery time
+    /// clamped to `≤ now_ns` (a push can land between reads; a capture stamp must
+    /// never read into the future), falling back to `now_ns` when no record covers
+    /// the frame yet.
+    fn hop_stamp(&self, hop_frames: u64, ns_per_frame: f64, now_ns: u64) -> u64 {
+        self.hop_newest_delivery(hop_frames, ns_per_frame)
+            .map_or(now_ns, |d| d.min(now_ns))
+    }
 }
 
 /// Whether capture has gone quiet past the gap timeout: either nothing has ever
@@ -967,84 +1052,216 @@ fn is_starving(stats: &SinkStats, gap_ns: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::hop_delivery_ns;
+    use super::*;
 
-    const NS_PER_FRAME_48K: f64 = 1.0e9 / 48_000.0;
+    const NPF: f64 = 1.0e9 / 48_000.0;
+    const HOP: u64 = 256;
+    const HOP_MS: f64 = HOP as f64 * NPF / 1.0e6;
 
-    /// The delivery-anchored publish clock places a hop's newest frame at
-    /// `last_push_ns − occupancy`, tracking the capture-delivery clock rather than
-    /// the DSP's processing time.
+    fn rec(frames: u32, delivery_ns: u64, cum: u64) -> PushRecord {
+        PushRecord {
+            frames,
+            delivery_ns,
+            cumulative_frames: cum,
+        }
+    }
+
+    /// A [`DeliveryMap`] preloaded with `records` and a frame cursor, bypassing the
+    /// ring drain so the mapping arithmetic can be exercised directly.
+    fn map_with(records: &[PushRecord], consumed: u64) -> DeliveryMap {
+        let mut m = DeliveryMap::new();
+        m.records.extend(records.iter().copied());
+        m.consumed = consumed;
+        m
+    }
+
+    /// The pre-fix stamp model: spread the ring occupancy uniformly at the nominal
+    /// frame rate back from `last_push_ns`. Kept here to prove the reproduction gate
+    /// bites — this model breaks the subset invariant on the bursty schedule below;
+    /// the [`DeliveryMap`] mapping that replaced it holds.
+    fn uniform_inference(last_push_ns: u64, after_frames: u64, now: u64) -> u64 {
+        if last_push_ns == 0 {
+            return now;
+        }
+        let back = (after_frames as f64 * NPF).round() as u64;
+        last_push_ns.saturating_sub(back).min(now)
+    }
+
+    /// Exact delivery time of global frame `g` from the push log — the reference
+    /// the tee's raw-arrival mapping computes, used to place a click's leading edge.
+    fn exact_delivery(records: &[PushRecord], g: u64) -> u64 {
+        for r in records {
+            if r.cumulative_frames > g {
+                let newest = r.cumulative_frames - 1;
+                return r
+                    .delivery_ns
+                    .saturating_sub(((newest - g) as f64 * NPF).round() as u64);
+            }
+        }
+        records.last().unwrap().delivery_ns
+    }
+
+    /// **Reproduction of the P7 round-5 SUBSET-BREAK.** A real backend (WASAPI
+    /// shared-mode loopback under Windows timer coalescing) hands the capture path
+    /// several packets in a *faster-than-realtime burst*: the wall-clock spacing
+    /// between those pushes is far shorter than `frames × ns_per_frame`. The pre-fix
+    /// stamp spread the ring occupancy uniformly at the nominal rate back from
+    /// `last_push_ns`, crossing the burst, and so placed a hop's newest frame ~29 ms
+    /// (≈ 1410 frames) *before* it truly arrived — pushing `emit → publish` below
+    /// the raw-ring `emit → raw-arrival`, which a sample-enters-before-its-hop
+    /// ordering makes impossible. The exact per-push [`DeliveryMap`] mapping anchors
+    /// the frame within the push that carried it and holds the invariant.
+    ///
+    /// This asserts the old model breaks (publish well below raw) and the new model
+    /// holds (`raw ≤ publish ≤ raw + one hop`) on the same schedule — the failing
+    /// state on master's model, the passing state after the fix.
     #[test]
-    fn delivery_anchor_subtracts_ring_occupancy_from_last_push() {
-        // Writer's newest frame delivered at 130 ms; the popped hop left 480 newer
-        // frames (10 ms) in the ring; the DSP woke 5 ms after that delivery.
-        let last_push = 130_000_000u64;
-        let now = last_push + 5_000_000; // processing time, 5 ms later
-        let ts = hop_delivery_ns(now, last_push, 480, NS_PER_FRAME_48K);
-        let expected = last_push - 10_000_000; // 130 ms − 10 ms occupancy
+    fn bursty_delivery_breaks_uniform_stamp_but_exact_mapping_holds() {
+        // Two realtime 480-frame packets, then a coalesced burst of four packets
+        // handed over within 0.3 ms at ~200 ms — 40 ms of audio delivered almost
+        // instantaneously, the timer-coalescing cadence the synthetic 256-frame
+        // realtime backend never exercises.
+        let records = [
+            rec(480, 100_000_000, 480),  // realtime
+            rec(480, 110_000_000, 960),  // realtime
+            rec(480, 200_000_000, 1440), // burst packet 0
+            rec(480, 200_100_000, 1920), // burst packet 1
+            rec(480, 200_200_000, 2400), // burst packet 2
+            rec(480, 200_300_000, 2880), // burst packet 3
+        ];
+        // A click whose leading edge (frame 1400) and hop-newest frame (1439) both
+        // sit in burst packet 0, while packets 1–3 (1440 frames) sit newer in the
+        // ring — the compressed span the old model over-counts as 30 ms.
+        let leading_edge = 1400u64;
+        let hop_newest = 1439u64; // newest frame of a 256-hop ending here
+        let now = 200_400_000u64; // DSP processes just after the burst lands
+
+        let raw_ns = exact_delivery(&records, leading_edge);
+
+        // New model: exact per-push mapping for the hop ending at `hop_newest`.
+        let consumed = hop_newest + 1 - HOP;
+        let map = map_with(&records, consumed);
+        let publish_new = map.hop_stamp(HOP, NPF, now);
+
+        // Old model: last_push − occupancy×npf. Occupancy after the pop is every
+        // frame newer than the hop's newest that is resident (the whole burst tail),
+        // anchored on the burst's last delivery.
+        let newest_resident = records.last().unwrap().cumulative_frames - 1; // 2879
+        let after_frames = newest_resident - hop_newest; // 1440
+        let last_push = records.last().unwrap().delivery_ns;
+        let publish_old = uniform_inference(last_push, after_frames, now);
+
+        let raw_ms = raw_ns as f64 / 1.0e6;
+        let new_ms = publish_new as f64 / 1.0e6;
+        let old_ms = publish_old as f64 / 1.0e6;
+        let new_delta = new_ms - raw_ms;
+        let old_delta = old_ms - raw_ms;
+
+        // The old model breaks the subset invariant grossly: publish reads ~29 ms
+        // BELOW raw-arrival (the field's −29.38 ms; here 1440 frames of burst tail).
         assert!(
-            (ts as i64 - expected as i64).unsigned_abs() <= 1_000_000,
-            "delivery stamp {ts} should be ~{expected} (last_push − occupancy)"
+            old_delta < -20.0,
+            "old uniform stamp should read the hop far below raw-arrival \
+             (Δ {old_delta:.2} ms) — the SUBSET-BREAK the field hit"
         );
-        // It is the delivery clock, NOT the DSP's processing `now` (which is later
-        // by the ring residence — the pre-fix over-stamp).
+        let predicted = -(after_frames as f64 * NPF / 1.0e6); // −30 ms nominal span
         assert!(
-            ts < now,
-            "delivery stamp {ts} must not read the processing time {now}"
+            (old_delta - predicted).abs() < HOP_MS + 1.0,
+            "old break Δ {old_delta:.2} ms should match the over-counted burst span \
+             {predicted:.2} ms (≈ {after_frames} frames)"
+        );
+
+        // The exact mapping holds the invariant: raw ≤ publish ≤ raw + one hop.
+        assert!(
+            new_delta >= -0.5,
+            "exact stamp must not read below raw-arrival (Δ {new_delta:.2} ms)"
+        );
+        assert!(
+            new_delta <= HOP_MS + 0.5,
+            "exact stamp must stay within one hop of raw-arrival (Δ {new_delta:.2} ms, \
+             hop {HOP_MS:.2} ms)"
         );
     }
 
-    /// The regression that would have caught a gapless `epoch + index/rate` clock
-    /// model (candidate mechanism (a)): inject a deliberate startup gap — the
-    /// stream's first packet lands late — and confirm every hop's stamp shifts
-    /// later by exactly the gap. A gapless model that assumes contiguous delivery
-    /// from t=0 would ignore the gap and stamp the frame that many ms early; the
-    /// delivery anchor tracks `last_push_ns`, so the same physical occupancy under
-    /// a larger startup gap yields a proportionally later — never an early — stamp.
+    /// On the honest case the fix does not disturb — a uniform realtime cadence
+    /// (the synthetic 256-frame backend, or a well-behaved endpoint) maps to the
+    /// same stamp the old occupancy inference produced, so the passing synthetic
+    /// dual-tap numbers are unchanged.
     #[test]
-    fn delivery_anchor_reflects_a_startup_gap_not_a_gapless_epoch() {
-        let occupancy = 512u64; // frames still buffered after the pop
-        let residence = 3_000_000u64; // DSP woke 3 ms after delivery
+    fn uniform_delivery_matches_the_occupancy_inference() {
+        // Ten realtime 480-frame packets.
+        let mut records = Vec::new();
+        let mut cum = 0u64;
+        for k in 0..10u64 {
+            cum += 480;
+            records.push(rec(480, (k + 1) * 10_000_000, cum));
+        }
+        // A hop ending at frame 2559 (inside packet 5), some occupancy still ahead.
+        let hop_newest = 2559u64;
+        let consumed = hop_newest + 1 - HOP;
+        let map = map_with(&records, consumed);
+        let now = 100_000_000u64;
+        let exact = map.hop_stamp(HOP, NPF, now);
 
-        // No startup gap: the writer's newest frame is delivered at 40 ms.
-        let base_push = 40_000_000u64;
-        let no_gap = hop_delivery_ns(
-            base_push + residence,
-            base_push,
-            occupancy,
-            NS_PER_FRAME_48K,
-        );
-
-        // A 30 ms startup gap delays the whole delivery timeline by 30 ms, so
-        // `last_push_ns` for the same physical hop is 30 ms later.
-        let gap = 30_000_000u64;
-        let with_gap = hop_delivery_ns(
-            base_push + gap + residence,
-            base_push + gap,
-            occupancy,
-            NS_PER_FRAME_48K,
-        );
-
-        // The stamp moved later by exactly the gap. A gapless epoch+index/rate
-        // model would have produced the SAME stamp both times (the gap invisible),
-        // reading the gapped hop `gap` ns early — the constant early bias this test
-        // guards against.
-        let shift = with_gap as i64 - no_gap as i64;
+        let newest_resident = cum - 1;
+        let after = newest_resident - hop_newest;
+        let old = uniform_inference((10) * 10_000_000, after, now);
         assert!(
-            (shift - gap as i64).unsigned_abs() <= 1_000,
-            "startup gap {gap} ns should shift the delivery stamp by the same amount, got {shift}"
+            (exact as i64 - old as i64).unsigned_abs() <= NPF.ceil() as u64,
+            "uniform cadence: exact stamp {exact} and occupancy inference {old} \
+             should agree within a frame period"
         );
     }
 
-    /// Before the first push there is no delivered frame to anchor on, so the
-    /// stamp falls back to the processing clock; and a stamp can never read past
-    /// `now` even if a push lands between the occupancy read and the anchor call.
+    /// `advance` drops fully-consumed pushes and the cursor tracks the frames the
+    /// DSP has popped, so a later hop maps against the still-resident pushes.
     #[test]
-    fn delivery_anchor_falls_back_and_clamps() {
-        // No push yet.
-        assert_eq!(hop_delivery_ns(1_000, 0, 999, NS_PER_FRAME_48K), 1_000);
-        // last_push_ns briefly ahead of the sampled `now` (a push raced in): clamp.
-        let clamped = hop_delivery_ns(50_000_000, 60_000_000, 0, NS_PER_FRAME_48K);
-        assert_eq!(clamped, 50_000_000, "stamp must never exceed now_ns");
+    fn advance_drops_consumed_records_and_moves_the_cursor() {
+        let records = [
+            rec(256, 10_000_000, 256),
+            rec(256, 20_000_000, 512),
+            rec(256, 30_000_000, 768),
+        ];
+        let mut map = map_with(&records, 0);
+        // First hop [0,256): newest 255 → packet 0 delivery.
+        assert_eq!(map.hop_stamp(HOP, NPF, 40_000_000), 10_000_000);
+        map.advance(HOP);
+        // Packet 0 is now fully consumed and dropped.
+        assert_eq!(map.records.len(), 2);
+        // Second hop [256,512): newest 511 → packet 1 delivery.
+        assert_eq!(map.hop_stamp(HOP, NPF, 40_000_000), 20_000_000);
+        map.advance(HOP);
+        assert_eq!(map.records.len(), 1);
+    }
+
+    /// With no record covering the hop's newest frame yet (a race the ordering
+    /// makes rare), the stamp falls back to the processing clock rather than
+    /// inventing a time; and it never reads past `now`.
+    #[test]
+    fn missing_record_falls_back_to_now_and_never_exceeds_it() {
+        // Empty map: nothing logged.
+        let map = map_with(&[], 0);
+        assert_eq!(map.hop_stamp(HOP, NPF, 5_000), 5_000);
+        // A record whose delivery is ahead of the sampled `now` (a push raced in):
+        // clamp to now.
+        let records = [rec(256, 60_000_000, 256)];
+        let map = map_with(&records, 0);
+        assert_eq!(
+            map.hop_stamp(HOP, NPF, 50_000_000),
+            50_000_000,
+            "stamp must never exceed now"
+        );
+    }
+
+    /// `reset` rewinds the map for a reopened ring (fresh log numbered from 0).
+    #[test]
+    fn reset_clears_records_and_cursor() {
+        let records = [rec(256, 10_000_000, 256), rec(256, 20_000_000, 512)];
+        let mut map = map_with(&records, 256);
+        map.reset();
+        assert!(map.records.is_empty());
+        assert_eq!(map.consumed, 0);
+        // After reset a fresh hop falls back to now (no records yet).
+        assert_eq!(map.hop_stamp(HOP, NPF, 7_777), 7_777);
     }
 }

@@ -89,9 +89,10 @@ in milliseconds:
 
 - **emit → publish** — from the click's emission to the `timestamp_ns` of the
   hop that carries it. `timestamp_ns` is the **capture-delivery time of the hop's
-  newest frame** — when that frame entered scia's ring (`last_push_ns` minus the
-  ring occupancy the pop leaves behind), *not* the DSP's own wall-clock at the
-  moment it processed the hop (see *Publish clock* below). So this is capture
+  newest frame** — when that frame entered scia's ring, taken as the *exact
+  delivery time of the push that carried it* (from the primary ring's per-push
+  delivery log), *not* the DSP's own wall-clock at the moment it processed the hop
+  (see *Publish clock* below). So this is capture
   transport plus up to one 256-frame hop (**5.33 ms at 48 kHz**) of gather: a
   click can wait up to a hop to be gathered, on top of however long the capture
   path buffered it. It is anchored on the **same** capture-delivery clock the
@@ -122,14 +123,29 @@ runs at its own cadence, so a plain "wall-clock at pull" stamp folds in the DSP'
 scheduling jitter and however long the hop sat in the ring — a term that does not
 belong in a capture timestamp, and one that is invisible to the raw-ring mode
 (which anchors on delivery). To keep the two modes on one clock, the DSP stamps
-each real hop with the **capture-delivery time of its newest frame**: the writer's
-newest frame entered the ring at `last_push_ns`, and the hop's newest frame is the
-ring-occupancy-after-pop number of frames older, so its delivery time is
-`last_push_ns − frames_left_in_ring × ns_per_frame`. This is exactly the
-delivery-clock anchor the raw-ring drain uses (`last_push_ns` minus residual
-occupancy), applied to the hop grid. Synthesized-silence hops (capture starved)
-carry no delivered frame and keep the wall-clock, which is correct — they
-represent "now, nothing captured". The render overlay already treats
+each real hop with the **capture-delivery time of its newest frame** — the *exact
+delivery time of the push that carried that frame*.
+
+The primary capture ring keeps a wait-free **per-push delivery log**: every push
+records `(frames, delivery_ns, cumulative_frames)`, the same record the dual-tap
+tee logs. The DSP consumes that log in lockstep with the frames it pops, so for a
+hop ending at global frame `g` it finds the push whose range covers `g` and stamps
+`delivery_ns − (push_newest − g) × ns_per_frame` — exact per push, with no
+occupancy inference.
+
+That inference is what the earlier model used — `last_push_ns − frames_left_in_ring
+× ns_per_frame` — and it is exact only when the ring's occupancy was delivered at a
+*uniform* nominal frame rate. A real backend does not oblige: WASAPI shared-mode
+loopback under Windows timer coalescing hands several packets over in a
+faster-than-realtime burst, so the occupancy spans pushes whose wall-clock spacing
+is shorter than `frames × ns_per_frame`. Spreading the occupancy uniformly back
+from `last_push_ns` across those bursts places the hop's newest frame *earlier*
+than it truly arrived — the round-5 SUBSET-BREAK (see *Field reconciliation —
+fifth round*). The per-push mapping anchors each frame inside the push that
+actually carried it, so it is immune to the cadence *between* pushes and tracks the
+same capture-delivery instant the raw-ring/tee mapping does. Synthesized-silence
+hops (capture starved) carry no delivered frame and keep the wall-clock, which is
+correct — they represent "now, nothing captured". The render overlay already treats
 `timestamp_ns` as capture time (`feature_age = now − timestamp_ns` is "capture →
 now"), so this also makes the displayed feature age honest.
 
@@ -509,5 +525,75 @@ collapses to ~0 (the emit stamp is taken at the chunk push, which is also the
 delivery instant) and `emit → raw-arrival` is a few milliseconds *negative* (the
 continuous-capture sample time precedes the pre-push emit stamp), so Δ is the pure
 hop-gather term — the invariant holds with room to spare, proving the tee, the
-exact mapping, and the joined measurement end-to-end. Real-hardware dual-tap
-numbers land here later via the orchestrator.
+exact mapping, and the joined measurement end-to-end. The synthetic backend
+delivers one 256-frame chunk per real-time sleep, so its ring never holds an
+occupancy spanning several non-uniform pushes — which is exactly why the synthetic
+path did **not** reproduce the field's break (see below): the defect lived in the
+delivery cadence, not the pipeline logic.
+
+**Field reconciliation — fifth round (the break, localized and fixed).** The first
+on-hardware dual-tap run (Windows shared-mode, 48 kHz 2 ch, 10 ms period, hop 256;
+25 clicks) removed the last ambiguity by measuring both legs from the same clicks
+in one process on one clock:
+
+```
+25 clicks · publish-matched 25 · raw-matched 25 · both 25 · tee dropped-pushes 0
+emit → raw-arrival  median 108.72 ms  (spread 108.55–108.91)
+emit → publish      median  79.33 ms  (spread  79.09– 79.44)
+per-click Δ = publish − raw-arrival = −29.38 ms constant (−29.60 … −29.30)
+subset invariant 0/25   (raw-arrival sits ABOVE publish for the same click)
+engine: pushes 1324 (480-frame/10 ms packets) · hops 2480 · dropped 0 · xruns 1
+```
+
+A **SUBSET-BREAK**: raw-arrival above publish for the same click in the same run is
+impossible for two honest clocks, since a sample enters the ring strictly before
+any hop that carries it is published. And now it is *localizable*, because both
+figures come from one push stream. The raw-arrival leg maps a click's leading edge
+to the **exact** delivery time of the push that carried it (the tee's per-push log,
+no inference) — it is trustworthy (the round-3 finding stands). So the **publish
+leg lied, reading ~29.4 ms early**.
+
+The mechanism is the publish clock's **occupancy inference**. The pre-fix stamp was
+`last_push_ns − ring_occupancy × ns_per_frame`, which assumes the ring's occupancy
+was delivered at a uniform nominal frame rate. On this endpoint it is not: WASAPI
+shared-mode loopback under timer coalescing hands several 480-frame packets over in
+a faster-than-realtime burst, so the frames resident *newer* than the hop being
+stamped were delivered in far less wall-time than `frames × ns_per_frame`. Spreading
+the occupancy uniformly back from `last_push_ns` across that burst placed the hop's
+newest frame ≈ 1410 frames (`−29.38 ms ≈ 1410 / 48 000`) before it truly arrived —
+a tight constant because the coalesced cadence is stable. The synthetic backend
+(one 256-frame chunk per realtime sleep) never builds such an occupancy, so it never
+reproduced the break; a deterministic reproduction of the bursty cadence lives in
+`crates/core/src/dsp.rs::tests::bursty_delivery_breaks_uniform_stamp_but_exact_mapping_holds`,
+which fails the subset invariant under the old model and holds under the fix.
+
+**The fix.** The DSP no longer infers. The primary capture ring now carries a
+wait-free **per-push delivery log** (`(frames, delivery_ns, cumulative_frames)` per
+push — the same record the tee logs), and the DSP maps a hop's newest frame to the
+delivery time of the push that actually carried it — exact per push, immune to the
+cadence between pushes (see *Publish clock*). This is the **honest side made
+symmetric**: the raw-arrival leg was already exact per push; the publish leg now is
+too. The tee's raw-arrival reconstruction was not touched.
+
+**Corrected interpretation — which absolute numbers stand.**
+
+- `emit → raw-arrival` ≈ **108.7 ms** stands as the endpoint's capture transport
+  from the output callback (it was always the exact-mapped leg). Of it,
+  ≈ 39.9 ms is the probe player's own render buffering (`output delay (cb→play)`,
+  **not** scia's path) and ≈ 68.8 ms is loopback/endpoint capture buffering upstream
+  of scia — the dominant pre-pixel term on this endpoint, in front of every
+  visualiser equally.
+- The pre-fix `emit → publish` figures — the `81.3 ms` first-run table *and* this
+  round's `79.33 ms` — are **both retired**: the first was the DSP's processing
+  wall-clock, the second the occupancy inference, and neither is the hop's true
+  capture-delivery time. Do not score US-PERF-1 against either.
+- On a fresh delivery-anchored dual-tap run the subset invariant holds by
+  construction: `emit → raw-arrival ≤ emit → publish ≤ emit → raw-arrival + one hop`.
+  So the corrected `emit → publish` is `raw-arrival + Δ` with the hop-gather
+  **Δ ∈ [0, 5.33 ms]** measured directly per click — expected ≈ 108.7 … 114.0 ms on
+  this endpoint. **US-PERF-1 scoring uses that Δ** (median) as scia's own gather
+  contribution above ring entry, plus ~1 ms feature-bus poll into `emit → observe`
+  and up to one render frame (~16.7 ms at 60 fps) this probe does not measure; the
+  large endpoint-capture term is upstream of scia and not scia's audio→pixel budget.
+  The confirming on-hardware run: `latency_probe --dual-tap --clicks 25` must now
+  read `subset 25/25` with every `Δ ∈ [0, 5.33 ms]`.
