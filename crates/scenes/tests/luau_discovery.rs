@@ -36,11 +36,16 @@ impl Drop for TempDir {
 }
 
 /// Point the config dir at `dir`, so `scenes_dir()` resolves under it and no
-/// real drop-ins on this machine leak into the test.
+/// real drop-ins on this machine leak into the test. The variable is the one
+/// `config_dir()` actually reads on this platform: `APPDATA` on Windows,
+/// `XDG_CONFIG_HOME` elsewhere.
 fn set_config_home(dir: &std::path::Path) {
     // SAFETY: set before any catalogue access in this (single-test) process; no
     // other thread reads the env concurrently here.
     unsafe {
+        #[cfg(windows)]
+        std::env::set_var("APPDATA", dir);
+        #[cfg(not(windows))]
         std::env::set_var("XDG_CONFIG_HOME", dir);
     }
 }
