@@ -88,9 +88,16 @@ Each interval is reported as nearest-rank percentiles (min / median / p95 / max)
 in milliseconds:
 
 - **emit → publish** — from the click's emission to the `timestamp_ns` of the
-  hop that carries it. This is capture transport plus the hop grid: a click can
-  wait up to one 256-frame hop (**5.33 ms at 48 kHz**) to be gathered into a
-  hop, plus however long the capture path buffered it.
+  hop that carries it. `timestamp_ns` is the **capture-delivery time of the hop's
+  newest frame** — when that frame entered scia's ring (`last_push_ns` minus the
+  ring occupancy the pop leaves behind), *not* the DSP's own wall-clock at the
+  moment it processed the hop (see *Publish clock* below). So this is capture
+  transport plus up to one 256-frame hop (**5.33 ms at 48 kHz**) of gather: a
+  click can wait up to a hop to be gathered, on top of however long the capture
+  path buffered it. It is anchored on the **same** capture-delivery clock the
+  raw-ring mode's `emit → raw-arrival` uses, so on one run
+  `emit → raw-arrival ≤ emit → publish ≤ emit → raw-arrival + one hop` holds by
+  construction.
 - **publish → observe** — from the hop's publish time to the observer reading
   it. Bounded by the observer's **1 ms** poll interval (plus scheduling
   jitter).
@@ -107,6 +114,25 @@ Quantization sources to keep in mind when reading the numbers: the 256-frame hop
 grid (5.33 ms at 48 kHz), the 1 ms DSP poll while waiting for a partial hop, the
 1 ms observer poll, and the click length itself (`--click-ms`, default 1 ms).
 
+### Publish clock
+
+A snapshot's `timestamp_ns` marks *when its audio was captured*, not when the DSP
+thread got around to processing it. The DSP pops the **oldest** buffered hop but
+runs at its own cadence, so a plain "wall-clock at pull" stamp folds in the DSP's
+scheduling jitter and however long the hop sat in the ring — a term that does not
+belong in a capture timestamp, and one that is invisible to the raw-ring mode
+(which anchors on delivery). To keep the two modes on one clock, the DSP stamps
+each real hop with the **capture-delivery time of its newest frame**: the writer's
+newest frame entered the ring at `last_push_ns`, and the hop's newest frame is the
+ring-occupancy-after-pop number of frames older, so its delivery time is
+`last_push_ns − frames_left_in_ring × ns_per_frame`. This is exactly the
+delivery-clock anchor the raw-ring drain uses (`last_push_ns` minus residual
+occupancy), applied to the hop grid. Synthesized-silence hops (capture starved)
+carry no delivered frame and keep the wall-clock, which is correct — they
+represent "now, nothing captured". The render overlay already treats
+`timestamp_ns` as capture time (`feature_age = now − timestamp_ns` is "capture →
+now"), so this also makes the displayed feature age honest.
+
 ## Results
 
 First live run — Windows 11 desktop, onboard Realtek endpoint (shared mode,
@@ -122,6 +148,17 @@ output delay (cb→play)   39.65   39.85   39.94   39.94
 engine: pushes 1224 · dropped 0 · xruns 1 · hops 2293/0 (processed/synthesized)
 ```
 
+> **Publish clock changed since this run.** This `emit → publish` column was
+> measured with the *pre-fix* publish clock — the DSP's wall-clock at the moment
+> it pulled the hop. That stamp is `now ≥ delivery`: it sits *above* the hop's
+> capture-delivery time by the ring residence, so it can only over-state
+> `emit → publish`, never under-state it. The clock is now anchored on capture
+> delivery (see *Publish clock* and *Field reconciliation — third round*); a fresh
+> run's `emit → publish` will read a few ms lower than this table and satisfies the
+> subset invariant against `emit → raw-arrival` by construction. Treat the 81.3 ms
+> median as an upper-bound intermediate, not the endpoint's delivery-anchored
+> number.
+
 Reading:
 
 - Detection is airtight: 25/25 matched, no drops, no synthesized hops, and
@@ -130,18 +167,18 @@ Reading:
   (cpal's default WASAPI output stream) plus the click's intra-buffer
   offset — it is NOT part of scia's capture path; a real player's audio is
   already in the mix.
-- **Open question:** estimated playback → publish ≈ 41 ms median
-  (81.3 − 39.9), vs ~15–20 ms expected from the P1 cadence (10 ms loopback
-  packet + 5.3 ms hop + polls). Either cpal's output playback timestamp
-  underestimates the true chain (making the residual smaller than it looks)
-  or the loopback path buffers more than its packet cadence suggests. The
-  follow-up that decomposes this — cross-correlating raw ring samples against
-  the emitted click (sub-millisecond, no hop quantization) — is *Raw-ring
-  mode* below. Its field runs so far mis-measured — first a drain-timestamp
-  poll-jitter bug, then a residual constant bias — both addressed across two
-  correction rounds (see *Raw-ring mode → Field reconciliation*), so a corrected
-  raw-ring run on this endpoint, read together with the new backlog readout, is
-  still owed before the ≤ 33 ms US-PERF-1 criterion is scored.
+- **Playback → publish decomposition.** Estimated playback → publish ≈ 41 ms
+  median (81.3 − 39.9) on the pre-fix clock, vs ~15–20 ms expected from the P1
+  cadence (10 ms loopback packet + 5.3 ms hop + polls). The raw-ring follow-up
+  below decomposes this by measuring capture transport directly; its first two
+  field runs mis-measured (a drain-timestamp poll-jitter bug, then a residual
+  constant bias), and the third run finally read clean (backlog max 0 frames,
+  every click `ncc` 1.000, `emit → raw-arrival` ≈ 108.7 ms with a ±0.15 ms
+  spread — see *Field reconciliation — third round*). That clean raw-arrival sat
+  *above* the pre-fix `emit → publish`, which is impossible for two honest clocks
+  and is what motivated putting both modes on one capture-delivery clock. A
+  back-to-back dual run on the delivery-anchored clock is owed before the ≤ 33 ms
+  US-PERF-1 criterion is scored.
 
 ## Raw-ring mode (`--raw-ring`)
 
@@ -306,6 +343,64 @@ full 27.5 ms on this endpoint. That is precisely why the backlog readout was
 added rather than assumed: the next corrected raw-ring run should be read with the
 backlog line in hand before attributing the residual. The `81.3 ms` normal-run
 table still stands; a third raw-ring run lands here later via the orchestrator.
+
+**Field reconciliation — third round.** The third raw-ring run read **clean**:
+`emit → raw-arrival` ≈ `108.7 ms` median with a `±0.15 ms` spread, every click
+`ncc` exactly `1.000`, and **ring backlog max 0 frames**. The backlog readout is
+the discriminating measurement: at zero, the unbounded drain kept up, the
+occupancy correction is a no-op, and the reconstruction is not the source of a
+residual bias. Raw-arrival is now a trustworthy direct measurement of capture
+delivery: from the click's emission (at the output callback) to its samples
+entering scia's ring, ≈ 108.7 ms on this endpoint.
+
+That reading forced the real diagnosis. Raw-arrival (≈ 108.7 ms) sat *above* the
+same-endpoint normal-run `emit → publish` (≈ 81.3 ms) by ~27.4 ms — impossible for
+two honest clocks, since a sample enters the ring **before** any hop that carries
+it is published, so raw-arrival must be the *smaller* number. The suspect this
+round was the **normal-mode publish clock**, on the hypothesis that it read the
+click ~27 ms early. Reading the code refutes an *early* stamp: the pre-fix
+`timestamp_ns` was the DSP's `now_ns()` at hop pull, read only *after* the hop's
+frames were already buffered, so it is `now ≥ delivery` — it can only sit *above*
+the hop's capture-delivery time (by the ring residence), never below it. There is
+no `epoch + index/rate` gapless-sample model in the normal path to read early from
+a startup gap. So the pre-fix publish clock cannot explain a 27 ms *inversion*; if
+anything it inflates `emit → publish`, which would only make the true
+delivery-anchored number *smaller* and the inversion *wider*.
+
+The honest resolution is therefore twofold:
+
+- **The two modes were measuring against different reference points, and now do
+  not.** Normal mode stamped the DSP's *processing* wall-clock; raw-ring anchored
+  on *capture delivery*. Those are not the same instant, and nothing said so. Both
+  modes are now anchored on the one capture-delivery clock (the hop's newest frame
+  at `last_push_ns` minus ring occupancy — see *Publish clock*), so on a single
+  run `emit → raw-arrival ≤ emit → publish ≤ emit → raw-arrival + one hop` holds by
+  construction. The probe reports state their reference points explicitly.
+- **The ~27.4 ms is a cross-run difference, not a clock bug in either mode.** The
+  `81.3 ms` and `108.7 ms` figures come from **separate** probe processes — the
+  normal run and the raw-ring run are not simultaneous, and each opens its own
+  loopback capture on a shared-mode WASAPI endpoint whose buffering need not match
+  between two independent opens. With the delivery-anchored clock, the two modes
+  can no longer invert *within one run*; a residual gap between a **back-to-back**
+  normal and raw-ring pair on the delivery clock would then be a genuine
+  capture-transport property to chase, not an instrumentation artifact. That
+  back-to-back pair is the confirmation run now owed.
+
+What this means for the latency story: `emit → raw-arrival` ≈ 108.7 ms is capture
+transport from the *output callback*, and it includes the probe player's own
+render buffering (`output delay (cb→play)` ≈ 39.9 ms), which is **not** scia's
+path — a real player's audio is already in the mix. Subtracting it leaves
+**playback → ring ≈ 68.8 ms** of loopback/endpoint capture buffering on this
+endpoint, well above the ~10–15 ms a bare packet cadence suggests; that endpoint
+buffering, not scia's hop grid, dominates the pre-pixel budget here. scia's own
+contribution above ring entry is small and bounded: up to one hop of gather
+(≤ 5.33 ms) into `emit → publish`, then ~1 ms of feature-bus poll into
+`emit → observe`, then up to one frame interval of render/present (~16.7 ms at
+60 fps) that this probe does not measure. The ≤ 33 ms US-PERF-1 budget is about
+scia's audio→pixel contribution; the large endpoint-capture term is upstream of
+scia and rides in front of every visualiser on this endpoint equally. Scoring
+US-PERF-1 still needs the back-to-back delivery-clock run to pin
+`emit → publish − emit → raw-arrival` (the hop-gather term) directly.
 
 **Synthetic self-test.** `--raw-ring --synthetic` (and the
 `crates/core/tests/latency.rs` regression that drives the same library logic)

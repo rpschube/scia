@@ -697,10 +697,13 @@ fn run_raw_ring(
     }
     println!(
         "note: emit → raw-arrival is capture transport only — from the click's emission to its \
-         samples entering scia's ring — found by cross-correlation with no hop quantization. \
-         emit → publish is not measured in this mode; the hop grid adds up to one {HOP_FRAMES}-frame \
-         hop ({hop_ms:.2} ms) of gather on top (stated, not measured). Compare raw-arrival against \
-         a normal run's emit → publish to see how much of that interval is capture transport."
+         samples entering scia's ring, anchored on the capture-delivery clock (last_push_ns minus \
+         ring occupancy) — found by cross-correlation with no hop quantization. emit → publish is \
+         not measured in this mode; the hop grid adds up to one {HOP_FRAMES}-frame hop \
+         ({hop_ms:.2} ms) of gather on top (stated, not measured). A normal run's emit → publish is \
+         anchored on the SAME capture-delivery clock (the hop's newest frame), so on one run \
+         raw-arrival ≤ publish ≤ raw-arrival + one hop holds by construction; compare the two to \
+         split the interval into capture transport vs hop gather."
     );
 
     if emitted == 0 {
@@ -774,6 +777,13 @@ fn observe_and_report(
         engine_stats.xruns,
         engine_stats.hops_processed,
         engine_stats.hops_synthesized,
+    );
+    println!(
+        "note: emit → publish is anchored on the capture-delivery clock — the hop's newest frame \
+         is stamped with when it entered scia's ring (last_push_ns minus ring occupancy), not the \
+         DSP's processing time. This is the same clock --raw-ring anchors emit → raw-arrival on, so \
+         raw-arrival ≤ publish ≤ raw-arrival + one hop ({HOP_FRAMES} frames, {hop_ms:.2} ms) on one \
+         run. output delay (cb→play) is the probe player's own render buffering, not scia's path."
     );
 
     // Exit 0 when at least 80 % of emitted clicks were matched.
