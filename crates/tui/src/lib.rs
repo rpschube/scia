@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+mod author;
 mod chrome;
 mod devicepick;
 mod keymap;
@@ -53,8 +54,12 @@ use scia_core::engine::EngineHealth;
 use scia_core::{
     Activity, DeviceInfo, DeviceSelector, EngineStats, FeatureReader, FeatureSnapshot, list_devices,
 };
-use scia_scenes::{Palette, Preset, ReloadEvent, builtin_presets, catalog_scenes, scene_preset};
+use scia_scenes::{
+    Palette, Preset, ReloadEvent, SceneSource, builtin_presets, catalog_scenes,
+    expression_vocabulary, scene_preset,
+};
 
+pub use author::{AuthorMode, ReloadStatus, SourceError, did_you_mean, draw_author};
 pub use chrome::{ChromeMode, ChromeState, Fade};
 pub use devicepick::{
     CaptureFilter, DevicePicker, DeviceRow, EnumState, Platform, apply_device_pin, build_rows,
@@ -531,6 +536,18 @@ fn run_loop(
             ));
             notice_deadline = Some(frame_start + NOTICE_TTL);
         }
+        // Fulfil a scene-author open request: build the source descriptor from
+        // the `--scene-file` path or the running builtin preset, plus the
+        // did-you-mean vocabulary (the signal names and the scene's params), and
+        // open the mode on it. With no presenter (direct-bars) it stays shut.
+        if std::mem::take(&mut ui.author_open_pending) {
+            if let Some(p) = presenter.as_ref() {
+                if let Some(source) = author_source(opts, &ui.scene_nav, p) {
+                    ui.author.open(source, author_vocab(p));
+                }
+            }
+        }
+
         // Open the device picker: spawn the (blocking) enumeration on a worker
         // thread and show the `enumerating…` placeholder until its result lands.
         // A re-open always re-enumerates.
@@ -610,9 +627,9 @@ fn run_loop(
         if let Some(rx) = reload.as_ref() {
             if let Ok(event) = rx.try_recv() {
                 if let Some(p) = presenter.as_mut() {
-                    match event.result {
+                    match &event.result {
                         Ok(preset) => {
-                            p.swap_preset(&preset);
+                            p.swap_preset(preset);
                             // Rebuild the mapping overlay's rows against the new
                             // preset when it is open, so its list never lags the
                             // running scene.
@@ -631,6 +648,12 @@ fn run_loop(
                     }
                     notice_deadline = Some(frame_start + NOTICE_TTL);
                 }
+                // Scene-author mode surfaces the reload: it re-reads the source so
+                // the pane shows the just-saved bytes, records the reload time, and
+                // on a failed validate highlights the failing line with the inline
+                // message. It never drives the pipeline — the last good scene holds
+                // above regardless. A no-op while author mode is closed.
+                ui.author.on_reload(&event);
             }
         }
         // Auto-clear the notice once its deadline passes.
@@ -760,6 +783,12 @@ fn run_loop(
                         // top of it too.
                         if ui.mapping.is_open() {
                             mapping_ui::draw_mapping(frame.buffer_mut(), body, &ui.mapping);
+                        }
+                        // Scene-author mode: the source pane plus the reused meter
+                        // bridge, split over the body. Drawn above the scene, below
+                        // the help overlay.
+                        if ui.author.is_open() {
+                            author::draw_author(frame.buffer_mut(), body, &ui.author, &snap, &ui);
                         }
                         // The help overlay is the topmost body layer.
                         render::draw_help(frame.buffer_mut(), body, &ui);
@@ -1134,6 +1163,38 @@ fn handle_event(event: Event, ui: &mut UiState) -> Action {
                     _ => {}
                 }
             }
+            // While scene-author mode is open its keys take priority: the arrows
+            // (and PageUp/PageDown) scroll the source pane, and esc closes. The
+            // horizontal arrows are swallowed so scene cycling never fires under
+            // the pane, keeping the shown source in step with the running scene.
+            // Everything else (the author key itself, `?`, the other actions)
+            // falls through unchanged.
+            if ui.author.is_open() {
+                match key.code {
+                    KeyCode::Esc => {
+                        ui.author.close();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Up => {
+                        ui.author.scroll_up();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Down => {
+                        ui.author.scroll_down();
+                        return Action::Redraw;
+                    }
+                    KeyCode::PageUp => {
+                        ui.author.page_up();
+                        return Action::Redraw;
+                    }
+                    KeyCode::PageDown => {
+                        ui.author.page_down();
+                        return Action::Redraw;
+                    }
+                    KeyCode::Left | KeyCode::Right => return Action::Redraw,
+                    _ => {}
+                }
+            }
             // While the device picker is open it is modal: its keys take priority
             // over scene cycling, the browser and Esc-quit. ↑↓ (or j/k) select,
             // ⏎ switches, `p` pins, esc closes. The devices key itself falls
@@ -1282,6 +1343,18 @@ fn apply_action(action: InputAction, ui: &mut UiState, browsing: bool) -> Action
                 ui.devices.close();
             } else {
                 ui.device_open_pending = true;
+            }
+            Action::Redraw
+        }
+        // Toggle scene-author mode, the sibling of the tuning strip and mapping
+        // overlay: closing is immediate, opening is a one-shot request the loop
+        // fulfils by building the source descriptor from the presenter and the
+        // scene-file / builtin source. Inert with no presenter (direct-bars).
+        InputAction::Author => {
+            if ui.author.is_open() {
+                ui.author.close();
+            } else {
+                ui.author_open_pending = true;
             }
             Action::Redraw
         }
@@ -1455,6 +1528,39 @@ fn write_mapping(
         Ok(path) => format!("wrote {}", path.display()),
         Err(err) => format!("write failed: {err}"),
     }
+}
+
+/// Build the source descriptor scene-author mode opens on: the `--scene-file`
+/// on disk when one is set, otherwise the running builtin preset's embedded
+/// source. The builtin name is the currently running scene (cycling may have
+/// moved it off `--scene`), mirroring the write-back path's name resolution.
+/// `None` when no source can be resolved.
+fn author_source(
+    opts: &TuiOptions,
+    nav: &SceneNav,
+    presenter: &ScenePresenter,
+) -> Option<SceneSource> {
+    if let Some(path) = &opts.scene_file {
+        return Some(SceneSource::from_file(path));
+    }
+    let name = nav
+        .current_id()
+        .or(opts.scene.as_deref())
+        .or_else(|| presenter.layer0_scene_id())?;
+    SceneSource::builtin(name)
+}
+
+/// The did-you-mean vocabulary for scene-author mode: the expression signal
+/// names plus the active scene's parameter keys (its `ParamSpec` manifest).
+fn author_vocab(presenter: &ScenePresenter) -> Vec<String> {
+    let mut vocab: Vec<String> = expression_vocabulary()
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for spec in presenter.layer0_specs() {
+        vocab.push(spec.key.to_string());
+    }
+    vocab
 }
 
 /// Pin the picker's selected device into the config file, returning the status
@@ -2288,6 +2394,73 @@ mod tests {
         assert!(!ui.mapping.is_editing(), "enter committed the edit");
         assert!(ui.mapping.is_dirty("gap"), "the row is dirty after commit");
         assert_eq!(ui.mapping.dirty_edits(), vec![("gap", "bass * 0.5")]);
+    }
+
+    /// A scene-mode UiState with author mode already open on a builtin source,
+    /// as the loop would have seeded it from the presenter.
+    fn ui_with_open_author() -> UiState {
+        let mut ui = UiState {
+            scene_mode: true,
+            ..UiState::default()
+        };
+        let source = SceneSource::builtin("spectra").expect("spectra builtin");
+        let vocab: Vec<String> = expression_vocabulary()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        ui.author.open(source, vocab);
+        ui
+    }
+
+    #[test]
+    fn a_requests_scene_author_mode() {
+        let mut ui = UiState::default();
+        assert!(!ui.author_open_pending);
+        assert!(matches!(
+            handle_event(press(KeyCode::Char('a')), &mut ui),
+            Action::Redraw
+        ));
+        assert!(
+            ui.author_open_pending,
+            "a asks the loop to open scene-author mode"
+        );
+    }
+
+    #[test]
+    fn a_closes_author_mode_when_open() {
+        let mut ui = ui_with_open_author();
+        assert!(ui.author.is_open());
+        let _ = handle_event(press(KeyCode::Char('a')), &mut ui);
+        assert!(!ui.author.is_open(), "a closes an open author mode");
+        assert!(
+            !ui.author_open_pending,
+            "closing does not re-request an open"
+        );
+    }
+
+    #[test]
+    fn author_keys_scroll_and_take_priority_over_cycling() {
+        let mut ui = ui_with_open_author();
+        // Down scrolls the source; it does not cycle the scene.
+        let _ = handle_event(press(KeyCode::Down), &mut ui);
+        assert_eq!(ui.author.scroll(), 1);
+        // Left/Right are swallowed so scene cycling never fires under the pane.
+        let _ = handle_event(press(KeyCode::Right), &mut ui);
+        assert_eq!(
+            ui.scene_nav.take_pending(),
+            None,
+            "right did not cycle the scene"
+        );
+        assert!(!ui.scene_nav.is_open(), "no browser opened");
+        // Up scrolls back.
+        let _ = handle_event(press(KeyCode::Up), &mut ui);
+        assert_eq!(ui.author.scroll(), 0);
+        // Esc closes author mode rather than quitting.
+        assert!(matches!(
+            handle_event(press(KeyCode::Esc), &mut ui),
+            Action::Redraw
+        ));
+        assert!(!ui.author.is_open());
     }
 
     #[test]

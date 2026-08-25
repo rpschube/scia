@@ -1433,6 +1433,110 @@ pub fn builtin_preset(name: &str) -> Option<Result<Preset, PresetError>> {
         .map(|(_, src)| parse_preset(src, None))
 }
 
+/// The expression vocabulary: the feature/signal names a `[map]` expression may
+/// reference (`bass`, `mid`, `treb`, `loud`, `onset`, `beat`, `width`, …).
+///
+/// Exposed so a source-authoring view can offer did-you-mean hints against the
+/// same canonical list the expression compiler validates against.
+#[must_use]
+pub fn expression_vocabulary() -> &'static [&'static str] {
+    EXPR_VARS
+}
+
+/// The language a scene's source is written in, so a source viewer can label it
+/// — and a future syntax-aware view can branch on it.
+///
+/// Every preset is TOML today; the Luau scripting rung adds [`Lua`](Self::Lua)
+/// with no change to a viewer that reads a [`SceneSource`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    /// A TOML preset (`.toml`).
+    Toml,
+    /// A Luau script (`.lua`).
+    Lua,
+}
+
+impl SourceKind {
+    /// Infer the kind from a path's extension: a `.lua` extension (any case) is
+    /// [`Lua`](Self::Lua); everything else (a `.toml` preset, or no extension)
+    /// is [`Toml`](Self::Toml).
+    #[must_use]
+    pub fn from_path(path: &Path) -> Self {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("lua") => Self::Lua,
+            _ => Self::Toml,
+        }
+    }
+
+    /// A short lowercase label for a pane header (`"toml"` / `"lua"`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Toml => "toml",
+            Self::Lua => "lua",
+        }
+    }
+}
+
+/// A descriptor of where the active scene's source lives, for a source viewer
+/// (scene-author mode) to show.
+///
+/// It carries the source language and a short display label, plus — depending on
+/// where the source lives — either an on-disk [`path`](Self::path) the viewer
+/// reads live (a `--scene-file`) or the embedded [`text`](Self::text) of a
+/// built-in preset compiled into the binary. A viewer is generic over it, so an
+/// on-disk TOML preset, an embedded built-in, and a future Luau script are all
+/// shown the same way.
+#[derive(Clone, Debug)]
+pub struct SceneSource {
+    /// The on-disk path, when the source is a file (a `--scene-file`); `None`
+    /// for a built-in preset compiled into the binary. A viewer reads a path
+    /// source live, so a live reload shows the newly saved bytes.
+    pub path: Option<PathBuf>,
+    /// The source language.
+    pub kind: SourceKind,
+    /// A short human label for a pane header — the file name, or
+    /// `<name> (built-in)` for an embedded preset.
+    pub label: String,
+    /// The embedded source text for a built-in preset. Empty for a file source,
+    /// which a viewer reads live from [`path`](Self::path).
+    pub text: String,
+}
+
+impl SceneSource {
+    /// Describe an on-disk `--scene-file`: infer the kind from the extension and
+    /// label it by file name. The text is left empty — a viewer reads a file
+    /// source live from its path, so a reload shows the current bytes.
+    #[must_use]
+    pub fn from_file(path: &Path) -> Self {
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        Self {
+            path: Some(path.to_path_buf()),
+            kind: SourceKind::from_path(path),
+            label,
+            text: String::new(),
+        }
+    }
+
+    /// Describe a built-in preset by name, carrying its embedded TOML source.
+    /// `None` when `name` is not a built-in preset.
+    #[must_use]
+    pub fn builtin(name: &str) -> Option<Self> {
+        builtin_presets()
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(n, src)| Self {
+                path: None,
+                kind: SourceKind::Toml,
+                label: format!("{n} (built-in)"),
+                text: (*src).to_string(),
+            })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------

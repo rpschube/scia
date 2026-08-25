@@ -33,7 +33,8 @@ pub use palette::{Palette, Rgb};
 pub use preset::{
     Blend, Curve, ExprError, ExprMapping, Feature, Layer, LayerInstance, MapEntry, Mapping,
     MappingSet, PaletteSource, Preset, PresetError, PresetErrorKind, PresetWatcher, ReloadEvent,
-    builtin_preset, builtin_presets, load_preset, parse_preset,
+    SceneSource, SourceKind, builtin_preset, builtin_presets, expression_vocabulary, load_preset,
+    parse_preset,
 };
 pub use registry::{SceneInfo, builtin_scenes, create_builtin, scene_info};
 pub use scene::{ParamSpec, Params, Scene, SceneCtx, SceneState};
