@@ -18,6 +18,19 @@ to grow a GPU window and a desktop-wallpaper mode later.
 - Now-playing metadata and album-art palettes from any player
 - A single small binary, permissively licensed
 
+## Platform notes
+
+- **Windows** — captures the system mix through WASAPI loopback, no setup.
+- **Linux** — captures the system mix through the PipeWire sink monitor (build
+  with the `capture-pipewire` feature); on plain ALSA it falls back to the
+  default input. Inside WSL, see [docs/wsl.md](docs/wsl.md).
+- **macOS** — captures the system mix through a Core Audio process tap on macOS
+  14.4+, after a one-time **System Audio Recording** permission prompt. If you
+  see no audio, grant it under System Settings > Privacy & Security > Screen &
+  System Audio Recording; on older macOS use a loopback device. Full notes,
+  including recovery and the loopback fallback, are in
+  [docs/macos.md](docs/macos.md).
+
 ## Make your own scenes
 
 A scene or preset is one self-contained file you drop next to the built-ins — no

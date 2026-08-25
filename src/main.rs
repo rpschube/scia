@@ -817,6 +817,30 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         eprintln!("  see docs/wsl.md for both paths.");
     }
 
+    // macOS captures the system mix through a Core Audio process tap, which is
+    // gated by the "System Audio Recording" TCC permission. Pre-explain the
+    // prompt before it fires, so a first run is not a surprise dialog over a
+    // black screen; if the tap then delivers nothing (denied or unanswered) the
+    // in-app notice repeats the recovery path (see docs/macos.md).
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!(
+            "note: capturing system audio on macOS uses a Core Audio process tap (macOS 14.4+)."
+        );
+        eprintln!(
+            "  · macOS will ask to allow \"System Audio Recording\" — click Allow to visualize \
+             system audio."
+        );
+        eprintln!(
+            "  · if you denied it before, enable scia under System Settings > Privacy & Security \
+             > Screen & System Audio Recording."
+        );
+        eprintln!(
+            "  · on macOS older than 14.4, install a loopback device (e.g. BlackHole) and select \
+             it with --device. see docs/macos.md."
+        );
+    }
+
     // Device precedence is already merged (flag > config > default) in `resolved`.
     let selector = match &resolved.device {
         Some(name) => DeviceSelector::Named(name.clone()),
@@ -1117,6 +1141,9 @@ fn format_status_line(
     match health {
         EngineHealth::Reconnecting { since_ms, attempts } => {
             suffix.push_str(&format!("  reconnecting… {since_ms}ms attempt {attempts}"));
+        }
+        EngineHealth::Unavailable { message } => {
+            suffix.push_str(&format!("  UNAVAILABLE: {message}"));
         }
         EngineHealth::Failed { error } => {
             suffix.push_str(&format!("  FAILED: {error}"));
