@@ -410,23 +410,35 @@ pub trait CaptureBackend: Send {
 /// [`SampleConsumer`] outside the engine (the P7 raw-ring probe's tap).
 ///
 /// The probe drains the ring on a fixed poll: each poll pops whatever whole
-/// stream of interleaved samples is buffered and hands this timeline the poll's
-/// clock reading (`drain_ns`, on the ring epoch — the same clock
+/// stream of interleaved samples is buffered and hands this timeline an anchor
+/// time for the drain's newest frame (on the ring epoch — the same clock
 /// [`SinkStats::now_ns`] and `FeatureSnapshot::timestamp_ns` share) together
 /// with the number of *frames* popped (interleaved samples ÷ channels).
 ///
+/// The anchor is the **capture-delivery clock**, not the poll's own read time.
+/// The frames a poll pops entered the ring when a capture callback delivered
+/// them; the newest of them was delivered by the most recent push, whose time
+/// [`SinkStats::last_push_ns`] records. Anchoring there measures "when the
+/// samples entered scia's ring" — exactly what `emit → raw-arrival` is defined
+/// to measure. Anchoring on the poll's `now_ns()` instead would fold the probe's
+/// own drain-poll latency (the gap between a callback delivering a packet and the
+/// next poll reading it — larger under a coalesced OS timer) into every
+/// reconstructed time, which is a probe artifact, not capture transport, and
+/// pushes raw-arrival past the engine's `emit → publish` even though ring entry
+/// strictly precedes any hop that carries the sample. [`drain_into_timeline`]
+/// supplies `last_push_ns` as the anchor for this reason.
+///
 /// Bookkeeping, stated exactly so the probe's cross-correlation lands on the
-/// right clock: the frames a poll pops are the most-recently captured frames
-/// still in the ring, so the newest of them was captured about one frame-period
-/// before the poll's clock read and the oldest about `frames` frame-periods
+/// right clock: the newest popped frame was captured about one frame-period
+/// before its delivery (`anchor_ns`) and the oldest about `frames` frame-periods
 /// before it. We therefore place the oldest frame of a drain at
-/// `base = drain_ns − frames × ns_per_frame` and step forward one frame-period
+/// `base = anchor_ns − frames × ns_per_frame` and step forward one frame-period
 /// per frame, so for global frame index `g` (drains are contiguous, so global
 /// indices accumulate across polls)
 /// `sample_time_ns(g) = base + (g − start_frame) × ns_per_frame`. The per-frame
 /// quantum is `1e9 / sample_rate` ns — ~20.8 µs at 48 kHz, far below the
 /// millisecond effects being measured — and the only real error is up to one
-/// poll interval of jitter on `drain_ns`.
+/// push interval of jitter on `anchor_ns`.
 pub struct DrainTimeline {
     ns_per_frame: f64,
     total_frames: u64,
@@ -473,14 +485,16 @@ impl DrainTimeline {
         self.total_frames
     }
 
-    /// Record one drain of `frames` frames read at `drain_ns` (ns on the ring
-    /// epoch). A zero-frame drain is ignored.
-    pub fn record_drain(&mut self, drain_ns: u64, frames: u64) {
+    /// Record one drain of `frames` frames anchored at `anchor_ns` (ns on the
+    /// ring epoch) — the capture-delivery time of the drain's newest frame (one
+    /// frame-period after that frame), i.e. [`SinkStats::last_push_ns`] at the
+    /// drain, not the poll's own read time. A zero-frame drain is ignored.
+    pub fn record_drain(&mut self, anchor_ns: u64, frames: u64) {
         if frames == 0 {
             return;
         }
         let span_ns = (frames as f64 * self.ns_per_frame).round() as u64;
-        let base_ns = drain_ns.saturating_sub(span_ns);
+        let base_ns = anchor_ns.saturating_sub(span_ns);
         self.segments.push(DrainSegment {
             start_frame: self.total_frames,
             frames,
@@ -523,6 +537,50 @@ impl DrainTimeline {
         }
         self.total_frames
     }
+}
+
+/// Drain everything currently buffered from `consumer`, down-mix it to mono,
+/// append it to `mono`, and record the drain in `timeline`. This is the raw-ring
+/// probe's per-poll step, shared by the `latency_probe` example and the synthetic
+/// regression so both reconstruct sample times through one code path.
+///
+/// The drain is anchored to the **capture-delivery clock**
+/// ([`SinkStats::last_push_ns`] — the moment the most recent callback delivered
+/// the newest buffered frame into the ring), read just before the drain so it
+/// names a frame already buffered. That is precisely "the moment the samples
+/// enter scia's ring", the quantity `emit → raw-arrival` measures; anchoring on
+/// the poll's own `now_ns()` instead would fold the probe's drain-poll latency
+/// into every reconstructed time (worse under a coalesced OS timer) and push
+/// raw-arrival past the engine's `emit → publish`, even though ring entry
+/// strictly precedes any hop that carries the sample. A push landing in the tiny
+/// window between the anchor read and [`SampleConsumer::drain_all`] only shifts
+/// the newest few frames sub-millisecond and self-corrects on the next poll.
+///
+/// `scratch` is reused as the interleaved drain buffer (cleared each call);
+/// pre-sizing it and `mono` to the ring capacity keeps the drain allocation-free.
+pub fn drain_into_timeline(
+    consumer: &mut SampleConsumer,
+    scratch: &mut Vec<f32>,
+    mono: &mut Vec<f32>,
+    timeline: &mut DrainTimeline,
+    channels: usize,
+) {
+    let anchor_ns = consumer.stats().last_push_ns.load(Ordering::Acquire);
+    let n = consumer.drain_all(scratch);
+    if n == 0 {
+        return;
+    }
+    let channels = channels.max(1);
+    let frames = n / channels;
+    for f in 0..frames {
+        let base = f * channels;
+        let mut acc = 0.0f32;
+        for c in 0..channels {
+            acc += scratch[base + c];
+        }
+        mono.push(acc / channels as f32);
+    }
+    timeline.record_drain(anchor_ns, frames as u64);
 }
 
 /// Acceptance floor a click's cross-correlation peak must clear for the raw-ring
@@ -713,6 +771,52 @@ mod tests {
         tl.record_drain(1_000_000, 0);
         assert_eq!(tl.total_frames(), 0);
         assert_eq!(tl.sample_time_ns(0), None);
+    }
+
+    #[test]
+    fn drain_into_timeline_anchors_on_capture_delivery_not_poll() {
+        use std::thread::sleep;
+        use std::time::{Duration, Instant};
+
+        let epoch = Instant::now();
+        let (mut sink, mut consumer) = sample_ring(epoch);
+        sink.stats().set_channels(1);
+
+        // A capture callback delivers 480 mono frames (10 ms at 48 kHz) into the
+        // ring after the stream has been running a while; `last_push_ns` records
+        // that delivery time. (The delivery is necessarily at least one buffer
+        // duration into the stream — a 10 ms block cannot arrive before 10 ms.)
+        sleep(Duration::from_millis(12));
+        sink.push(&vec![0.5f32; 480]);
+        let push_ns = consumer.stats().last_push_ns.load(Ordering::Acquire);
+
+        // The probe's drain poll fires much later than the delivery — the coarse,
+        // coalesced-timer regime the field run hit. Anchoring on this poll's read
+        // (`now_ns()`) would inflate every reconstructed sample time by the gap.
+        sleep(Duration::from_millis(20));
+        let poll_ns = consumer.stats().now_ns();
+
+        let mut scratch: Vec<f32> = Vec::new();
+        let mut mono: Vec<f32> = Vec::new();
+        let mut timeline = DrainTimeline::new(48_000);
+        drain_into_timeline(&mut consumer, &mut scratch, &mut mono, &mut timeline, 1);
+
+        assert_eq!(mono.len(), 480, "all delivered frames drained");
+        let newest = timeline
+            .sample_time_ns(timeline.total_frames() - 1)
+            .expect("newest frame has a reconstructed time");
+        // The newest reconstructed time tracks the capture-delivery clock
+        // (within a frame or two), not the ~20 ms-late poll read.
+        assert!(
+            newest <= push_ns + 2_000_000,
+            "newest reconstructed time {newest} should track the delivery clock \
+             {push_ns}, not the late poll"
+        );
+        assert!(
+            poll_ns >= newest + 15_000_000,
+            "the late poll read {poll_ns} must not be folded into the newest \
+             reconstructed time {newest}"
+        );
     }
 
     #[test]

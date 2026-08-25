@@ -47,12 +47,14 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use scia_core::capture::{DrainTimeline, RAW_CORR_ACCEPT, RING_FRAMES, rect_xcorr_peak};
+use scia_core::capture::{
+    DrainTimeline, RAW_CORR_ACCEPT, RING_FRAMES, drain_into_timeline, rect_xcorr_peak,
+};
 use scia_core::{
     CaptureBackend, CaptureError, CaptureTarget, ClickDetector, CpalBackend, Detection, DeviceKind,
     DeviceSelector, Emission, EmitLog, Engine, EngineConfig, EngineError, FeatureReader,
-    LatencyStats, Matcher, Pacing, Percentiles, PerfModeState, SampleConsumer, Signal,
-    StreamHealth, SyntheticBackend, list_devices, sample_ring,
+    LatencyStats, Matcher, Pacing, Percentiles, PerfModeState, Signal, StreamHealth,
+    SyntheticBackend, list_devices, sample_ring,
 };
 
 /// Frames per hop the pipeline runs on — fixed at 256 across the codebase.
@@ -579,10 +581,12 @@ fn run_raw_ring(
     timeline.reserve(observe_ms as usize + 16); // ~one drain per 1 ms poll
 
     // Drain the ring every 1 ms across the observation window, accumulating mono
-    // samples and their capture times; one final drain catches the last tail.
+    // samples and their capture-delivery times; one final drain catches the last
+    // tail. Each drain is anchored to `last_push_ns` (see `drain_into_timeline`),
+    // so the reconstructed times measure ring entry, not the probe's poll read.
     let deadline = Instant::now() + Duration::from_millis(observe_ms);
     while Instant::now() < deadline {
-        drain_once(
+        drain_into_timeline(
             &mut consumer,
             &mut scratch,
             &mut mono,
@@ -591,7 +595,7 @@ fn run_raw_ring(
         );
         sleep(Duration::from_millis(1));
     }
-    drain_once(
+    drain_into_timeline(
         &mut consumer,
         &mut scratch,
         &mut mono,
@@ -689,34 +693,6 @@ fn run_raw_ring(
         eprintln!("only {matched}/{emitted} clicks correlated (< 80%)");
         ExitCode::from(4)
     }
-}
-
-/// Drain everything currently buffered, down-mix it to mono, append it to `mono`,
-/// and record the drain in `timeline`. `drain_ns` is read just before the drain,
-/// so the newest buffered frame sits ~one frame-period before it (see
-/// [`DrainTimeline`]).
-fn drain_once(
-    consumer: &mut SampleConsumer,
-    scratch: &mut Vec<f32>,
-    mono: &mut Vec<f32>,
-    timeline: &mut DrainTimeline,
-    channels: usize,
-) {
-    let drain_ns = consumer.stats().now_ns();
-    let n = consumer.drain_all(scratch);
-    if n == 0 {
-        return;
-    }
-    let frames = n / channels;
-    for f in 0..frames {
-        let base = f * channels;
-        let mut acc = 0.0f32;
-        for c in 0..channels {
-            acc += scratch[base + c];
-        }
-        mono.push(acc / channels as f32);
-    }
-    timeline.record_drain(drain_ns, frames as u64);
 }
 
 // ---------------------------------------------------------------------------
