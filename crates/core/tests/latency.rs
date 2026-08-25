@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use scia_core::capture::{DrainTimeline, RAW_CORR_ACCEPT, rect_xcorr_peak};
+use scia_core::capture::{DrainTimeline, RAW_CORR_ACCEPT, drain_into_timeline, rect_xcorr_peak};
 use scia_core::{
     CaptureBackend, CaptureTarget, ClickDetector, Detection, Emission, EmitLog, Engine,
-    EngineConfig, LatencyStats, Matcher, Pacing, Percentiles, SampleConsumer, Signal, StreamFormat,
+    EngineConfig, LatencyStats, Matcher, Pacing, Percentiles, Signal, StreamFormat,
     SyntheticBackend, sample_ring,
 };
 
@@ -184,10 +184,13 @@ fn synthetic_raw_ring_correlation_is_within_budget() {
     let mut timeline = DrainTimeline::new(sample_rate);
     timeline.reserve(observe_ms as usize + 16);
 
-    // Drain every 1 ms across the observation window, then one final drain.
+    // Drain every 1 ms across the observation window, then one final drain. Each
+    // drain is anchored to the capture-delivery clock (see `drain_into_timeline`),
+    // so the reconstructed sample times measure ring entry — independent of how
+    // coarsely the platform coalesces this poll.
     let deadline = Instant::now() + Duration::from_millis(observe_ms);
     while Instant::now() < deadline {
-        drain_once(
+        drain_into_timeline(
             &mut consumer,
             &mut scratch,
             &mut mono,
@@ -196,7 +199,7 @@ fn synthetic_raw_ring_correlation_is_within_budget() {
         );
         sleep(Duration::from_millis(1));
     }
-    drain_once(
+    drain_into_timeline(
         &mut consumer,
         &mut scratch,
         &mut mono,
@@ -251,42 +254,20 @@ fn synthetic_raw_ring_correlation_is_within_budget() {
         u64::from(matched) * 100 >= u64::from(emitted) * 80,
         "only {matched}/{emitted} clicks correlated (< 80%)"
     );
-    // No hardware and no hop grid: raw-arrival is just the drain/push cadence
-    // (a few ms, and slightly negative because the synthetic backend stamps
-    // emit_ns before the chunk is pushed while the sample time is on the
-    // continuous-capture model — see the probe doc). A loose two-sided bound
-    // proves the machinery without being flaky on shared runners.
+    // No hardware and no hop grid: with the drain anchored to the capture-
+    // delivery clock (`last_push_ns`, not the poll's read), raw-arrival collapses
+    // to a click's sub-chunk offset — roughly −(chunk − k) frame-periods, i.e. a
+    // few ms and slightly negative because the synthetic backend stamps emit_ns at
+    // the chunk push while the leading-edge sample precedes it within the chunk
+    // (see the probe doc). Crucially this no longer carries the probe's poll-lag,
+    // so the bound holds regardless of how coarsely the platform coalesces the
+    // 1 ms drain sleep. A loose two-sided bound proves the machinery without being
+    // flaky on shared runners.
     assert!(
         pct.median.abs() < 10.0,
         "median emit→raw-arrival {:.2} ms should be within ±10 ms of zero",
         pct.median
     );
-}
-
-/// Drain everything buffered, down-mix to mono, append to `mono`, and record the
-/// drain's clock reading — the raw-ring probe's per-poll step.
-fn drain_once(
-    consumer: &mut SampleConsumer,
-    scratch: &mut Vec<f32>,
-    mono: &mut Vec<f32>,
-    timeline: &mut DrainTimeline,
-    channels: usize,
-) {
-    let drain_ns = consumer.stats().now_ns();
-    let n = consumer.drain_all(scratch);
-    if n == 0 {
-        return;
-    }
-    let frames = n / channels;
-    for f in 0..frames {
-        let base = f * channels;
-        let mut acc = 0.0f32;
-        for c in 0..channels {
-            acc += scratch[base + c];
-        }
-        mono.push(acc / channels as f32);
-    }
-    timeline.record_drain(drain_ns, frames as u64);
 }
 
 /// Tracks how much of the published hop stream the observer actually sampled.

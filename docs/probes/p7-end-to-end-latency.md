@@ -134,10 +134,13 @@ Reading:
   (81.3 − 39.9), vs ~15–20 ms expected from the P1 cadence (10 ms loopback
   packet + 5.3 ms hop + polls). Either cpal's output playback timestamp
   underestimates the true chain (making the residual smaller than it looks)
-  or the loopback path buffers more than its packet cadence suggests. A
-  follow-up probe should cross-correlate raw ring samples against the
-  emitted click (sub-millisecond, no hop quantization) before the ≤ 33 ms
-  US-PERF-1 criterion is scored on this endpoint.
+  or the loopback path buffers more than its packet cadence suggests. The
+  follow-up that decomposes this — cross-correlating raw ring samples against
+  the emitted click (sub-millisecond, no hop quantization) — is *Raw-ring
+  mode* below. Its first field run mis-measured because of a drain-timestamp
+  bug (now fixed; see *Raw-ring mode → Field reconciliation*), so a corrected
+  raw-ring run on this endpoint is still owed before the ≤ 33 ms US-PERF-1
+  criterion is scored.
 
 ## Raw-ring mode (`--raw-ring`)
 
@@ -150,7 +153,9 @@ before scia's hop grid touches the samples* — and answers it without the
 DSP hop grid. It opens the same capture backend the engine uses
 (`CaptureBackend::open`) directly into a probe-local sample ring, then drains
 that ring on a 1 ms poll off-thread, accumulating the exact interleaved samples
-(down-mixed to mono) with a per-drain capture timestamp. For each emitted click
+(down-mixed to mono) with each drain anchored to the capture-delivery clock — the
+time the samples entered the ring, not the time the probe read them out (see
+*Timestamp bookkeeping*). For each emitted click
 it runs a **normalized matched-filter cross-correlation** of the captured stream
 against the known click template (a rectangular burst of `--click-ms` at
 `--amp`) over a search window one click spacing wide centered on the click's
@@ -163,14 +168,28 @@ continuous-capture time can fall a few ms *before* the emission; a neighbour
 click is a full spacing away and cannot be picked up, and real transport always
 lands to the right of `emit_ns`.)
 
-**Timestamp bookkeeping.** The frames a poll drains are the most-recently
-captured frames still in the ring, so the newest sits about one frame-period
-before the poll's clock read and the oldest about `frames` frame-periods before
-it. The probe places a drain's oldest frame at `drain_ns − frames ×
-ns_per_frame` and steps one frame-period per frame; the ring clock is the same
-epoch `FeatureSnapshot.timestamp_ns` and the click player's `emit_ns` use, so
+**Timestamp bookkeeping.** A drain is anchored to *when its samples entered the
+ring*, not *when the probe read them out*. The frames a poll drains entered the
+ring when a capture callback delivered them; the newest was delivered by the most
+recent push, whose time the sink records as `last_push_ns` (on the ring epoch).
+The probe reads `last_push_ns` just before the drain and places the drain's oldest
+frame at `last_push_ns − frames × ns_per_frame`, stepping one frame-period per
+frame — so the newest sits about one frame-period before its delivery and the
+oldest about `frames` frame-periods before it. The ring clock is the same epoch
+`FeatureSnapshot.timestamp_ns` and the click player's `emit_ns` use, so
 `emit → raw-arrival` is a difference on one clock. The residual error is a single
-poll interval of jitter on `drain_ns` (sub-millisecond quanta are negligible).
+*push* interval of jitter on the anchor (sub-millisecond quanta are negligible).
+
+Anchoring on the *delivery* clock, not the probe's own poll-read clock, is what
+keeps raw-arrival a true subset of the publish path. A sample enters the ring
+strictly before any hop that carries it can be gathered and published, so
+`emit → raw-arrival ≤ emit → publish` must hold. Anchoring instead on the poll's
+read time would fold the probe's own drain-poll latency into every reconstructed
+time — and that latency balloons whenever the OS coalesces the probe's short poll
+sleeps into a coarse timer (the same ~15.6 ms Windows-timer effect the observer
+hits, noted above). That is a probe artifact, not capture transport; loading it
+into raw-arrival can push it *past* `emit → publish`, breaking the subset
+invariant (see *Field reconciliation* below).
 
 **How to run.**
 
@@ -203,6 +222,25 @@ capture buffering, and the rest is the hop grid plus any output-timestamp error.
 It also does not correct for the output player's own render buffering — subtract
 the main probe's `output delay (cb→play)` from raw-arrival, as with `emit →
 observe`, to reason about the moment a real player's audio is already in the mix.
+
+**Field reconciliation.** An early raw-ring run on the Windows/Realtek endpoint
+reported `emit → raw-arrival ≈ 109.6 ms` median while a same-session normal run
+reported `emit → publish ≈ 81.3 ms`. That ordering is impossible: a sample enters
+the ring before any hop that carries it is published, so raw-arrival is a strict
+subset of publish and must be the *smaller* number. The cause was the drain
+timestamp model, not the pipeline. The probe anchored each drain to its poll-read
+clock (`now_ns()` at the drain) instead of the capture-delivery clock; under the
+coalesced Windows timer the poll fired well after the callback that delivered the
+newest frame, and that ~28 ms poll-to-delivery gap was folded into every
+reconstructed sample time, inflating raw-arrival above publish. The probe now
+anchors on `last_push_ns` (the delivery clock, see *Timestamp bookkeeping*), so
+raw-arrival measures ring entry and the subset invariant holds by construction.
+
+> **Superseded:** the `109.6 ms` raw-ring figure above is a *pre-correction*
+> measurement — an instrumentation artifact, not an endpoint property. Do not
+> compare it against the `81.3 ms` normal-run number or use it to score
+> US-PERF-1. The `81.3 ms` normal-run table stands; only the raw-ring figure was
+> affected. A corrected raw-ring run lands here later via the orchestrator.
 
 **Synthetic self-test.** `--raw-ring --synthetic` (and the
 `crates/core/tests/latency.rs` regression that drives the same library logic)
