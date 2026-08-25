@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
 use scia_core::{Activity, EngineStats, FeatureSnapshot};
-use scia_scenes::{SceneInfo, builtin_scenes};
+use scia_scenes::{SceneInfo, catalog_scenes};
 
 use crate::chrome::ChromeState;
 use crate::devicepick::DevicePicker;
@@ -309,7 +309,7 @@ impl SceneNav {
     /// Build the navigator committed to `initial` (clamped into the registry).
     #[must_use]
     pub fn new(initial: usize) -> Self {
-        let scenes = builtin_scenes();
+        let scenes = catalog_scenes();
         let current = if scenes.is_empty() {
             0
         } else {

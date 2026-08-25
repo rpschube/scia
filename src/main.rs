@@ -353,15 +353,28 @@ fn main() -> ExitCode {
     }
 }
 
-/// Print the registered scenes and the built-in preset names, then exit 0.
+/// Print every scene (built-in and Luau) and the built-in preset names, then
+/// exit 0.
 fn print_scene_list() -> ExitCode {
+    let luau: Vec<&str> = scia_scenes::luau_scene_ids();
     println!("{:<12}  {:<10}  summary", "scene", "mood");
-    for info in scia_scenes::builtin_scenes() {
-        println!("{:<12}  {:<10}  {}", info.id, info.mood, info.summary);
+    for info in scia_scenes::catalog_scenes() {
+        let tag = if luau.contains(&info.id) {
+            " [luau]"
+        } else {
+            ""
+        };
+        println!("{:<12}  {:<10}  {}{tag}", info.id, info.mood, info.summary);
     }
     println!("\npresets:");
     for (name, _) in scia_scenes::builtin_presets() {
         println!("  {name}");
+    }
+    if let Some(dir) = scia_scenes::scenes_dir() {
+        println!(
+            "\nDrop `.lua` scenes in {} to add your own; they list above and load with `--scene <id>`.",
+            dir.display()
+        );
     }
     println!(
         "\nBare `scia` opens the {} scene; pass `--scene {}` for the legacy spectrum-bars renderer.",

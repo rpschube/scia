@@ -173,6 +173,18 @@ impl Canvas {
         self.text_data.clear();
     }
 
+    /// Overwrite this canvas with a copy of `src`, **retaining backing
+    /// capacity** on both stores (a warmed destination reuses its allocations,
+    /// same contract as [`clear`](Self::clear)). Used to hold a scripted scene's
+    /// last good frame across a failed tick without allocating on the hold path.
+    #[inline]
+    pub fn copy_from(&mut self, src: &Canvas) {
+        self.primitives.clone_from(&src.primitives);
+        self.field_data.clone_from(&src.field_data);
+        self.text_data.clone_from(&src.text_data);
+        self.aspect = src.aspect;
+    }
+
     /// Set the aspect ratio (width / height in physical units).
     #[inline]
     pub fn set_aspect(&mut self, aspect: f32) {

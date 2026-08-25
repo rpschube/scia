@@ -157,7 +157,14 @@ impl SceneState {
 /// receives the newest features and the elapsed time `dt` in seconds; `render`
 /// draws the current state onto a cleared canvas. `state` / `restore` are
 /// optional and default to carrying nothing.
-pub trait Scene: Send {
+///
+/// A scene is driven entirely on the render thread and is never sent across a
+/// thread boundary: the built-in scenes are plain data, and a scripted
+/// [`crate::luau::LuauScene`] owns a Luau VM whose in-place feature/canvas
+/// bridges are single-threaded by design. The trait therefore carries no `Send`
+/// bound — a preset (plain, `Send` data) crosses the hot-reload thread, the
+/// live scene it instantiates never does.
+pub trait Scene {
     /// A stable machine identifier, e.g. `"spectra"`.
     fn id(&self) -> &'static str;
 
