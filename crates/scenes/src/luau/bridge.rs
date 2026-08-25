@@ -68,6 +68,43 @@ impl UserData for FeaturesUd {
     }
 }
 
+/// The scalar feature-API field names a Luau scene reads off the `features`
+/// userdata, in the order they are defined above.
+///
+/// This list is the single source of truth for the scripting feature vocabulary
+/// and must stay in step with the `add_field_method_get` getters in
+/// [`FeaturesUd::add_fields`] just above — the names a script may write as
+/// `features.<name>`. A source-authoring view offers did-you-mean hints against
+/// it (the `.lua` twin of [`crate::expression_vocabulary`], which serves the
+/// TOML `[map]` expression vocabulary instead).
+static FEATURE_VOCABULARY: &[&str] = &[
+    "rms",
+    "loud",
+    "peak",
+    "flux",
+    "onset",
+    "onset_age",
+    "bass",
+    "mid",
+    "treb",
+    "beat_phase",
+    "beat",
+    "tempo",
+    "quiet_ms",
+    "width",
+    "bar_count",
+];
+
+/// The scalar feature-API field names a Luau scene may read (`rms`, `loud`,
+/// `bass`, `beat`, `width`, …) — the scripting-side vocabulary, mirrored from the
+/// `features` userdata getters in this module. Exposed so scene-author mode can
+/// offer did-you-mean hints for a `.lua` source against the same names the bridge
+/// actually serves.
+#[must_use]
+pub fn luau_feature_vocabulary() -> &'static [&'static str] {
+    FEATURE_VOCABULARY
+}
+
 /// The abstract canvas, shared with the host. Each method clamps through the
 /// real [`Canvas`] builders (coordinates/sizes to `0.0..=1.0`, `NaN`→`0.0`,
 /// palette slot to `0..=7`), so a scripted scene can never push garbage into the
@@ -200,4 +237,42 @@ pub(crate) fn write_params(
         table.set(spec.key, v.clamp(spec.min, spec.max))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feature_vocabulary_is_the_documented_set_without_duplicates() {
+        // The vocabulary the source-authoring view offers hints against. This
+        // locks the exact list; the sibling integration test proves every name is
+        // a live `features` getter, so the two together keep this in step with the
+        // bridge above.
+        let vocab = luau_feature_vocabulary();
+        assert_eq!(
+            vocab,
+            &[
+                "rms",
+                "loud",
+                "peak",
+                "flux",
+                "onset",
+                "onset_age",
+                "bass",
+                "mid",
+                "treb",
+                "beat_phase",
+                "beat",
+                "tempo",
+                "quiet_ms",
+                "width",
+                "bar_count",
+            ]
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for name in vocab {
+            assert!(seen.insert(*name), "no duplicate in the vocabulary: {name}");
+        }
+    }
 }

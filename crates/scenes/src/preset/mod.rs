@@ -1521,6 +1521,21 @@ impl SceneSource {
         }
     }
 
+    /// Describe a shipped (embedded) Luau scene by name, carrying its bundled
+    /// `.lua` source text. Read-only and unwatched — there is no drop-in file —
+    /// labeled like a built-in preset (`<name> (built-in)`), so scene-author mode
+    /// shows a shipped scene the same way it shows a compiled-in TOML preset. A
+    /// drop-in Luau scene has a file instead and uses [`from_file`](Self::from_file).
+    #[must_use]
+    pub fn luau_builtin(name: &str, source: &str) -> Self {
+        Self {
+            path: None,
+            kind: SourceKind::Lua,
+            label: format!("{name} (built-in)"),
+            text: source.to_string(),
+        }
+    }
+
     /// Describe a built-in preset by name, carrying its embedded TOML source.
     /// `None` when `name` is not a built-in preset.
     #[must_use]

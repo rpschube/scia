@@ -15,8 +15,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
 use scia_scenes::{
-    Blend, Canvas, LayerInstance, MapEntry, Palette, ParamSpec, Params, Preset, Rgb,
-    catalog_scene_info, catalog_scenes, scene_preset,
+    Blend, Canvas, LayerInstance, MapEntry, MappingSet, Palette, ParamSpec, Params, Preset, Rgb,
+    Scene, SceneCtx, catalog_scene_info, catalog_scenes, scene_preset,
 };
 
 use crate::mosaic::{CellGrid, FrameBuffer, TextRun, Tier};
@@ -452,8 +452,62 @@ impl ScenePresenter {
         self.outgoing_palette = self.palette;
         self.palette = preset.palette();
 
-        // Allocate (or reuse) the outgoing buffer at the current geometry for the
-        // active mode.
+        self.begin_swap_fade();
+    }
+
+    /// Swap in a freshly recompiled Luau scene as the sole layer, crossfading
+    /// from the current layers exactly as [`swap_preset`](Self::swap_preset) does.
+    ///
+    /// The `.lua` hot-reload path uses this: the Luau watcher hands back
+    /// re-validated source, the run loop rebuilds a live scene from it (via
+    /// [`scia_scenes::rebuild_luau_scene`]) and swaps it in here. Continuity
+    /// carries when the incoming scene's id matches the outgoing layer-0 scene
+    /// (an edit that keeps the manifest id — the usual case), so the animation
+    /// does not visibly reset across a reload. The incoming scene is initialized
+    /// with an empty parameter bag, so it falls back to its own manifest defaults;
+    /// a synthesized Luau `--scene` preset carries no `[map]` mappings, so the new
+    /// layer has none. The palette is left unchanged: a reload alters the scene's
+    /// geometry and logic, not its colours, so any applied album-art palette holds.
+    pub fn swap_scene(&mut self, mut scene: Box<dyn Scene>) {
+        let aspect = self.canvas.aspect();
+
+        // Carry scene continuity when the incoming id matches the outgoing one.
+        if let Some(old) = self.layers.first() {
+            if old.scene.id() == scene.id() {
+                scene.restore(old.scene.state());
+            }
+        }
+        let ctx = SceneCtx::new(aspect, self.palette, Params::new());
+        scene.init(&ctx);
+
+        let incoming = vec![LayerInstance {
+            scene,
+            blend: Blend::Over,
+            intensity: 1.0,
+            mappings: MappingSet::default(),
+        }];
+        let mut incoming_params = Vec::with_capacity(incoming.len());
+        for layer in &incoming {
+            let mut p = Params::new();
+            layer.mappings.seed(&mut p);
+            incoming_params.push(p);
+        }
+
+        self.outgoing = std::mem::replace(&mut self.layers, incoming);
+        self.outgoing_params = std::mem::replace(&mut self.params, incoming_params);
+        self.outgoing_palette = self.palette;
+        // The palette is unchanged, so both stacks fade with the same colours.
+
+        self.begin_swap_fade();
+    }
+
+    /// Begin a 300 ms cross-fade from the outgoing layers to the current ones:
+    /// allocate (or reuse) the outgoing raster buffer at the current geometry for
+    /// the active mode, arm the [`fade`](Self::fade), and abandon any in-flight
+    /// palette fade rather than let it fight the swap. Shared by
+    /// [`swap_preset`](Self::swap_preset) and [`swap_scene`](Self::swap_scene),
+    /// which have already moved the layers into place.
+    fn begin_swap_fade(&mut self) {
         match self.mode {
             PresenterMode::Mosaic(tier) => {
                 self.fb_out.resize(self.cols, self.rows, tier);
@@ -466,8 +520,6 @@ impl ScenePresenter {
             }
         }
         self.fade = Some(Fade { elapsed: 0.0 });
-        // A preset swap sets its own palette; abandon any in-flight palette fade
-        // rather than let it fight the new scene's colours.
         self.palette_fade = None;
     }
 
@@ -1015,6 +1067,67 @@ mod tests {
             "the replaced mapping drives the bag: {}",
             p.layer0_value("punch")
         );
+    }
+
+    #[test]
+    fn swap_scene_crossfades_to_a_rebuilt_luau_scene() {
+        use scia_scenes::{LuauSource, compile_manifest, rebuild_luau_scene};
+
+        // Start on a built-in scene, then hot-swap in a freshly rebuilt Luau
+        // scene the way the .lua reload path does: rebuild from re-validated
+        // source, then swap_scene. The swap must crossfade (not snap), retarget
+        // layer-0 to the new scene, and visibly change the rendered frame.
+        let preset = builtin_preset("spectra")
+            .expect("spectra is a built-in preset")
+            .expect("spectra parses");
+        let mut p = ScenePresenter::from_preset(&preset, Tier::Half);
+        let (cols, rows) = (24u16, 12u16);
+        p.resize(cols, rows);
+
+        let mut snap = FeatureSnapshot::default();
+        for (i, bar) in snap.spectrum.iter_mut().enumerate() {
+            *bar = 0.4 + 0.5 * ((i % 5) as f32) / 5.0;
+        }
+        snap.spectrum_len = snap.spectrum.len() as u16;
+
+        for _ in 0..40 {
+            p.frame(&snap, 0.05);
+        }
+        let before = snapshot_buffer(&p, cols, rows);
+        assert_eq!(p.layer0_scene_id(), Some("spectra"));
+
+        // A distinctive scene: fill the whole canvas so the frame is unmistakably
+        // different from spectra's bars once the fade completes.
+        let src = r#"
+        return {
+          id = "orbit",
+          mood = "kinetic",
+          summary = "a full-canvas fill",
+          update = function(f, dt) end,
+          render = function(c) c:bar(0.0, 0.0, 1.0, 1.0, 5, 1.0) end,
+        }
+        "#;
+        let source = LuauSource {
+            source: src.to_string(),
+            manifest: compile_manifest(src, "orbit").expect("valid manifest"),
+        };
+        let scene = rebuild_luau_scene(&source).expect("rebuilds");
+        p.swap_scene(scene);
+
+        assert!(p.is_fading(), "the swap crossfades rather than snapping");
+        assert_eq!(
+            p.layer0_scene_id(),
+            Some("orbit"),
+            "layer-0 retargets to the swapped scene"
+        );
+
+        // Run past the fade; the rendered frame reflects the new scene.
+        for _ in 0..20 {
+            p.frame(&snap, 0.05);
+        }
+        assert!(!p.is_fading(), "the fade completes");
+        let after = snapshot_buffer(&p, cols, rows);
+        assert_ne!(before, after, "the hot-swapped scene changed the frame");
     }
 
     #[test]

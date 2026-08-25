@@ -63,9 +63,10 @@ use crate::scene::{ParamSpec, Scene, SceneCtx, SceneState};
 
 use bridge::{CanvasUd, FeaturesUd, write_params};
 
+pub use bridge::luau_feature_vocabulary;
 pub use catalog::{
     catalog_scene_info, catalog_scenes, create_scene, is_luau_scene, luau_scene_ids,
-    luau_scene_path, scene_preset,
+    luau_scene_path, rebuild_luau_scene, scene_preset,
 };
 pub use discover::{DEFAULT_SCENES_SUBDIR, scenes_dir, shipped_scenes};
 pub use watch::{LuauReloadEvent, LuauSource, LuauWatcher};
