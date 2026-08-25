@@ -145,14 +145,27 @@ pub fn rebuild_luau_scene(source: &LuauSource) -> Result<Box<dyn Scene>, LuauErr
 }
 
 /// A preset for scene `id`, for the `--scene`/browser path: the built-in TOML
-/// preset when one exists, otherwise a synthesized bare preset that runs the
-/// Luau scene with its manifest defaults and the default palette.
+/// preset when one exists, then a `.toml` drop-in preset in the config dir,
+/// otherwise a synthesized bare preset that runs the Luau scene with its
+/// manifest defaults and the default palette.
 ///
-/// Returns `None` only when `id` is neither a built-in preset nor a Luau scene.
+/// Resolution order encodes the collision rule — **built-ins win**: a built-in
+/// preset is checked first, so a drop-in can never shadow it; drop-in discovery
+/// itself already refuses any name a built-in scene, a built-in preset, or a
+/// Luau scene owns (see [`crate::preset::discover`]), so the fall-through to the
+/// Luau catalog is never reached for a name a drop-in claimed.
+///
+/// Returns `None` only when `id` is neither a built-in preset, a drop-in preset,
+/// nor a Luau scene.
 #[must_use]
 pub fn scene_preset(id: &str) -> Option<Result<Preset, PresetError>> {
     if let Some(preset) = builtin_preset(id) {
         return Some(preset);
+    }
+    // A `.toml` drop-in in `<config_dir>/presets` is reachable by name, exactly
+    // like a built-in preset. Discovery already validated it, so it is `Ok`.
+    if let Some(preset) = crate::preset::discovered_preset(id) {
+        return Some(Ok(preset));
     }
     let entry = catalog().luau.iter().find(|e| e.info.id == id)?;
     Some(Ok(Preset::for_scene(entry.info, default_palette())))

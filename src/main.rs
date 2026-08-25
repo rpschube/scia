@@ -605,9 +605,18 @@ fn print_scene_list() -> ExitCode {
     for (name, _) in scia_scenes::builtin_presets() {
         println!("  {name}");
     }
+    for name in scia_scenes::discovered_preset_names() {
+        println!("  {name} [drop-in]");
+    }
     if let Some(dir) = scia_scenes::scenes_dir() {
         println!(
             "\nDrop `.lua` scenes in {} to add your own; they list above and load with `--scene <id>`.",
+            dir.display()
+        );
+    }
+    if let Some(dir) = scia_scenes::presets_dir() {
+        println!(
+            "Drop `.toml` presets in {} to add your own; they list above and load with `--scene <name>`.",
             dir.display()
         );
     }

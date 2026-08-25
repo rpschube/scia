@@ -42,9 +42,12 @@ use crate::palette::{Palette, Rgb};
 use crate::registry::{create_builtin, scene_info};
 use crate::scene::{ParamSpec, Params, Scene, SceneCtx};
 
+mod discover;
 mod expr;
 mod watch;
 
+pub(crate) use discover::discovered_preset;
+pub use discover::{DEFAULT_PRESETS_SUBDIR, discovered_preset_names, presets_dir};
 use expr::{CompiledExpr, EXPR_VARS, ExprCompileError, ExprEnv, ONSET_TAU};
 pub use watch::{PresetWatcher, ReloadEvent};
 
