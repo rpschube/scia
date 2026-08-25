@@ -63,7 +63,11 @@ jobs:
           cargo build -p scia-core --example capture_probe "${features[@]}"
           cargo build -p scia-core --example latency_probe "${features[@]}"
           cargo build -p scia-core --example beat_probe "${features[@]}"
-          cargo build --bin scia "${features[@]}"
+          # The scia binary is what staging machines run INTERACTIVELY: a debug
+          # build renders frames 10-50x slower than release, overruns the frame
+          # budget on modest hardware, and starves input — so it, alone, is
+          # built with the release profile (fat LTO per Cargo.toml).
+          cargo build --release --bin scia "${features[@]}"
 
       - name: Collect
         shell: bash
@@ -73,7 +77,7 @@ jobs:
           cp target/debug/examples/capture_probe* out/ 2>/dev/null || true
           cp target/debug/examples/latency_probe* out/ 2>/dev/null || true
           cp target/debug/examples/beat_probe* out/ 2>/dev/null || true
-          cp target/debug/scia* out/ 2>/dev/null || true
+          cp target/release/scia* out/ 2>/dev/null || true
           rm -f out/*.d out/*.pdb
           ls -la out
 
