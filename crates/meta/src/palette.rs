@@ -22,13 +22,36 @@
 //!
 //! `decode → crop uniform near-black padding → downscale to ~64×64 → k-means
 //! (k=8) in Oklab with deterministic k-means++ seeding → order clusters by
-//! population → derive dominant / accents / light / dark / slots`.
+//! salience (population × vibrancy) → derive dominant / accents / light / dark
+//! / slots`.
 //!
 //! The Oklab conversion follows Björn Ottosson, "A perceptual color space for
 //! image processing" (<https://bottosson.github.io/posts/oklab/>); the matrix
 //! coefficients below are taken verbatim from that reference. Working in Oklab
 //! makes "distinct hue" and "lighter / darker" mean what the eye expects
 //! rather than what raw sRGB arithmetic produces.
+//!
+//! # Vibrancy-biased cluster scoring
+//!
+//! Ranking clusters by population alone lets a large dull background or a broad
+//! shadow beat the small, vivid region that actually defines the artwork, so
+//! palettes come out grey and neutral. Instead each cluster is scored by
+//! *salience* = `population × vibrancy_weight`, where the vibrancy weight is a
+//! monotonic function of the cluster's OKLCh **chroma** (`sqrt(a² + b²)` in
+//! Oklab), gated so that near-black clusters cannot win on chroma alone. A
+//! genuinely colourful minority region thus outranks a dull majority, while
+//! near-black vivid-hue pixels — which read as dark, not vibrant — do not
+//! displace a genuinely vivid mid-lightness cluster.
+//!
+//! **Honesty floor.** If *no* cluster's chroma reaches
+//! [`VIBRANCY_MIN_CHROMA`], the artwork is treated as genuinely neutral and
+//! clusters keep their population order (exactly the pre-vibrancy behaviour):
+//! the scorer never invents colour that isn't meaningfully present in the art.
+//!
+//! Chroma, not HSV saturation, is the vibrancy signal on purpose: a near-black
+//! pixel of a pure hue is fully *saturated* yet has low Oklab *chroma* and
+//! reads as black, so chroma (reinforced by a lightness gate) captures "how
+//! colourful this actually looks" far better than saturation would.
 //!
 //! # Spotify / SMTC quirk absorbed here
 //!
@@ -48,11 +71,12 @@ use image::imageops::FilterType;
 /// All colours are 24-bit sRGB `[r, g, b]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtPalette {
-    /// The most populous colour in the artwork — the visual "key" colour.
+    /// The most salient colour in the artwork (population × vibrancy; plain
+    /// population on genuinely neutral art) — the visual "key" colour.
     pub dominant: [u8; 3],
     /// Further colours that are perceptually distinct from the dominant and
-    /// from each other, ordered by population. May be empty (e.g. monochrome
-    /// art). At most [`MAX_ACCENTS`] entries.
+    /// from each other, ordered by salience (population × vibrancy). May be
+    /// empty (e.g. monochrome art). At most [`MAX_ACCENTS`] entries.
     pub accents: Vec<[u8; 3]>,
     /// A lighter variant of the dominant, suitable as a background or a light
     /// foreground anchor. Guaranteed no darker than [`dominant`].
@@ -105,17 +129,79 @@ pub const MAX_ACCENTS: usize = 4;
 /// Maximum Lloyd iterations; k-means on a downscaled image converges quickly.
 const MAX_ITERS: usize = 24;
 
+// --- Vibrancy scoring (see the module-level "Vibrancy-biased cluster scoring"
+// section). Salience = population × vibrancy_weight; the weight is chroma-driven
+// with a lightness gate, and the honesty floor disables it on neutral art.
+
+/// Honesty floor: if no cluster's OKLCh chroma reaches this, the artwork is
+/// treated as genuinely neutral and clusters keep their population order — the
+/// scorer never promotes a faintly tinted cluster over the true majority.
+const VIBRANCY_MIN_CHROMA: f32 = 0.045;
+/// Chroma normalised against this before shaping; at or above it a cluster is
+/// treated as fully vibrant. Sits just below the chroma of a saturated mid
+/// primary so ordinary album colours reach full weight.
+const CHROMA_REF: f32 = 0.125;
+/// Exponent shaping the chroma → weight ramp. `> 1` sharpens the preference for
+/// genuinely colourful clusters over faintly tinted ones.
+const CHROMA_EXP: f32 = 1.6;
+/// Weight floor so mid- and low-chroma clusters are down-weighted, never zeroed:
+/// a cluster with real area still carries some salience.
+const WEIGHT_FLOOR: f32 = 0.06;
+/// Lightness below which a cluster is too dark to read as vibrant whatever its
+/// chroma — the gate that stops a large near-black region (even a pure-hue one)
+/// from out-scoring a genuinely vivid mid-lightness cluster.
+const DARK_L: f32 = 0.22;
+/// Lightness at or above which the darkness gate imposes no penalty.
+const MID_L: f32 = 0.45;
+/// Floor for the darkness gate, so ordering stays well-defined on an all-dark
+/// image (nothing is multiplied to exactly zero).
+const DARK_FLOOR: f32 = 0.10;
+
+/// How clusters are ranked before the dominant colour and accents are chosen.
+///
+/// [`extract`] always uses [`Scoring::Vibrancy`]; the population variant exists
+/// so the `palette_swatch` maintainer example (and tests) can show the old,
+/// grey-prone ranking side by side with the new one. Selecting a scoring never
+/// changes the clustering itself — only which clusters win.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scoring {
+    /// Rank clusters by pixel population alone — the pre-vibrancy behaviour,
+    /// which lets large dull regions dominate. Retained for A/B comparison.
+    Population,
+    /// Rank clusters by salience (population × vibrancy), biasing the palette
+    /// toward the colours that perceptually define the art. This is the default
+    /// [`extract`] uses; see the module-level "Vibrancy-biased cluster scoring".
+    Vibrancy,
+}
+
 /// Extract a palette from raw encoded artwork bytes.
 ///
 /// Pure and synchronous — see the module docs for the off-render-path
 /// contract. Returns [`PaletteError::Decode`] only when `bytes` is not a
 /// decodable image; tiny and monochrome images yield a valid palette.
 ///
+/// Uses [`Scoring::Vibrancy`]; call [`extract_scored`] to choose the ranking.
+///
 /// # Errors
 ///
 /// [`PaletteError::Decode`] if the bytes are not a supported/valid image,
 /// [`PaletteError::Empty`] if the decoded image has no pixels.
 pub fn extract(bytes: &[u8]) -> Result<ArtPalette, PaletteError> {
+    extract_scored(bytes, Scoring::Vibrancy)
+}
+
+/// Extract a palette using an explicit cluster [`Scoring`].
+///
+/// Identical to [`extract`] except the ranking strategy is chosen by the
+/// caller. Decoding, cropping, downscaling and k-means are unchanged between
+/// scorings; only the order clusters are ranked in — and therefore which one
+/// becomes the dominant colour and which become accents — differs.
+///
+/// # Errors
+///
+/// [`PaletteError::Decode`] if the bytes are not a supported/valid image,
+/// [`PaletteError::Empty`] if the decoded image has no pixels.
+pub fn extract_scored(bytes: &[u8], scoring: Scoring) -> Result<ArtPalette, PaletteError> {
     let img = image::load_from_memory(bytes).map_err(|e| PaletteError::Decode(e.to_string()))?;
     let rgb = img.to_rgb8();
     let (w, h) = rgb.dimensions();
@@ -147,7 +233,7 @@ pub fn extract(bytes: &[u8]) -> Result<ArtPalette, PaletteError> {
         .map(|p| Oklab::from_srgb(p.0[0], p.0[1], p.0[2]))
         .collect();
 
-    let clusters = kmeans(&samples);
+    let clusters = rank_clusters(kmeans(&samples), scoring);
     Ok(build_palette(&clusters))
 }
 
@@ -323,7 +409,55 @@ fn kmeans(samples: &[Oklab]) -> Vec<Cluster> {
     clusters
 }
 
-/// Derive the reported palette from population-ordered clusters.
+/// Re-rank population-ordered clusters according to `scoring`.
+///
+/// [`Scoring::Population`] is a no-op ([`kmeans`] already returns clusters most
+/// populous first). [`Scoring::Vibrancy`] re-orders by salience
+/// (population × [`vibrancy_weight`]) so the perceptually defining colours win
+/// — unless the honesty floor fires, in which case the population order stands
+/// (see the module-level "Vibrancy-biased cluster scoring").
+fn rank_clusters(mut clusters: Vec<Cluster>, scoring: Scoring) -> Vec<Cluster> {
+    if scoring == Scoring::Population {
+        return clusters;
+    }
+    // Honesty floor: genuinely neutral art (no cluster clears the minimum
+    // chroma) keeps its population order, so we never invent colour.
+    let max_chroma = clusters
+        .iter()
+        .map(|c| c.mean.chroma())
+        .fold(0.0_f32, f32::max);
+    if max_chroma < VIBRANCY_MIN_CHROMA {
+        return clusters;
+    }
+    // Salience = population × vibrancy_weight. `total_cmp` gives a deterministic
+    // order; ties fall back to population so the ranking is stable and the same
+    // bytes always produce the same palette.
+    clusters.sort_by(|a, b| {
+        let sa = a.count as f32 * vibrancy_weight(&a.mean);
+        let sb = b.count as f32 * vibrancy_weight(&b.mean);
+        sb.total_cmp(&sa).then_with(|| b.count.cmp(&a.count))
+    });
+    clusters
+}
+
+/// Vibrancy weight for a cluster mean: a chroma-driven factor times a lightness
+/// gate, both in `[0, 1]`-ish range.
+///
+/// The chroma factor is a monotonic function of OKLCh chroma — normalised
+/// against [`CHROMA_REF`], raised to [`CHROMA_EXP`], lifted off zero by
+/// [`WEIGHT_FLOOR`] so mid-chroma colours still count. The lightness gate
+/// linearly ramps from [`DARK_FLOOR`] below [`DARK_L`] up to `1.0` at
+/// [`MID_L`], so a near-black cluster — however pure its hue — cannot win on
+/// chroma alone.
+fn vibrancy_weight(c: &Oklab) -> f32 {
+    let norm = (c.chroma() / CHROMA_REF).clamp(0.0, 1.0);
+    let chroma_w = WEIGHT_FLOOR + (1.0 - WEIGHT_FLOOR) * norm.powf(CHROMA_EXP);
+    let lit = ((c.l - DARK_L) / (MID_L - DARK_L)).clamp(0.0, 1.0);
+    let light_gate = DARK_FLOOR + (1.0 - DARK_FLOOR) * lit;
+    chroma_w * light_gate
+}
+
+/// Derive the reported palette from ranked clusters.
 fn build_palette(clusters: &[Cluster]) -> ArtPalette {
     // `kmeans` never returns an empty vec for a non-empty image, but stay total.
     let dom_lab = clusters.first().map_or(Oklab::GREY, |c| c.mean);
@@ -546,6 +680,14 @@ impl Oklab {
             (linear_to_srgb(g) * 255.0).round().clamp(0.0, 255.0) as u8,
             (linear_to_srgb(b) * 255.0).round().clamp(0.0, 255.0) as u8,
         ]
+    }
+
+    /// OKLCh chroma: distance from the neutral axis, `sqrt(a² + b²)`. A
+    /// perceptual measure of colourfulness that — unlike HSV saturation — is
+    /// low for near-black and near-white colours, which is what makes it the
+    /// right vibrancy signal (see [`vibrancy_weight`]).
+    fn chroma(&self) -> f32 {
+        self.a.hypot(self.b)
     }
 
     /// Squared Euclidean distance in Oklab (a fine perceptual metric here).
@@ -1030,5 +1172,210 @@ mod tests {
         // Neutrals climb in lightness across 5→6→7.
         assert!(lightness(pal.slots[5]) < lightness(pal.slots[6]));
         assert!(lightness(pal.slots[6]) < lightness(pal.slots[7]));
+    }
+
+    // --- Vibrancy-biased scoring ------------------------------------------
+
+    /// OKLCh chroma of an sRGB triple, for assertions.
+    fn chroma(c: [u8; 3]) -> f32 {
+        Oklab::from_srgb(c[0], c[1], c[2]).chroma()
+    }
+
+    /// OKLCh hue angle in degrees `[0, 360)` of an sRGB triple.
+    fn hue_deg(c: [u8; 3]) -> f32 {
+        let o = Oklab::from_srgb(c[0], c[1], c[2]);
+        let d = o.b.atan2(o.a).to_degrees();
+        if d < 0.0 { d + 360.0 } else { d }
+    }
+
+    /// Smallest absolute hue difference on the colour circle, in degrees.
+    fn hue_diff(a: f32, b: f32) -> f32 {
+        let d = (a - b).abs() % 360.0;
+        d.min(360.0 - d)
+    }
+
+    /// Four equal quadrants: `[top-left, top-right, bottom-left, bottom-right]`.
+    fn quadrants(w: u32, h: u32, cs: [[u8; 3]; 4]) -> RgbImage {
+        ImageBuffer::from_fn(w, h, |x, y| {
+            let i = usize::from(x >= w / 2) + 2 * usize::from(y >= h / 2);
+            Rgb(cs[i])
+        })
+    }
+
+    /// A solid `bg` with a centred rectangular `subject` patch covering roughly
+    /// `frac` of the total image area.
+    fn bg_with_subject(w: u32, h: u32, bg: [u8; 3], subject: [u8; 3], frac: f32) -> RgbImage {
+        let side = frac.sqrt();
+        let sw = (w as f32 * side) as u32;
+        let sh = (h as f32 * side) as u32;
+        let x0 = (w - sw) / 2;
+        let y0 = (h - sh) / 2;
+        ImageBuffer::from_fn(w, h, |x, y| {
+            if x >= x0 && x < x0 + sw && y >= y0 && y < y0 + sh {
+                Rgb(subject)
+            } else {
+                Rgb(bg)
+            }
+        })
+    }
+
+    /// Every reported palette colour (dominant then accents), in rank order.
+    fn palette_order(pal: &ArtPalette) -> Vec<[u8; 3]> {
+        std::iter::once(pal.dominant)
+            .chain(pal.accents.iter().copied())
+            .collect()
+    }
+
+    /// Does any palette colour carry real chroma and sit within `tol` degrees of
+    /// `target`'s hue?
+    fn palette_has_hue(pal: &ArtPalette, target: [u8; 3], tol: f32) -> bool {
+        palette_order(pal).iter().any(|c| {
+            chroma(*c) > VIBRANCY_MIN_CHROMA && hue_diff(hue_deg(*c), hue_deg(target)) <= tol
+        })
+    }
+
+    /// Fixture 1: vivid multi-colour art — the extracted palette's hues match
+    /// the four source hues, and nothing else is invented.
+    #[test]
+    fn vivid_multicolor_palette_matches_source_hues() {
+        let red = [220, 40, 40];
+        let green = [40, 190, 70];
+        let blue = [40, 70, 210];
+        let yellow = [230, 200, 40];
+        let img = quadrants(160, 160, [red, green, blue, yellow]);
+        let pal = extract(&png_bytes(&img)).expect("extract");
+        for src in [red, green, blue, yellow] {
+            assert!(
+                palette_has_hue(&pal, src, 25.0),
+                "source hue {src:?} missing from palette {:?}",
+                palette_order(&pal)
+            );
+        }
+        for c in palette_order(&pal) {
+            let near = [red, green, blue, yellow]
+                .iter()
+                .any(|s| hue_diff(hue_deg(c), hue_deg(*s)) <= 25.0);
+            assert!(near, "invented colour {c:?} matches no source hue");
+        }
+    }
+
+    /// Fixture 2: duotone — both source hues appear and no third hue is invented.
+    #[test]
+    fn duotone_palette_has_both_hues_and_no_third() {
+        let teal = [30, 170, 175];
+        let magenta = [200, 40, 160];
+        let img = two_tone(160, 160, 0.55, teal, magenta);
+        let pal = extract(&png_bytes(&img)).expect("extract");
+        assert!(
+            palette_has_hue(&pal, teal, 25.0),
+            "teal missing from {:?}",
+            palette_order(&pal)
+        );
+        assert!(
+            palette_has_hue(&pal, magenta, 25.0),
+            "magenta missing from {:?}",
+            palette_order(&pal)
+        );
+        for c in palette_order(&pal) {
+            let near = hue_diff(hue_deg(c), hue_deg(teal)) <= 25.0
+                || hue_diff(hue_deg(c), hue_deg(magenta)) <= 25.0;
+            assert!(near, "invented colour {c:?} in a duotone palette");
+        }
+    }
+
+    /// Fixture 3: genuinely neutral art stays neutral — the honesty floor holds
+    /// and the ranking is identical to population scoring (no colour invented).
+    #[test]
+    fn neutral_art_stays_neutral_honesty_floor() {
+        let img = ImageBuffer::from_fn(160, 160, |_x, y| {
+            let g = match y / 40 {
+                0 => 40u8,
+                1 => 100,
+                2 => 150,
+                _ => 200,
+            };
+            Rgb([g, g, g])
+        });
+        let bytes = png_bytes(&img);
+        let pal = extract(&bytes).expect("extract");
+        for c in palette_order(&pal) {
+            assert!(
+                chroma(c) < VIBRANCY_MIN_CHROMA,
+                "neutral art produced chromatic colour {c:?} (chroma {})",
+                chroma(c)
+            );
+        }
+        let pop = extract_scored(&bytes, Scoring::Population).expect("pop");
+        assert_eq!(
+            pal, pop,
+            "the honesty floor must leave neutral art on population order"
+        );
+    }
+
+    /// Fixture 4: large dull background + small vivid subject. Population scoring
+    /// picks the dull background; vibrancy scoring makes the vivid subject win.
+    #[test]
+    fn vivid_subject_outranks_dull_background() {
+        let dull_bg = [120, 112, 104];
+        let vivid = [225, 45, 45];
+        let img = bg_with_subject(160, 160, dull_bg, vivid, 0.18);
+        let bytes = png_bytes(&img);
+
+        let pop = extract_scored(&bytes, Scoring::Population).expect("pop");
+        assert!(
+            chroma(pop.dominant) < 0.05,
+            "population dominant should be the dull bg, got {:?} (chroma {})",
+            pop.dominant,
+            chroma(pop.dominant)
+        );
+
+        let vib = extract(&bytes).expect("vib");
+        assert!(
+            hue_diff(hue_deg(vib.dominant), hue_deg(vivid)) <= 25.0 && chroma(vib.dominant) > 0.08,
+            "vibrancy dominant should be the vivid subject, got {:?} — palette {:?}",
+            vib.dominant,
+            palette_order(&vib)
+        );
+    }
+
+    /// Fixture 5: dark cover with a neon accent — the neon is selected (wins the
+    /// dominant), where population scoring would keep the dark field.
+    #[test]
+    fn dark_cover_neon_accent_is_selected() {
+        let dark = [34, 30, 44]; // dark charcoal, above the near-black crop floor
+        let neon = [40, 245, 130];
+        let img = bg_with_subject(160, 160, dark, neon, 0.16);
+        let bytes = png_bytes(&img);
+
+        let vib = extract(&bytes).expect("vib");
+        assert!(
+            hue_diff(hue_deg(vib.dominant), hue_deg(neon)) <= 25.0 && chroma(vib.dominant) > 0.10,
+            "neon accent should win the dark cover, dominant={:?} — palette {:?}",
+            vib.dominant,
+            palette_order(&vib)
+        );
+
+        let pop = extract_scored(&bytes, Scoring::Population).expect("pop");
+        assert!(
+            lightness(pop.dominant) < 0.35,
+            "population dominant should be the dark field, got {:?} (L={})",
+            pop.dominant,
+            lightness(pop.dominant)
+        );
+    }
+
+    /// The dark-vivid clause: a large near-black pure-hue region must not
+    /// out-score a smaller genuinely vivid mid-lightness cluster.
+    #[test]
+    fn near_black_vivid_does_not_beat_mid_vivid() {
+        let navy = [8, 8, 46]; // ~70% area, pure hue but near-black
+        let orange = [235, 130, 25]; // ~30% area, vivid mid-lightness
+        let img = two_tone(160, 160, 0.7, navy, orange);
+        let vib = extract(&png_bytes(&img)).expect("vib");
+        assert!(
+            hue_diff(hue_deg(vib.dominant), hue_deg(orange)) <= 30.0,
+            "mid-vivid orange must out-score near-black navy, dominant={:?}",
+            vib.dominant
+        );
     }
 }
