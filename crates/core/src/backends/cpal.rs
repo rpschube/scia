@@ -320,6 +320,18 @@ fn build_stream(
     // stop their stream thread for good. The branch below records that as a
     // health fault, and the engine's route watcher rebuilds the stream — it must
     // not expect the dead stream to recover on its own.
+    //
+    // PipeWire default-sink switch (CAP-2 on Linux): the native PipeWire host
+    // opens the default output as an `is_default_device` monitor stream and
+    // subscribes to the session-manager "default" metadata; a `pactl
+    // set-default-sink` fires this error callback with `ErrorKind::DeviceChanged`
+    // ("default device changed"). It is not `Xrun`, so it marks the stream
+    // errored, and the route watcher reopens. The reopen must drop this errored
+    // stream *before* opening its replacement (see `engine::Shared::reopen`): a
+    // fresh `host_from_id(PipeWire)` re-enumerates and resolves the new default,
+    // but a replacement opened while the errored stream is still connected does
+    // not settle on the PipeWire graph across the switch. Dropping the dead
+    // stream first is what makes recovery work here.
     let error_callback = move |err: cpal::Error| {
         // Off the data path: locking here is allowed.
         // A buffer under/overrun is a transient glitch (the engine dropped or

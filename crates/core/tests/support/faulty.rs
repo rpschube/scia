@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use std::f64::consts::PI;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -46,6 +46,15 @@ pub struct FaultyControl {
     /// State of the most recently opened live stream, so `trip_fault` hits the
     /// current stream even after a reopen swapped in a new one.
     current: Mutex<Option<Arc<StreamState>>>,
+    /// Live (opened, not yet dropped) streams right now. Incremented when `open`
+    /// returns a stream and decremented when it is dropped, so a test can observe
+    /// the engine's reopen ordering.
+    live: AtomicI64,
+    /// The high-water mark of [`live`](FaultyControl::live): `1` means the engine
+    /// dropped the old stream before opening the replacement (the errored
+    /// down-path reopen); `2` means it opened the replacement first (the seamless
+    /// healthy-path reopen).
+    max_live: AtomicI64,
 }
 
 impl FaultyControl {
@@ -61,6 +70,8 @@ impl FaultyControl {
             route: Mutex::new(route_id.to_owned()),
             last_device: Mutex::new(None),
             current: Mutex::new(None),
+            live: AtomicI64::new(0),
+            max_live: AtomicI64::new(0),
         })
     }
 
@@ -68,6 +79,18 @@ impl FaultyControl {
     #[must_use]
     pub fn last_device(&self) -> Option<DeviceSelector> {
         self.last_device.lock().unwrap().clone()
+    }
+
+    /// Live streams right now (opened and not yet dropped).
+    #[must_use]
+    pub fn live(&self) -> i64 {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// High-water mark of concurrently-live streams across the run.
+    #[must_use]
+    pub fn max_live(&self) -> i64 {
+        self.max_live.load(Ordering::Acquire)
     }
 
     /// Set the format the next `open` will negotiate.
@@ -148,10 +171,16 @@ impl CaptureBackend for FaultyBackend {
             .spawn(move || produce(format, &thread_state, &mut sink))
             .map_err(|e| CaptureError::Backend(e.to_string()))?;
 
+        // Count this stream as live and update the high-water mark, so a test can
+        // tell whether the engine dropped the old stream before opening this one.
+        let now_live = self.control.live.fetch_add(1, Ordering::AcqRel) + 1;
+        self.control.max_live.fetch_max(now_live, Ordering::AcqRel);
+
         Ok(Box::new(FaultyStream {
             format,
             state,
             handle: Some(handle),
+            control: Arc::clone(&self.control),
         }))
     }
 
@@ -205,6 +234,7 @@ struct FaultyStream {
     format: StreamFormat,
     state: Arc<StreamState>,
     handle: Option<JoinHandle<()>>,
+    control: Arc<FaultyControl>,
 }
 
 impl CaptureStream for FaultyStream {
@@ -227,5 +257,6 @@ impl Drop for FaultyStream {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        self.control.live.fetch_sub(1, Ordering::AcqRel);
     }
 }
