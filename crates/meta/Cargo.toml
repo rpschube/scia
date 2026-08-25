@@ -18,6 +18,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 async-io = "2"
+# A one-shot shutdown wake for the backend thread: closing the channel resolves
+# the stop future the reconcile loop races against, cancelling any in-flight
+# D-Bus call so the join returns at once. Already in the tree via zbus, so this
+# adds no new dependency (clears cargo-deny).
+async-channel = "2"
 futures-lite = "2"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
@@ -35,3 +40,10 @@ features = [
     "Storage_Streams",
     "Win32_System_Com",
 ]
+
+# The MPRIS shutdown regression test serves a fake player on a private bus it
+# spawns; it needs zbus to serve that interface and async-io to drive it. Both
+# are already the backend's own deps, so nothing new enters the tree.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+async-io = "2"

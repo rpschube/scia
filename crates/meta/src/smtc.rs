@@ -111,7 +111,11 @@ pub fn start_with_policy(out: Sender<MetaEvent>, policy: RetryPolicy) -> MetaHan
             run(&out, &thread_stop, &tx, &rx, policy);
         })
         .expect("spawn scia-smtc thread");
-    MetaHandle::new(stop, vec![join])
+    // No shutdown waker: the backend loop already polls the stop flag every
+    // POLL_CAP (250 ms) — its blocking `recv_timeout` is capped to it, and the
+    // artwork campaign checks the flag between attempts — so a dropped handle
+    // stops the thread promptly without a wake trigger.
+    MetaHandle::new(stop, Vec::new(), vec![join])
 }
 
 /// Markers the WinRT callbacks and the safety net push onto the backend
