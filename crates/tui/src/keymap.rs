@@ -47,12 +47,14 @@ pub enum InputAction {
     Mapping,
     /// Toggle the capture device picker (default `d`).
     Devices,
+    /// Toggle scene-author mode: the source-viewer split (default `a`).
+    Author,
 }
 
 impl InputAction {
     /// Every action, in a stable order. [`Keymap::action_for`] scans this order,
     /// so an earlier action wins if two are ever bound to the same chord.
-    pub const ALL: [InputAction; 12] = [
+    pub const ALL: [InputAction; 13] = [
         InputAction::SceneNext,
         InputAction::ScenePrev,
         InputAction::Browser,
@@ -65,6 +67,7 @@ impl InputAction {
         InputAction::Tuning,
         InputAction::Mapping,
         InputAction::Devices,
+        InputAction::Author,
     ];
 
     /// The config `[keys]` name this action is bound under.
@@ -83,6 +86,7 @@ impl InputAction {
             InputAction::Tuning => "tuning",
             InputAction::Mapping => "mapping",
             InputAction::Devices => "devices",
+            InputAction::Author => "author",
         }
     }
 
@@ -102,6 +106,7 @@ impl InputAction {
             InputAction::Tuning => "tuning strip",
             InputAction::Mapping => "expression map",
             InputAction::Devices => "device picker",
+            InputAction::Author => "scene author",
         }
     }
 
@@ -262,6 +267,8 @@ pub struct Keymap {
     pub mapping: Option<KeyChord>,
     /// Toggle the capture device picker.
     pub devices: Option<KeyChord>,
+    /// Toggle scene-author mode.
+    pub author: Option<KeyChord>,
 }
 
 impl Default for Keymap {
@@ -279,6 +286,7 @@ impl Default for Keymap {
             tuning: Some(KeyChord::plain(KeyCode::Char('t'))),
             mapping: Some(KeyChord::plain(KeyCode::Char('m'))),
             devices: Some(KeyChord::plain(KeyCode::Char('d'))),
+            author: Some(KeyChord::plain(KeyCode::Char('a'))),
         }
     }
 }
@@ -300,6 +308,7 @@ impl Keymap {
             InputAction::Tuning => self.tuning,
             InputAction::Mapping => self.mapping,
             InputAction::Devices => self.devices,
+            InputAction::Author => self.author,
         }
     }
 
@@ -318,6 +327,7 @@ impl Keymap {
             InputAction::Tuning => &mut self.tuning,
             InputAction::Mapping => &mut self.mapping,
             InputAction::Devices => &mut self.devices,
+            InputAction::Author => &mut self.author,
         };
         *slot = chord;
     }
@@ -482,6 +492,29 @@ mod tests {
             Some(InputAction::Mapping)
         );
         assert_eq!(km.action_for(&key(KeyCode::Char('m'), false)), None);
+    }
+
+    #[test]
+    fn author_defaults_to_a_and_rebinds() {
+        let km = Keymap::default();
+        assert!(km.author.unwrap().matches(&key(KeyCode::Char('a'), false)));
+        assert_eq!(
+            km.action_for(&key(KeyCode::Char('a'), false)),
+            Some(InputAction::Author)
+        );
+        assert_eq!(InputAction::parse("author"), Some(InputAction::Author));
+
+        // Rebinding moves it and frees the old key.
+        let mut km = Keymap::default();
+        km.rebind(
+            InputAction::Author,
+            Some(KeyChord::plain(KeyCode::Char('z'))),
+        );
+        assert_eq!(
+            km.action_for(&key(KeyCode::Char('z'), false)),
+            Some(InputAction::Author)
+        );
+        assert_eq!(km.action_for(&key(KeyCode::Char('a'), false)), None);
     }
 
     #[test]

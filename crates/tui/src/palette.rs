@@ -25,6 +25,9 @@ pub const OVERLAY_FG: Color = Color::Rgb(200, 200, 210);
 pub const CHROME_FG: Color = Color::Rgb(150, 150, 160);
 /// The chrome now-playing line one dim step down, just before it vanishes.
 pub const CHROME_DIM: Color = Color::Rgb(90, 90, 100);
+/// An error highlight: the source line a preset reload failed on, and its
+/// inline message, in scene-author mode.
+pub const ERROR: Color = Color::Rgb(230, 90, 90);
 
 /// The three-stop bar gradient, low to high.
 const STOP_LOW: (u8, u8, u8) = (20, 180, 170); // teal

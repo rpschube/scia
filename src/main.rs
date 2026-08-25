@@ -61,10 +61,12 @@ KEYS (defaults, all rebindable; press ? in-app for the active map):
   n           now-playing panel      p      apply palette
   c           cycle chrome           t      tuning strip
   m           expression map         d      device picker  s  debug line
-  esc         back (overlay) / quit  ?      toggle help
+  a           scene author           esc    back (overlay) / quit
+  ?           toggle help
   tuning:     tab param · ←/→ adjust · w write preset · esc done
   mapping:    ↑↓ row · ⏎ edit (⏎ apply · esc cancel) · w write · esc done
   devices:    ↑↓ select · ⏎ switch · p pin · esc close
+  author:     ↑↓ scroll · PgUp/PgDn page · esc close
 
 EXIT CODES:
   0  success            1  runtime error         2  usage / unsupported

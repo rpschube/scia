@@ -11,6 +11,7 @@ use ratatui::style::{Modifier, Style};
 use scia_core::{Activity, EngineStats, FeatureSnapshot};
 use scia_scenes::{SceneInfo, catalog_scenes};
 
+use crate::author::AuthorMode;
 use crate::chrome::ChromeState;
 use crate::devicepick::DevicePicker;
 use crate::keymap::{InputAction, Keymap};
@@ -139,6 +140,13 @@ pub struct UiState {
     /// A one-shot request from the picker's pin key (`p`), consumed by the render
     /// loop to pin the selected device into the config file.
     pub device_pin_pending: bool,
+    /// The scene-author model: the source lines on show, the scroll position,
+    /// and the watch/reload status. Drawn as a split over the body when open.
+    pub author: AuthorMode,
+    /// A one-shot request from the author key to open scene-author mode, consumed
+    /// by the render loop (which builds the source descriptor from the presenter
+    /// and the scene-file / builtin source).
+    pub author_open_pending: bool,
 }
 
 impl UiState {
@@ -893,12 +901,13 @@ fn render_debug(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiSta
     );
 }
 
-/// Number of rows the overlay panel occupies at the bottom of the body.
-const OVERLAY_ROWS: u16 = 5;
+/// Number of rows the overlay panel occupies at the bottom of the body. Shared
+/// with scene-author mode, which reuses this meter bridge below its source pane.
+pub(crate) const OVERLAY_ROWS: u16 = 5;
 /// Minimum body height that hosts the full panel; below it the overlay falls
 /// back to the single debug line. Twice the panel height so the panel never
 /// blankets the whole spectrum.
-const OVERLAY_MIN_BODY: u16 = 2 * OVERLAY_ROWS;
+pub(crate) const OVERLAY_MIN_BODY: u16 = 2 * OVERLAY_ROWS;
 /// An onset lamp stays lit this many milliseconds after the last onset.
 const ONSET_LAMP_MS: f32 = 150.0;
 /// The lit onset lamp.
