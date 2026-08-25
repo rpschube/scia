@@ -46,8 +46,8 @@ CONFIG:
               chrome = invisible | instrument | playful | utilitarian;
               both overridden by their flags)
   [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
-              quit, chrome, now_playing, palette, tuning. A value is a single
-              character, a named
+              quit, chrome, now_playing, palette, tuning, mapping. A value is a
+              single character, a named
               key (tab, esc, left, right, up, down, enter, space, backtick), or
               ctrl+<key>. Unknown actions or unparseable keys warn and are
               ignored.
@@ -57,8 +57,9 @@ KEYS (defaults, all rebindable; press ? in-app for the active map):
   `           debug overlay          space  pause         q  quit
   n           now-playing panel      p      apply palette
   c           cycle chrome           t      tuning strip
-  esc         back (browser/tuning) / quit  ?  toggle help
+  m           expression map         esc    back (overlay) / quit   ?  toggle help
   tuning:     tab param · ←/→ adjust · w write preset · esc done
+  mapping:    ↑↓ row · ⏎ edit (⏎ apply · esc cancel) · w write · esc done
 
 EXIT CODES:
   0  success            1  runtime error         2  usage / unsupported

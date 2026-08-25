@@ -167,7 +167,56 @@ impl ExprMapping {
     pub fn source(&self) -> &str {
         self.expr.source()
     }
+
+    /// Compile `source` into an expression mapping driving `target`, over the
+    /// storyboard feature vocabulary. This is the runtime entry point the
+    /// expression-mapping overlay uses to build a mapping from edited text; it
+    /// applies exactly the same compile and vocabulary check
+    /// [`parse_preset`] applies to a string `[map]` value at load, so a draft
+    /// that compiles here is a draft that would load.
+    ///
+    /// # Errors
+    /// Returns an [`ExprError`] with a short, single-line message when the
+    /// expression is malformed or references a name outside the vocabulary.
+    pub fn compile(target: impl Into<String>, source: &str) -> Result<Self, ExprError> {
+        let expr = CompiledExpr::compile(source).map_err(|e| ExprError {
+            message: match e {
+                ExprCompileError::Syntax(msg) => format!("invalid expression: {msg}"),
+                ExprCompileError::UnknownVar(name) => format!("unknown variable `{name}`"),
+            },
+        })?;
+        Ok(Self {
+            target: target.into(),
+            expr,
+        })
+    }
 }
+
+/// An error compiling a `[map]` expression string at runtime (from the
+/// expression-mapping overlay, via [`ExprMapping::compile`]). Its
+/// [`Display`](fmt::Display) is a short, single-line message suitable for inline
+/// UI — unlike [`PresetError`] it carries no file position, because a runtime
+/// draft has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExprError {
+    message: String,
+}
+
+impl ExprError {
+    /// The short, single-line error message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ExprError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExprError {}
 
 /// One validated `[map]` entry: either a response **table** or a compiled string
 /// **expression**. Both forms drive one target parameter of the mapped scene.
@@ -375,6 +424,58 @@ impl MappingSet {
                 params.set(target, 0.0);
             }
         }
+    }
+
+    /// The current entries as public [`MapEntry`] values, for UI introspection
+    /// (the expression-mapping overlay lists these). A table entry is
+    /// reconstructed from its runtime spec (its live envelope-follower value is
+    /// not part of the view); an expression entry shares the compiled program
+    /// behind the [`Arc`], so this allocates only the row vector and the target
+    /// strings, never a new expression slab.
+    #[must_use]
+    pub fn entries_view(&self) -> Vec<MapEntry> {
+        self.entries
+            .iter()
+            .map(|s| match s {
+                MappingState::Table(t) => MapEntry::Table(Mapping {
+                    target: t.target.to_string(),
+                    feature: t.feature,
+                    curve: t.curve,
+                    attack_ms: t.attack_tau * 1000.0,
+                    decay_ms: t.decay_tau * 1000.0,
+                    scale: t.scale,
+                    offset: t.offset,
+                }),
+                MappingState::Expr(e) => MapEntry::Expr(ExprMapping {
+                    target: e.target.to_string(),
+                    expr: Arc::clone(&e.expr),
+                }),
+            })
+            .collect()
+    }
+
+    /// Replace the entry whose target matches `entry`'s target with `entry`,
+    /// preserving row order and every other entry's runtime state. The replaced
+    /// row's runtime state is rebuilt from `entry` (a table row's envelope
+    /// follower therefore resets to zero). Returns whether a matching row was
+    /// found and replaced; a target present in no row is left unchanged.
+    ///
+    /// The expression-mapping overlay uses this to swap one row's mapping into
+    /// the live set as the user edits, so a valid draft previews on the next
+    /// frame without rebuilding the whole set.
+    pub fn replace(&mut self, entry: MapEntry) -> bool {
+        let target = entry.target();
+        let Some(slot) = self.entries.iter_mut().find(|s| s.target() == target) else {
+            return false;
+        };
+        *slot = match &entry {
+            MapEntry::Table(m) => MappingState::Table(TableState::new(m)),
+            MapEntry::Expr(x) => MappingState::Expr(ExprState {
+                target: Box::from(x.target.as_str()),
+                expr: Arc::clone(&x.expr),
+            }),
+        };
+        true
     }
 
     /// Advance every mapping by `dt` seconds against the newest features and
@@ -1553,4 +1654,93 @@ fn enclosing_table(src: &str, offset: usize) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod runtime_api_tests {
+    use super::*;
+
+    #[test]
+    fn compile_builds_and_rejects_expression_mappings() {
+        // A valid expression compiles and drives its target.
+        let m = ExprMapping::compile("gap", "bass * 0.5").expect("valid");
+        assert_eq!(m.target, "gap");
+        assert_eq!(m.source(), "bass * 0.5");
+        // An unknown variable is rejected with a short message.
+        let err = ExprMapping::compile("gap", "nope").expect_err("unknown var");
+        assert!(err.message().contains("unknown variable"), "{err}");
+        // A syntax error is rejected too.
+        assert!(ExprMapping::compile("gap", "bass *").is_err());
+    }
+
+    #[test]
+    fn entries_view_round_trips_table_and_expression_rows() {
+        let table = Mapping {
+            target: "trail".into(),
+            feature: Feature::Loud,
+            curve: Curve::Linear,
+            attack_ms: 100.0,
+            decay_ms: 400.0,
+            scale: 0.7,
+            offset: 0.2,
+        };
+        let expr = ExprMapping::compile("gap", "onset * 0.5").expect("valid");
+        let set = MappingSet::from_entries(&[
+            MapEntry::Table(table.clone()),
+            MapEntry::Expr(expr.clone()),
+        ]);
+
+        let view = set.entries_view();
+        assert_eq!(view.len(), 2);
+        match &view[0] {
+            MapEntry::Table(m) => {
+                assert_eq!(m.target, "trail");
+                assert_eq!(m.feature, Feature::Loud);
+                assert!((m.attack_ms - 100.0).abs() < 1e-3);
+                assert!((m.decay_ms - 400.0).abs() < 1e-3);
+                assert!((m.scale - 0.7).abs() < 1e-6);
+                assert!((m.offset - 0.2).abs() < 1e-6);
+            }
+            MapEntry::Expr(_) => panic!("row 0 is a table"),
+        }
+        match &view[1] {
+            MapEntry::Expr(e) => assert_eq!(e.source(), "onset * 0.5"),
+            MapEntry::Table(_) => panic!("row 1 is an expression"),
+        }
+    }
+
+    #[test]
+    fn replace_swaps_one_row_in_place() {
+        let mut set = MappingSet::from_entries(&[
+            MapEntry::Table(Mapping {
+                target: "gap".into(),
+                feature: Feature::Bass,
+                curve: Curve::Linear,
+                attack_ms: 0.0,
+                decay_ms: 0.0,
+                scale: 1.0,
+                offset: 0.0,
+            }),
+            MapEntry::Expr(ExprMapping::compile("punch", "onset").expect("valid")),
+        ]);
+
+        // Replace the table row with an expression; order and the other row hold.
+        let ok = set.replace(MapEntry::Expr(
+            ExprMapping::compile("gap", "treb * 2").expect("valid"),
+        ));
+        assert!(ok, "the matching row is replaced");
+        let view = set.entries_view();
+        assert_eq!(view[0].target(), "gap");
+        match &view[0] {
+            MapEntry::Expr(e) => assert_eq!(e.source(), "treb * 2"),
+            MapEntry::Table(_) => panic!("gap became an expression"),
+        }
+        assert_eq!(view[1].target(), "punch", "the other row is untouched");
+
+        // A target present in no row leaves the set unchanged.
+        assert!(!set.replace(MapEntry::Expr(
+            ExprMapping::compile("absent", "bass").expect("valid")
+        )));
+        assert_eq!(set.entries_view().len(), 2);
+    }
 }
