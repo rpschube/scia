@@ -1,0 +1,72 @@
+# dist-size-guard — enforces the US-DIST-1 binary-size budget on release.
+#
+# Runs on the same version tags that trigger release.yml, so a tag that would
+# publish an over-budget binary fails here instead of shipping. It builds the
+# canonical Linux release binary with the SAME profile dist ships
+# (`--profile dist`, default features — no `capture-pipewire`, exactly what the
+# release archives contain) and asserts it stays within 10 MiB via
+# scripts/check-dist-size.sh.
+#
+# Also exposed as workflow_dispatch so the guard can be exercised on demand
+# against any ref without cutting a tag.
+#
+# Scope: this guards the x86_64-unknown-linux-gnu binary, the canonical release
+# build. The Windows/macOS/musl binaries build from the same sources and dist
+# profile and track within a few hundred KiB of it, so the glibc binary is the
+# representative size witness; if any target ever needs its own witness, add a
+# matrix entry here.
+name: dist-size-guard
+
+on:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build and measure (branch, tag or SHA)
+        type: string
+        default: master
+
+concurrency:
+  group: dist-size-guard-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  size-guard:
+    name: size-guard (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Install system audio headers (cpal → alsa-sys)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libasound2-dev
+
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install --profile minimal
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the release (dist-profile) binary
+        run: |
+          set -euo pipefail
+          # Default features only: this is byte-for-byte the profile and feature
+          # set dist packages for x86_64-unknown-linux-gnu.
+          cargo build --profile dist --bin scia --target x86_64-unknown-linux-gnu
+
+      - name: Enforce the 10 MiB size budget
+        run: |
+          set -euo pipefail
+          scripts/check-dist-size.sh target/x86_64-unknown-linux-gnu/dist/scia

@@ -1,0 +1,19 @@
+# TEMPLATE — regenerate with `makepkg --printsrcinfo > .SRCINFO` after filling
+# the PKGBUILD placeholders. AUR requires .SRCINFO to match PKGBUILD exactly,
+# so never hand-edit only one of the two. __VERSION__ / __SHA256__ are filled at
+# release time (see README.md).
+pkgbase = scia
+	pkgdesc = A real-time music visualizer for the terminal
+	pkgver = __VERSION__
+	pkgrel = 1
+	url = https://github.com/rpschube/scia
+	arch = x86_64
+	license = MIT OR Apache-2.0
+	makedepends = rust
+	makedepends = cargo
+	depends = alsa-lib
+	depends = pipewire
+	source = scia-__VERSION__.tar.gz::https://github.com/rpschube/scia/archive/refs/tags/v__VERSION__.tar.gz
+	sha256sums = __SHA256__
+
+pkgname = scia

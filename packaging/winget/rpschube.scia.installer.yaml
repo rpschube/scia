@@ -1,0 +1,31 @@
+# winget installer manifest for scia — TEMPLATE.
+#
+# Fields wrapped in __DOUBLE_UNDERSCORES__ are filled by the release process
+# (see packaging/winget/README.md). Everything else is final.
+#
+#   __VERSION__  the released version, e.g. 1.2.0 (no leading "v")
+#   __SHA256__   SHA-256 of scia-x86_64-pc-windows-msvc.zip, uppercase hex,
+#                taken from the release asset scia-x86_64-pc-windows-msvc.zip.sha256
+#
+# The Windows release asset is a .zip containing the single portable scia.exe,
+# so this is a zip installer whose nested file is a portable command.
+PackageIdentifier: rpschube.scia
+PackageVersion: __VERSION__
+Platform:
+  - Windows.Desktop
+MinimumOSVersion: 10.0.0.0
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  # dist archives are flat: scia.exe sits at the zip root (no wrapping folder).
+  - RelativeFilePath: scia.exe
+    PortableCommandAlias: scia
+Commands:
+  - scia
+ReleaseDate: __RELEASE_DATE__
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/rpschube/scia/releases/download/v__VERSION__/scia-x86_64-pc-windows-msvc.zip
+    InstallerSha256: __SHA256__
+ManifestType: installer
+ManifestVersion: 1.6.0

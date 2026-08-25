@@ -1,0 +1,7 @@
+# winget version manifest for scia — TEMPLATE.
+# Replace __VERSION__ with the released version (no leading "v").
+PackageIdentifier: rpschube.scia
+PackageVersion: __VERSION__
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

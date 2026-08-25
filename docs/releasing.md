@@ -14,7 +14,9 @@ Release builds never run on the dev machine; only tags build binaries, in CI.
    `chore(release): vX.Y.Z` and merge it through the normal pull-request flow.
 4. Tag the merge commit on `master`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 5. The tag triggers `release.yml`, which builds every target, generates the
-   installers and checksums, and publishes the GitHub Release.
+   installers, formula and checksums, and publishes the GitHub Release. The tag
+   also triggers `dist-size-guard.yml`, which fails the release if the binary
+   exceeds its size budget.
 
 `scia` and `scia-bridge` ship together from the same tag.
 
@@ -25,8 +27,36 @@ Release builds never run on the dev machine; only tags build binaries, in CI.
 - `x86_64-unknown-linux-musl`
 - `aarch64-apple-darwin`
 
-## Installers and checksums
+## Installers, formula and checksums
+
+Produced by `dist` on every tag and attached to the GitHub Release:
 
 - Shell installer (`*-installer.sh`)
 - PowerShell installer (`*-installer.ps1`)
-- SHA-256 checksum alongside every artifact
+- Homebrew formula (`scia.rb`) — emitted as an artifact only; no tap is
+  configured, so it is not auto-published (see the packaging step below)
+- SHA-256 checksum alongside every artifact, plus a combined `sha256.sum`
+
+## Size guard
+
+`.github/workflows/dist-size-guard.yml` builds the canonical Linux release
+binary (`--profile dist`, default features) on every version tag and runs
+`scripts/check-dist-size.sh`, failing if it exceeds 10 MiB. The same check runs
+per-OS inside `probe-build.yml`, covering the Windows and macOS binaries. To
+exercise it without cutting a tag, dispatch `dist-size-guard` (workflow_dispatch)
+against any ref.
+
+## Package-registry publishing (human, per release)
+
+`dist` produces the installers and formula, but submitting to the package
+registries is deliberate and manual. After the GitHub Release exists:
+
+- **Homebrew** — copy the released `scia.rb` into the `rpschube/homebrew-tap`
+  repo. See [../packaging/README.md](../packaging/README.md).
+- **winget** — fill the templated manifests and open a winget-pkgs PR. See
+  [../packaging/winget/README.md](../packaging/winget/README.md).
+- **AUR** — fill and push the templated `PKGBUILD`. See
+  [../packaging/aur/README.md](../packaging/aur/README.md).
+
+End-user install instructions live in
+[installing.md](installing.md) and the top-level README.
