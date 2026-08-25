@@ -609,6 +609,17 @@ fn stamp(snapshot: &mut FeatureSnapshot, activity: Activity, quiet_ms: f32) {
     snapshot.quiet_ms = quiet_ms;
 }
 
+/// Log an activity (silence-state) transition once, at the edge. `*prev` is the
+/// last-published state; when `now` differs it emits one debug event and updates
+/// `*prev`. The `tracing` event self-gates to nothing when logging is off, so
+/// this adds no allocation to the disabled hot path.
+fn note_activity(prev: &mut Activity, now: Activity) {
+    if now != *prev {
+        tracing::debug!(target: "scia::dsp", from = ?*prev, to = ?now, "activity transition");
+        *prev = now;
+    }
+}
+
 /// The DSP loop. Runs on the named `scia-dsp` thread until the stop flag is set.
 ///
 /// It carries a three-state silence machine ([`Activity`]). While `Active` or
@@ -659,6 +670,11 @@ pub(crate) fn run(mut thread: DspThread) {
     // its age drives the state machine and `quiet_ms`. Seeded to "now" so a
     // pipeline that never sees audio idles after `idle_after`.
     let mut last_non_quiet = Instant::now();
+    // The last activity state published, so a transition (Active↔Quiet↔Idle) is
+    // logged once at the edge rather than every hop. The comparison is a plain
+    // enum check; the `tracing` event self-gates to nothing when logging is off,
+    // so the hot path pays no allocation for logging that is disabled.
+    let mut prev_activity = Activity::Active;
 
     loop {
         if thread.stop.load(Ordering::Acquire) {
@@ -766,6 +782,7 @@ pub(crate) fn run(mut thread: DspThread) {
                     .counters
                     .activity
                     .store(snapshot.activity as u8, Ordering::Relaxed);
+                note_activity(&mut prev_activity, snapshot.activity);
                 thread.writer.publish(snapshot);
                 if resumed {
                     break;
@@ -796,6 +813,7 @@ pub(crate) fn run(mut thread: DspThread) {
                         .counters
                         .activity
                         .store(Activity::Idle as u8, Ordering::Relaxed);
+                    note_activity(&mut prev_activity, snapshot.activity);
                     thread.writer.publish(snapshot);
                     deadline += hop_period;
                     burst += 1;
@@ -860,6 +878,7 @@ pub(crate) fn run(mut thread: DspThread) {
                     .counters
                     .activity
                     .store(activity as u8, Ordering::Relaxed);
+                note_activity(&mut prev_activity, snapshot.activity);
                 thread.writer.publish(snapshot);
             }
             silent_deadline = None;
@@ -897,6 +916,7 @@ pub(crate) fn run(mut thread: DspThread) {
                     .counters
                     .activity
                     .store(snapshot.activity as u8, Ordering::Relaxed);
+                note_activity(&mut prev_activity, snapshot.activity);
                 thread.writer.publish(snapshot);
                 deadline += hop_period;
                 burst += 1;

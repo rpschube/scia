@@ -13,6 +13,9 @@ scia-scenes = { path = "../scenes", version = "0.0.0" }
 scia-meta = { path = "../meta", version = "0.0.0" }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
+# Structured logging facade: presenter-tier decision at startup. Zero
+# cost when no subscriber is installed.
+tracing = "0.1"
 # zlib compression of kitty-graphics image payloads (US-TUI-3). Default features
 # use the pure-Rust miniz_oxide backend; already present in the workspace tree.
 flate2 = "1"

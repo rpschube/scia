@@ -10,6 +10,11 @@ rust-version.workspace = true
 [dependencies]
 scia-core = { path = "../core", version = "0.0.0" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# Structured logging facade: now-playing session/track changes and the
+# artwork-campaign stage/outcome instrumentation the probes read. `tracing` is
+# already in the tree (via zbus); naming it directly makes the dependency
+# explicit. Zero-cost when no subscriber is installed.
+tracing = "0.1"
 
 # The MPRIS backend and its artwork fetch are Linux-only. zbus talks D-Bus on
 # its own async-io executor (no tokio, so the workspace gains no required async

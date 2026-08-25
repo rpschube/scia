@@ -20,6 +20,7 @@ use serde::Deserialize;
 use scia_tui::{ChromeMode, InputAction, Keymap, NowPlayingMode, parse_chord};
 
 use crate::PresenterTier;
+use crate::logging::{LogConfig, LogLevel};
 
 /// The built-in demo tempo when neither a flag nor the config supplies one.
 pub const DEFAULT_DEMO_BPM: f32 = 112.0;
@@ -39,6 +40,15 @@ pub const DEFAULT_SCENE: &str = "spectra";
 struct RawConfig {
     defaults: RawDefaults,
     keys: BTreeMap<String, String>,
+    log: RawLog,
+}
+
+/// The raw `[log]` table: an optional verbosity level and the file-sink toggle.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawLog {
+    level: Option<String>,
+    file: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -89,6 +99,8 @@ pub struct Config {
     pub defaults: FileDefaults,
     /// The key bindings: built-in defaults with the file's `[keys]` applied.
     pub keymap: Keymap,
+    /// The `[log]` layer: config-supplied level and file-sink toggle.
+    pub log: LogConfig,
     /// Non-fatal warnings collected while loading; the caller prints each line.
     pub warnings: Vec<String>,
 }
@@ -100,6 +112,7 @@ impl Config {
         Self {
             defaults: FileDefaults::default(),
             keymap: Keymap::default(),
+            log: LogConfig::default(),
             warnings: Vec::new(),
         }
     }
@@ -285,6 +298,23 @@ pub fn parse(text: &str) -> Config {
         now_playing,
     };
 
+    // Validate the [log] level against the same names the --log flag accepts.
+    let log_level = raw.log.level.as_deref().and_then(|name| {
+        match <LogLevel as ValueEnum>::from_str(name, true) {
+            Ok(level) => Some(level),
+            Err(_) => {
+                warnings.push(format!(
+                    "config: unknown log level `{name}`; ignoring (valid: error, warn, info, debug, trace)"
+                ));
+                None
+            }
+        }
+    });
+    let log = LogConfig {
+        level: log_level,
+        file: raw.log.file,
+    };
+
     // Apply the [keys] overrides on top of the built-in map.
     let mut keymap = Keymap::default();
     for (action, key) in &raw.keys {
@@ -303,6 +333,7 @@ pub fn parse(text: &str) -> Config {
     Config {
         defaults,
         keymap,
+        log,
         warnings,
     }
 }

@@ -165,6 +165,9 @@ fn input_producer(
                 let _ = stream.set_nodelay(true);
                 match FrameStreamReader::new(BufReader::new(stream)) {
                     Ok(mut reader) => {
+                        // No address in the message (privacy: no LAN addresses in
+                        // log messages) — just the connect/disconnect edges.
+                        tracing::info!(target: "scia::stream", "feature stream connected");
                         state.set_connected();
                         backoff = BACKOFF_START;
                         loop {
@@ -220,6 +223,7 @@ fn input_producer(
 
         // The connection is down. Mark the episode, settle the scene toward its
         // idle state with a quiet keepalive, and back off before retrying.
+        tracing::info!(target: "scia::stream", "feature stream disconnected; reconnecting");
         state.set_down();
         writer.publish(idle_keepalive(epoch));
         if sleep_with_stop(&stop, backoff) {

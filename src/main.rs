@@ -18,6 +18,8 @@
 //! capture device.
 
 mod config;
+mod logging;
+mod runrec;
 mod stream;
 
 use std::io::{self, IsTerminal};
@@ -278,6 +280,22 @@ struct Cli {
     /// List every registered scene and built-in preset, then exit.
     #[arg(long)]
     list_scenes: bool,
+
+    /// Enable structured logging at this level (`error|warn|info|debug|trace`).
+    /// Overrides `SCIA_LOG` and the config `[log] level`. Logs go to a rotating
+    /// JSON-lines file under the config dir, and also to stderr in headless /
+    /// stream modes (never while the TUI owns the screen). Off by default. See
+    /// docs/logging.md.
+    #[arg(long, value_enum, value_name = "LEVEL")]
+    log: Option<logging::LogLevel>,
+
+    /// Write a machine-readable per-run record (JSON Lines) to this path: a
+    /// `run_start`, one `hop` per recorded hop (every 4th live, every hop when
+    /// replaying via `--input`), `event`s for scene/preset swaps and device
+    /// switches, and a `run_end`. The data plane for the scene-quality harness.
+    /// See docs/logging.md.
+    #[arg(long, value_name = "PATH")]
+    log_run: Option<PathBuf>,
 }
 
 /// The machine-readable output encodings selectable with `--output`.
@@ -477,6 +495,30 @@ fn main() -> ExitCode {
         &cfg.defaults,
     );
 
+    // Structured logging (off by default). The stderr sink is gated off whenever
+    // the TUI owns the screen, so a log line can never corrupt it: `--output`
+    // and `--headless` runs have no TUI; `--input` and a bare demo/live run do.
+    let tui_active = if cli.output.is_some() {
+        false
+    } else if cli.input.is_some() {
+        true
+    } else {
+        !cli.headless
+    };
+    let mut log_warnings = Vec::new();
+    let level = logging::resolve_level(cli.log, &cfg.log, &mut log_warnings);
+    for warning in &log_warnings {
+        eprintln!("{warning}");
+    }
+    if let Some(note) = logging::init(
+        level,
+        tui_active,
+        cfg.log.file.unwrap_or(true),
+        config::config_dir().as_deref(),
+    ) {
+        eprintln!("{note}");
+    }
+
     // Headless machine-readable output: no TUI. Drives the same engine (demo or
     // live capture) and serialises its feature bus to stdout or a socket.
     if let Some(format) = cli.output {
@@ -597,6 +639,7 @@ fn run_input_mode(cli: &Cli, resolved: &Resolved, addr: String, keymap: Keymap) 
         fullscreen_pause_setup(resolved.fullscreen_pause, Arc::new(AtomicBool::new(false)));
 
     let (presenter_mode, initial_notice) = select_presenter(resolved);
+    tracing::info!(target: "scia::tui", presenter = ?presenter_mode, "presenter tier selected");
     let opts = TuiOptions {
         fps: cli.fps,
         label: Some(format!("INPUT — {addr}")),
@@ -623,8 +666,27 @@ fn run_input_mode(cli: &Cli, resolved: &Resolved, addr: String, keymap: Keymap) 
     let stats = handle.stats_fn();
     let health = handle.health_fn();
     let clock = handle.clock_fn();
+    // Replaying a remote stream records every hop (the stream is paced well
+    // below the live hop rate). The remote format is unknown until frames
+    // arrive, so the nominal hop period assumes the standard 48 kHz.
+    let observer = run_observer(build_run_recorder(
+        cli,
+        resolved,
+        "replay",
+        48_000,
+        runrec::Throttle::EveryHop,
+    ));
     // A remote stream has no local device to switch; the picker is inert.
-    let outcome = run(reader, stats, health, clock, |_sel| {}, reload, opts);
+    let outcome = run(
+        reader,
+        stats,
+        health,
+        clock,
+        |_sel| {},
+        reload,
+        opts,
+        observer,
+    );
     handle.stop();
     report_tui_outcome(outcome)
 }
@@ -759,6 +821,47 @@ fn print_device_table() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Build the `--log-run` recorder for a session, or `None` when the flag is
+/// unset. A file that cannot be opened is warned about and then ignored, so a
+/// logging failure never aborts the visualizer. `source` tags the input
+/// (`"synthetic"`, `"live"`, `"replay"`); `sample_rate` sets the nominal hop
+/// period; `throttle` records every hop for a clip replay, every fourth live.
+fn build_run_recorder(
+    cli: &Cli,
+    resolved: &Resolved,
+    source: &str,
+    sample_rate: u32,
+    throttle: runrec::Throttle,
+) -> Option<runrec::RunRecorder> {
+    let path = cli.log_run.as_ref()?;
+    let scene = resolved
+        .scene
+        .clone()
+        .unwrap_or_else(|| LEGACY_BARS_SCENE.to_string());
+    let preset = cli.scene_file.as_ref().map(|p| p.display().to_string());
+    let hop_ms = 256_000.0 / sample_rate.max(1) as f32;
+    match runrec::RunRecorder::create(
+        path,
+        throttle,
+        &scene,
+        preset,
+        std::collections::BTreeMap::new(),
+        source,
+        hop_ms,
+    ) {
+        Ok(recorder) => Some(recorder),
+        Err(err) => {
+            eprintln!("--log-run: cannot write {}: {err}", path.display());
+            None
+        }
+    }
+}
+
+/// Box a recorder as the TUI's run observer (the loop drives it per frame).
+fn run_observer(recorder: Option<runrec::RunRecorder>) -> Option<Box<dyn scia_tui::RunObserver>> {
+    recorder.map(|r| Box::new(r) as Box<dyn scia_tui::RunObserver>)
+}
+
 /// Start the engine on the built-in synthetic feed and run the TUI.
 fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     let bpm = resolved.demo_bpm.clamp(40.0, 220.0);
@@ -779,7 +882,14 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     // Headless demo: the same once-a-second status loop the live path uses, so
     // the synthetic feed can be exercised with no terminal (CI, probes).
     if cli.headless {
-        return run_headless(engine, reader, cli.seconds);
+        let recorder = build_run_recorder(
+            cli,
+            resolved,
+            "synthetic",
+            engine.format().sample_rate,
+            runrec::Throttle::EveryFourth,
+        );
+        return run_headless(engine, reader, cli.seconds, recorder);
     }
 
     // A `--scene-file` preset is loaded and its watcher started before the TUI
@@ -798,6 +908,7 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         fullscreen_pause_setup(resolved.fullscreen_pause, engine.pause_flag());
 
     let (presenter_mode, initial_notice) = select_presenter(resolved);
+    tracing::info!(target: "scia::tui", presenter = ?presenter_mode, "presenter tier selected");
     let opts = TuiOptions {
         fps: cli.fps,
         label: Some("DEMO — synthetic feed".to_string()),
@@ -821,6 +932,13 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         fullscreen_pause,
     };
 
+    let observer = run_observer(build_run_recorder(
+        cli,
+        resolved,
+        "synthetic",
+        engine.format().sample_rate,
+        runrec::Throttle::EveryFourth,
+    ));
     let outcome = run(
         reader,
         || engine.stats(),
@@ -830,6 +948,7 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         |_sel| {},
         reload,
         opts,
+        observer,
     );
     engine.stop();
     report_tui_outcome(outcome)
@@ -949,7 +1068,14 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     }
 
     if cli.headless {
-        return run_headless(engine, reader, cli.seconds);
+        let recorder = build_run_recorder(
+            cli,
+            resolved,
+            "live",
+            format.sample_rate,
+            runrec::Throttle::EveryFourth,
+        );
+        return run_headless(engine, reader, cli.seconds, recorder);
     }
 
     // A `--scene-file` preset is loaded and its watcher started before the TUI
@@ -974,6 +1100,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         fullscreen_pause_setup(resolved.fullscreen_pause, engine.pause_flag());
 
     let (presenter_mode, initial_notice) = select_presenter(resolved);
+    tracing::info!(target: "scia::tui", presenter = ?presenter_mode, "presenter tier selected");
     let opts = TuiOptions {
         fps: cli.fps,
         label: None,
@@ -997,6 +1124,13 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         fullscreen_pause,
     };
 
+    let observer = run_observer(build_run_recorder(
+        cli,
+        resolved,
+        "live",
+        format.sample_rate,
+        runrec::Throttle::EveryFourth,
+    ));
     let outcome = run(
         reader,
         || engine.stats(),
@@ -1010,6 +1144,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         },
         reload,
         opts,
+        observer,
     );
     engine.stop();
     // The WSL overlay's `[s]` key asks to leave live capture for the demo feed:
@@ -1116,10 +1251,20 @@ fn report_tui_outcome(outcome: Result<scia_tui::RunSummary, RunError>) -> ExitCo
 /// `seconds` is `0`. A device switch or fault is ridden out as a `reconnecting…`
 /// state; the loop exits 1 only once capture has failed past the reconnect
 /// deadline ([`EngineHealth::Failed`]).
-fn run_headless(engine: Engine, mut reader: FeatureReader, seconds: u64) -> ExitCode {
+fn run_headless(
+    engine: Engine,
+    mut reader: FeatureReader,
+    seconds: u64,
+    mut recorder: Option<runrec::RunRecorder>,
+) -> ExitCode {
     let mut t: u64 = 0;
     loop {
-        sleep(Duration::from_secs(1));
+        // Wait out the one-second status tick. With a `--log-run` recorder
+        // attached, spend that second sampling the feature bus fast enough to
+        // catch the per-hop generations (the recorder de-duplicates and applies
+        // its own throttle); headless has no scene engine, so the scene id is
+        // `None` and no swap events are emitted.
+        wait_one_second(&mut reader, recorder.as_mut());
         t += 1;
 
         let stats = engine.stats();
@@ -1143,6 +1288,7 @@ fn run_headless(engine: Engine, mut reader: FeatureReader, seconds: u64) -> Exit
 
         if let EngineHealth::Failed { error } = &health {
             eprintln!("capture stream error: {error}");
+            // The recorder drops here, terminating the run record.
             engine.stop();
             return ExitCode::from(1);
         }
@@ -1151,8 +1297,26 @@ fn run_headless(engine: Engine, mut reader: FeatureReader, seconds: u64) -> Exit
             break;
         }
     }
+    if let Some(recorder) = recorder {
+        let _ = recorder.finish();
+    }
     engine.stop();
     ExitCode::SUCCESS
+}
+
+/// Sleep for one second. When a run recorder is attached, poll the feature bus
+/// every couple of milliseconds across that second so the recorder observes each
+/// hop generation; otherwise a plain one-second sleep.
+fn wait_one_second(reader: &mut FeatureReader, recorder: Option<&mut runrec::RunRecorder>) {
+    let Some(recorder) = recorder else {
+        sleep(Duration::from_secs(1));
+        return;
+    };
+    let until = std::time::Instant::now() + Duration::from_secs(1);
+    while std::time::Instant::now() < until {
+        recorder.observe(reader.latest(), None);
+        sleep(Duration::from_millis(2));
+    }
 }
 
 /// Format one headless status line. Pure (no engine handle) so the formatting —

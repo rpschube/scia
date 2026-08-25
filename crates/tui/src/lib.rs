@@ -222,6 +222,26 @@ pub struct RunSummary {
     pub demo_requested: bool,
 }
 
+/// A passive observer of the render loop, driving the `--log-run` per-run
+/// record without coupling the TUI to the telemetry schema.
+///
+/// The loop calls [`frame`](RunObserver::frame) once per rendered frame with the
+/// freshest live snapshot and the active layer-0 scene id (the observer diffs
+/// the id to detect scene/preset swaps), and [`device_switch`] /
+/// [`reload`](RunObserver::reload) at those events. All methods are `&mut self`
+/// and must be cheap and non-blocking; the loop never inspects a return value.
+/// The default `run` path passes `None`, so an unobserved run pays nothing.
+///
+/// [`device_switch`]: RunObserver::device_switch
+pub trait RunObserver {
+    /// The freshest live snapshot this frame, and the active layer-0 scene id.
+    fn frame(&mut self, snapshot: &FeatureSnapshot, scene_id: Option<&str>);
+    /// A capture-device switch was just applied; `label` names the new device.
+    fn device_switch(&mut self, label: &str);
+    /// A live preset / Luau scene hot-reload was just applied.
+    fn reload(&mut self, scene_id: Option<&str>, elapsed_ms: f32);
+}
+
 /// Run the terminal frontend until the user quits (or `opts.frames` frames have
 /// been rendered).
 ///
@@ -250,6 +270,7 @@ pub struct RunSummary {
 /// [`RunError::Scene`] for a missing/invalid `--scene` preset, or
 /// [`RunError::Io`] for any I/O error from terminal setup, drawing, or input
 /// polling. The terminal is restored before an I/O error is returned.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     reader: FeatureReader,
     stats: impl FnMut() -> EngineStats,
@@ -258,6 +279,7 @@ pub fn run(
     switch_device: impl FnMut(DeviceSelector),
     reload: Option<Receiver<ReloadEvent>>,
     opts: TuiOptions,
+    observer: Option<Box<dyn RunObserver>>,
 ) -> Result<RunSummary, RunError> {
     install_panic_hook();
     // Build the scene presenter first: a bad preset must fail with the terminal
@@ -280,6 +302,7 @@ pub fn run(
         reload,
         &opts,
         presenter,
+        observer,
     )?)
 }
 
@@ -388,6 +411,7 @@ fn run_loop(
     reload: Option<Receiver<ReloadEvent>>,
     opts: &TuiOptions,
     mut presenter: Option<ScenePresenter>,
+    mut observer: Option<Box<dyn RunObserver>>,
 ) -> io::Result<RunSummary> {
     let mut frame_times = stats::FrameTimes::new();
     // The browser and live cycling navigate the built-in scenes, so they are
@@ -515,7 +539,15 @@ fn run_loop(
         // of pause and is advanced with `dt = 0`, so it renders an identical
         // frame every tick; capture keeps running underneath. `scene_dt` drives
         // the presenter and scene-nav timers, `snap` feeds the whole frame.
-        let (snap, scene_dt) = pause_state.resolve(ui.paused, *reader.latest(), dt);
+        let live = *reader.latest();
+        // Feed the run-record observer the live snapshot (never the paused
+        // freeze) and the active scene id, so `--log-run` records real hops and
+        // detects scene/preset swaps from the id changing.
+        if let Some(obs) = observer.as_mut() {
+            let scene_id = presenter.as_ref().and_then(ScenePresenter::layer0_scene_id);
+            obs.frame(&live, scene_id);
+        }
+        let (snap, scene_dt) = pause_state.resolve(ui.paused, live, dt);
 
         // Apply a scene switch the browser/cycle keys requested on the previous
         // frame, then age the cycle toast on the frame clock. The switch reuses
@@ -687,6 +719,9 @@ fn run_loop(
                 let selector = row.selector.clone();
                 let label = row.name.clone();
                 switch_device(selector.clone());
+                if let Some(obs) = observer.as_mut() {
+                    obs.device_switch(&label);
+                }
                 ui.devices.set_active(selector);
                 ui.devices.close();
                 ui.notice = Some(format!("capture → {label}"));
@@ -777,6 +812,9 @@ fn run_loop(
                                 ui.mapping.on_preset_swap(p.layer0_mapping_entries());
                             }
                             ui.notice = Some(format!("reloaded {:.0}ms", event.elapsed_ms));
+                            if let Some(obs) = observer.as_mut() {
+                                obs.reload(p.layer0_scene_id(), event.elapsed_ms);
+                            }
                         }
                         // A broken edit keeps the running scene; the error's
                         // first line surfaces on the status row.
@@ -812,6 +850,9 @@ fn run_loop(
                             Ok(scene) => {
                                 p.swap_scene(scene);
                                 ui.notice = Some(format!("reloaded {:.0}ms", event.elapsed_ms));
+                                if let Some(obs) = observer.as_mut() {
+                                    obs.reload(p.layer0_scene_id(), event.elapsed_ms);
+                                }
                             }
                             // Re-validated but failed to rebuild the live VM (rare):
                             // keep the running scene, surface the message.
