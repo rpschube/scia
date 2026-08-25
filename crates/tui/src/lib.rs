@@ -73,8 +73,8 @@ pub use kitty::{CLEANUP as KITTY_CLEANUP, KittyEncoder};
 pub use mapping_ui::{MappingUi, SourceSignal, draw_mapping, table_display};
 pub use mosaic::{Cell, CellGrid, FrameBuffer, TextRun, Tier};
 pub use nowplaying::{
-    ArtResult, DecodeJob, MetaRuntime, NowPlayingState, TrackArt, art_palette_to_scene,
-    draw_now_playing, extrapolated_position,
+    ArtResult, DecodeJob, MetaRuntime, NowPlayingMode, NowPlayingState, TrackArt,
+    art_palette_to_scene, draw_now_playing, extrapolated_position, resolve_now_playing,
 };
 pub use pixel::{FALLBACK_CELL_PX, PIXEL_BUDGET, PixelBuffer, image_dims};
 pub use presenter::{
@@ -138,6 +138,11 @@ pub struct TuiOptions {
     /// The chrome personality to start in. Defaults to
     /// [`ChromeMode::Invisible`].
     pub chrome: ChromeMode,
+    /// What the now-playing surfaces may name, and in what order (config
+    /// `[defaults] now_playing` / `--now-playing`). Governs the ambient chrome
+    /// line and the `n` panel, and whether the audio-source observer runs.
+    /// Defaults to [`NowPlayingMode::MediaThenSources`].
+    pub now_playing_mode: NowPlayingMode,
     /// The `--scene-file` path, when a preset was loaded from disk. The tuning
     /// strip writes its adjustments back to this file, comment-preserving, when
     /// set; otherwise it exports the running builtin preset under
@@ -186,6 +191,7 @@ impl Default for TuiOptions {
             initial_notice: None,
             keymap: Keymap::default(),
             chrome: ChromeMode::Invisible,
+            now_playing_mode: NowPlayingMode::default(),
             scene_file: None,
             config_dir: None,
             device: DeviceSelector::Default,
@@ -409,6 +415,7 @@ fn run_loop(
         scene_nav: SceneNav::new(initial_scene),
         keymap: opts.keymap,
         chrome: ChromeState::new(opts.chrome),
+        now_playing_mode: opts.now_playing_mode,
         devices: DevicePicker::new(opts.device.clone(), opts.prefer_pipewire),
         // Opens at startup when the binary detected WSL on a live capture, so the
         // guidance is the first thing seen rather than a black, WSL-only screen.
@@ -429,11 +436,12 @@ fn run_loop(
     // identical frame every tick.
     let mut pause_state = PauseState::default();
 
-    // The now-playing runtime: the platform backend (MPRIS/SMTC) plus a decode
-    // worker, wired by channels. Absence is normal — no backend or no media
-    // session leaves the state empty and the panel quiet. Dropped at loop exit,
-    // which stops the backend and joins the worker.
-    let meta = MetaRuntime::spawn();
+    // The now-playing runtime: the platform metadata backend (MPRIS/SMTC), a
+    // decode worker, and — only when the now-playing mode names sources — the
+    // audio-source observer. Absence is normal: no backend or no media session
+    // leaves the state empty and the panel quiet. Dropped at loop exit, which
+    // stops the backends and joins the workers.
+    let meta = MetaRuntime::spawn(opts.now_playing_mode.observes_sources());
     // The scene's own palette, remembered when an art palette is applied so the
     // palette key can crossfade back to it.
     let mut scene_base_palette: Option<Palette> = None;
@@ -571,6 +579,16 @@ fn run_loop(
         while let Some(res) = meta.try_result() {
             ui.now_playing
                 .apply_art(res.track_key, res.preview, res.palette);
+        }
+        // Drain audio-source-observer events: the dominant audio app feeding the
+        // mix, or its clearing. Inert when the mode does not name sources (no
+        // observer runs). This is the attribution shown when no media session is
+        // playing — the game case.
+        while let Some(ev) = meta.try_source_event() {
+            ui.source_app = match ev {
+                scia_meta::SourceEvent::Dominant(name) => Some(name),
+                scia_meta::SourceEvent::Cleared => None,
+            };
         }
 
         // Resolve a palette-key request here, where the presenter lives: apply the
@@ -961,6 +979,8 @@ fn run_loop(
                                     body,
                                     &ui.now_playing,
                                     ui.palette_applied,
+                                    ui.now_playing_shows_media(),
+                                    ui.now_playing_source(),
                                 );
                             }
                             // The tuning strip paints over the body bottom, above the
