@@ -245,3 +245,42 @@ fn error_in_render_holds_the_last_good_frame() {
         "the render fault holds the last good frame"
     );
 }
+
+#[test]
+fn a_hostile_field_grid_is_bounded_and_prompt() {
+    // canvas:field() copies cols*rows values on the host side, outside the Lua
+    // interrupt and memory cap — the bridge must clamp the dimensions itself.
+    // Unclamped, 65535×65535 would copy ~4.3 billion values (a multi-minute
+    // stall and gigabytes of host memory); clamped, the tick stays microseconds.
+    const HOSTILE_FIELD: &str = r#"
+    return {
+      id = "hostile-field", mood = "test", summary = "oversized field grid",
+      update = function(features, dt) end,
+      render = function(canvas)
+        canvas:field(65535, 65535, {}, 0, 1.0)
+      end,
+    }
+    "#;
+    let mut scene = LuauScene::from_source(HOSTILE_FIELD, "hostile-field", LuauLimits::default())
+        .expect("compiles");
+    scene.init(&ctx());
+    scene.update(&FeatureSnapshot::default(), 1.0 / 60.0);
+    let mut canvas = Canvas::new(1.0);
+    let started = Instant::now();
+    scene.render(&mut canvas);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "an oversized field must be clamped, not copied whole"
+    );
+    assert!(
+        !scene.is_errored(),
+        "a clamped field draw is not a fault: {:?}",
+        scene.last_error()
+    );
+    // The stored grid is the clamped one: at most 256×256 values.
+    assert!(
+        canvas.field_data().len() <= 256 * 256,
+        "field arena holds {} values, expected the clamped grid",
+        canvas.field_data().len()
+    );
+}

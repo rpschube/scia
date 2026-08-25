@@ -88,6 +88,14 @@ impl CanvasUd {
     }
 }
 
+/// The per-axis ceiling on a scripted `field()` grid. The canvas copies
+/// `cols * rows` values into its arena before any presenter-side clamping, and
+/// the copy loop runs on the host — outside the Lua instruction interrupt and
+/// memory cap — so the bridge must bound the dimensions itself. 256×256 is far
+/// above any sensible coarse grid (the design precedent is 32×24) while keeping
+/// the worst-case copy at 64 Ki values.
+const MAX_FIELD_AXIS: u16 = 256;
+
 /// Clamp a Lua number to a palette slot index `0..=7`.
 fn to_slot(v: f64) -> u8 {
     if v.is_nan() {
@@ -155,6 +163,8 @@ impl UserData for CanvasUd {
         methods.add_method(
             "field",
             |_, this, (cols, rows, values, slot, intensity): (u16, u16, mlua::Table, f64, f32)| {
+                let cols = cols.min(MAX_FIELD_AXIS);
+                let rows = rows.min(MAX_FIELD_AXIS);
                 let count = cols as usize * rows as usize;
                 let mut scratch = this.scratch.borrow_mut();
                 scratch.clear();
