@@ -153,6 +153,20 @@ pub struct SampleSink {
     /// [`sample_ring_with_tee`] installs it for the dual-tap probe, which then reads
     /// the teed packets while the DSP consumes the primary ring untouched.
     tee: Option<TeeProducer>,
+    /// Per-push delivery log of the primary ring (always present, wait-free). On
+    /// every push it records this packet's `(frames, delivery_ns, cumulative_frames)`
+    /// so the DSP can map a hop's newest frame to the **actual** push that delivered
+    /// it — instead of inferring a delivery time from `last_push_ns` minus the ring
+    /// occupancy, which assumes a uniform nominal frame rate and reads early when a
+    /// real backend delivers in faster-than-realtime bursts (WASAPI loopback timer
+    /// coalescing). This is the same exact-mapping the dual-tap tee uses, applied to
+    /// the production hop stamp. The [`SampleConsumer`] holds the read half.
+    delivery: Arc<PushLog>,
+    /// Producer-owned running count of frames committed to the primary ring (only
+    /// frames actually written; a drop does not advance it), so each logged
+    /// `cumulative_frames` matches the frame stream the DSP consumes even when the
+    /// ring drops on overflow.
+    delivery_cum: u64,
 }
 
 impl SampleSink {
@@ -204,6 +218,20 @@ impl SampleSink {
                 let split = first.len();
                 first.copy_from_slice(&src[..split]);
                 second.copy_from_slice(&src[split..]);
+                // Log this push's delivery BEFORE committing the samples to the
+                // ring. The log store is sequenced-before the ring commit on this
+                // (single producer) thread, so a DSP that observes these frames via
+                // the ring's acquire load is guaranteed to also observe their
+                // delivery record — the mapping is never short a record for a frame
+                // the DSP can read. Frames are the committed count, so the log's
+                // `cumulative_frames` tracks exactly the stream the DSP consumes.
+                let frames_written = (to_write / channels) as u64;
+                self.delivery_cum += frames_written;
+                self.delivery.push(PushRecord {
+                    frames: frames_written as u32,
+                    delivery_ns: now,
+                    cumulative_frames: self.delivery_cum,
+                });
                 chunk.commit_all();
             }
         }
@@ -251,6 +279,11 @@ impl SampleSink {
 pub struct SampleConsumer {
     consumer: rtrb::Consumer<f32>,
     stats: Arc<SinkStats>,
+    /// Read half of the primary ring's per-push delivery log (see
+    /// [`SampleSink::delivery`]). The DSP thread is its single consumer; it drains
+    /// new records with [`SampleConsumer::drain_delivery`] to map each hop's newest
+    /// frame to the delivery time of the push that actually carried it.
+    delivery: Arc<PushLog>,
 }
 
 impl SampleConsumer {
@@ -270,6 +303,15 @@ impl SampleConsumer {
     #[must_use]
     pub fn stats(&self) -> &Arc<SinkStats> {
         &self.stats
+    }
+
+    /// Append every per-push delivery record logged since the last drain to `out`,
+    /// in push order (see [`SampleSink::delivery`]). The DSP thread is the single
+    /// consumer; it keeps a running frame cursor and maps a hop's newest frame to
+    /// the delivery time of the push that carried it. `out` is not cleared, so a
+    /// caller accumulating a pending queue can drain straight into it.
+    pub(crate) fn drain_delivery(&self, out: &mut Vec<PushRecord>) {
+        self.delivery.drain(out);
     }
 
     /// Drain every interleaved sample currently buffered into `out`, replacing
@@ -335,13 +377,23 @@ pub fn sample_ring(epoch: Instant) -> (SampleSink, SampleConsumer) {
 #[must_use]
 pub(crate) fn sample_ring_with_stats(stats: Arc<SinkStats>) -> (SampleSink, SampleConsumer) {
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(RING_SLOTS);
+    // A fresh per-push delivery log per ring: a reopen builds a new ring (this
+    // function) and so a new log, and the DSP resets its frame cursor when it
+    // adopts the swapped-in consumer, keeping the mapping aligned across reopens.
+    let delivery = Arc::new(PushLog::new());
     (
         SampleSink {
             producer,
             stats: Arc::clone(&stats),
             tee: None,
+            delivery: Arc::clone(&delivery),
+            delivery_cum: 0,
         },
-        SampleConsumer { consumer, stats },
+        SampleConsumer {
+            consumer,
+            stats,
+            delivery,
+        },
     )
 }
 
