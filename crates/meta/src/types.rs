@@ -210,16 +210,37 @@ pub enum MetaEvent {
 /// A running backend. Constructed by a backend's `start` function; joins its
 /// worker threads when dropped. Holding it keeps the backend running; dropping
 /// it stops the threads and blocks until they have finished.
+///
+/// Shutdown is two steps, in order: set the shared stop flag, then fire every
+/// registered *waker*. A flag alone only stops a thread that is polling it; a
+/// thread parked in an async `await` (as the MPRIS backend is, inside its
+/// D-Bus reconcile loop) never observes it. Each waker is a one-shot trigger a
+/// backend supplies to cancel such a park — e.g. closing the channel the MPRIS
+/// loop races its reconcile against — so the join that follows returns promptly
+/// instead of blocking forever. A backend whose loop already polls the flag on
+/// a short cadence (the Windows SMTC backend) registers no waker.
 pub struct MetaHandle {
     stop: Arc<AtomicBool>,
+    wakers: Vec<Box<dyn FnOnce() + Send>>,
     joins: Vec<JoinHandle<()>>,
 }
 
 impl MetaHandle {
-    /// Wrap a backend's stop flag and worker threads. Backends construct this;
-    /// the flag is shared with the threads, which observe it and unwind.
-    pub(crate) fn new(stop: Arc<AtomicBool>, joins: Vec<JoinHandle<()>>) -> Self {
-        Self { stop, joins }
+    /// Wrap a backend's stop flag, its shutdown wakers, and its worker threads.
+    /// Backends construct this; the flag is shared with the threads, which
+    /// observe it and unwind, and each waker is fired once (before the joins) to
+    /// cancel a thread parked in an `await` rather than polling the flag. Pass an
+    /// empty `wakers` vector when every thread already polls the flag promptly.
+    pub(crate) fn new(
+        stop: Arc<AtomicBool>,
+        wakers: Vec<Box<dyn FnOnce() + Send>>,
+        joins: Vec<JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            stop,
+            wakers,
+            joins,
+        }
     }
 
     /// Stop the backend and wait for its threads to finish. Equivalent to
@@ -231,7 +252,14 @@ impl MetaHandle {
 
 impl Drop for MetaHandle {
     fn drop(&mut self) {
+        // Set the flag first (the error-path idle loop and the fetch worker poll
+        // it), then fire every waker so a thread blocked in an async await is
+        // cancelled and can exit — only then join, or the join could block
+        // forever on a thread that never sees the flag.
         self.stop.store(true, Ordering::Relaxed);
+        for waker in self.wakers.drain(..) {
+            waker();
+        }
         for join in self.joins.drain(..) {
             let _ = join.join();
         }

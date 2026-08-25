@@ -34,6 +34,7 @@
 //! `i.scdn.co/image/` CDN form first (see [`rewrite_art_url`]).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +56,12 @@ const NAME_PREFIX: &str = "org.mpris.MediaPlayer2.";
 /// Safety-net reconcile interval; the mechanism is signals, this only backstops
 /// a missed one and bounds how long a drop takes to notice the stop flag.
 const FALLBACK_TICK: Duration = Duration::from_secs(1);
+/// Upper bound on any single D-Bus await in the reconcile loop. A player that
+/// stops answering (or a bus that wedges) must never be able to strand the loop,
+/// so every call races this timer and a lapse is treated as absence/error — the
+/// module's absence-is-normal stance. Generous enough that a healthy but busy
+/// bus never trips it.
+const DBUS_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Cap on a fetched artwork body.
 const MAX_ART_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -62,7 +69,26 @@ const MAX_ART_BYTES: u64 = 8 * 1024 * 1024;
 /// joins it on drop. Events are pushed to `tx`. A machine with no session bus
 /// produces no events and never errors.
 pub fn start(tx: Sender<MetaEvent>) -> MetaHandle {
+    start_at(tx, None)
+}
+
+/// Like [`start`], but connect to an explicit D-Bus address instead of the
+/// session bus resolved from the environment. `None` means the session bus
+/// (what [`start`] uses). Exposed for the integration test, which points the
+/// backend at a private bus it spawns so the shutdown path can be exercised
+/// against a live player without touching the ambient session bus or a global
+/// environment variable; production callers use [`start`].
+#[doc(hidden)]
+pub fn start_at(tx: Sender<MetaEvent>, address: Option<String>) -> MetaHandle {
     let stop = Arc::new(AtomicBool::new(false));
+
+    // A one-shot shutdown wake. The reconcile loop races its whole body against
+    // a receive on this channel; closing the sender (from `MetaHandle`'s drop)
+    // resolves that race and drops the loop future — cancelling any in-flight
+    // D-Bus await — so the thread exits at once instead of parking forever on a
+    // reply that may never come. The `AtomicBool` still governs the error-path
+    // idle loop and the fetch worker.
+    let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
 
     let (art_tx, art_rx) = mpsc::channel::<ArtworkJob>();
     let fetch_stop = stop.clone();
@@ -76,7 +102,7 @@ pub fn start(tx: Sender<MetaEvent>) -> MetaHandle {
     let backend_join: JoinHandle<()> = thread::Builder::new()
         .name("scia-meta-mpris".into())
         .spawn(move || {
-            if run_backend(&tx, &art_tx, &backend_stop).is_err() {
+            if run_backend(&tx, &art_tx, &backend_stop, &stop_rx, address).is_err() {
                 // No session bus or a fatal D-Bus error: metadata is simply
                 // absent. Idle until asked to stop rather than spinning.
                 while !backend_stop.load(Ordering::Relaxed) {
@@ -88,7 +114,11 @@ pub fn start(tx: Sender<MetaEvent>) -> MetaHandle {
         })
         .expect("spawn scia-meta-mpris thread");
 
-    MetaHandle::new(stop, vec![backend_join, fetch_join])
+    // Closing the stop channel is the wake; `MetaHandle` fires it before joining.
+    let waker: Box<dyn FnOnce() + Send> = Box::new(move || {
+        stop_tx.close();
+    });
+    MetaHandle::new(stop, vec![waker], vec![backend_join, fetch_join])
 }
 
 /// A unit of work for the artwork thread: fetch `art` and, on success, emit it
@@ -268,47 +298,100 @@ fn run_backend(
     tx: &Sender<MetaEvent>,
     art_tx: &Sender<ArtworkJob>,
     stop: &Arc<AtomicBool>,
+    stop_rx: &async_channel::Receiver<()>,
+    address: Option<String>,
 ) -> zbus::Result<()> {
     async_io::block_on(async move {
-        let conn = zbus::Connection::session().await?;
-        let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
-
-        // Route the two signal classes we care about to this connection. We use
-        // the signals only as a wake — correctness comes from the reconcile
-        // query, not from parsing the signal body.
-        for rule in [
-            "type='signal',interface='org.freedesktop.DBus.Properties',\
-             member='PropertiesChanged',path='/org/mpris/MediaPlayer2'",
-            "type='signal',sender='org.freedesktop.DBus',\
-             interface='org.freedesktop.DBus',member='NameOwnerChanged'",
-        ] {
-            let rule: zbus::MatchRule = rule.try_into()?;
-            dbus.add_match_rule(rule).await?;
-        }
-
-        let mut stream = zbus::MessageStream::from(conn.clone());
-        let mut recon = Reconciler::new();
-
-        // Emit the initial state, then wake on a signal or the safety-net tick.
-        reconcile(&mut recon, &conn, &dbus, tx, art_tx).await;
-        loop {
-            {
-                use futures_lite::{FutureExt, StreamExt};
-                let signal = async {
-                    let _ = stream.next().await;
-                };
-                let tick = async {
-                    async_io::Timer::after(FALLBACK_TICK).await;
-                };
-                signal.or(tick).await;
-            }
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            reconcile(&mut recon, &conn, &dbus, tx, art_tx).await;
-        }
-        zbus::Result::Ok(())
+        use futures_lite::FutureExt;
+        // Race the whole reconcile loop against the shutdown signal. When the
+        // handle is dropped the stop channel closes, `stopped` wins, and the
+        // loop future — INCLUDING any `reconcile` awaiting a D-Bus reply that
+        // may never arrive — is dropped. That async cancellation is what makes
+        // `block_on` return and the thread exit promptly, rather than depending
+        // on the loop noticing the flag between awaits (it may never get there).
+        let stopped = async {
+            // Resolves when the sender is closed (drop) or a token is sent.
+            let _ = stop_rx.recv().await;
+            zbus::Result::Ok(())
+        };
+        run_backend_loop(tx, art_tx, stop, address)
+            .or(stopped)
+            .await
     })
+}
+
+/// The reconcile loop proper: connect, register the signal match rules, emit the
+/// initial state, then reconcile on every signal or safety-net tick until the
+/// stop flag is set. Runs as a future the caller races against shutdown, so it
+/// need not itself poll for a fast exit — it is cancelled by being dropped.
+async fn run_backend_loop(
+    tx: &Sender<MetaEvent>,
+    art_tx: &Sender<ArtworkJob>,
+    stop: &Arc<AtomicBool>,
+    address: Option<String>,
+) -> zbus::Result<()> {
+    let conn = match address {
+        Some(addr) => {
+            zbus::connection::Builder::address(addr.as_str())?
+                .build()
+                .await?
+        }
+        None => zbus::Connection::session().await?,
+    };
+    let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
+
+    // Route the two signal classes we care about to this connection. We use
+    // the signals only as a wake — correctness comes from the reconcile
+    // query, not from parsing the signal body. A wedged setup call just loses
+    // the signal wake; the fallback tick still drives reconcile, so it is
+    // best-effort and bounded rather than allowed to hang.
+    for rule in [
+        "type='signal',interface='org.freedesktop.DBus.Properties',\
+         member='PropertiesChanged',path='/org/mpris/MediaPlayer2'",
+        "type='signal',sender='org.freedesktop.DBus',\
+         interface='org.freedesktop.DBus',member='NameOwnerChanged'",
+    ] {
+        let rule: zbus::MatchRule = rule.try_into()?;
+        let _ = with_dbus_timeout(dbus.add_match_rule(rule)).await;
+    }
+
+    let mut stream = zbus::MessageStream::from(conn.clone());
+    let mut recon = Reconciler::new();
+
+    // Emit the initial state, then wake on a signal or the safety-net tick.
+    reconcile(&mut recon, &conn, &dbus, tx, art_tx).await;
+    loop {
+        {
+            use futures_lite::{FutureExt, StreamExt};
+            let signal = async {
+                let _ = stream.next().await;
+            };
+            let tick = async {
+                async_io::Timer::after(FALLBACK_TICK).await;
+            };
+            signal.or(tick).await;
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        reconcile(&mut recon, &conn, &dbus, tx, art_tx).await;
+    }
+    zbus::Result::Ok(())
+}
+
+/// Race a single D-Bus await against [`DBUS_CALL_TIMEOUT`]. `Some(v)` is the
+/// call's result; `None` means it did not finish in time and the caller treats
+/// the player/query as absent. This bounds the loop even outside shutdown: no
+/// one call can wedge it, independent of the top-level cancellation that handles
+/// shutdown.
+async fn with_dbus_timeout<T>(fut: impl Future<Output = T>) -> Option<T> {
+    use futures_lite::FutureExt;
+    async { Some(fut.await) }
+        .or(async {
+            async_io::Timer::after(DBUS_CALL_TIMEOUT).await;
+            None
+        })
+        .await
 }
 
 /// Query every player, select the winner, and emit any resulting events.
@@ -319,8 +402,11 @@ async fn reconcile(
     tx: &Sender<MetaEvent>,
     art_tx: &Sender<ArtworkJob>,
 ) {
-    let Ok(names) = dbus.list_names().await else {
-        return;
+    let names = match with_dbus_timeout(dbus.list_names()).await {
+        Some(Ok(names)) => names,
+        // A wedged or failed enumeration is treated as "no players": leave the
+        // last emitted state as-is and wait for the next wake.
+        _ => return,
     };
     let players: Vec<String> = names
         .iter()
@@ -336,15 +422,36 @@ async fn reconcile(
     let mut metas: HashMap<String, (NowPlaying, Option<String>)> = HashMap::new();
 
     for bus in &players {
-        let Ok(proxy) = zbus::Proxy::new(conn, bus.clone(), MPRIS_PATH, PLAYER_IFACE).await else {
-            continue;
+        let proxy = match with_dbus_timeout(zbus::Proxy::new(
+            conn,
+            bus.clone(),
+            MPRIS_PATH,
+            PLAYER_IFACE,
+        ))
+        .await
+        {
+            Some(Ok(proxy)) => proxy,
+            // Could not build a proxy (or it wedged): skip this player, it
+            // simply does not contribute to selection this pass.
+            _ => continue,
         };
-        let status = proxy.get_property::<String>("PlaybackStatus").await.ok();
-        let metadata = proxy
-            .get_property::<HashMap<String, OwnedValue>>("Metadata")
-            .await
-            .unwrap_or_default();
-        let position = proxy.get_property::<i64>("Position").await.ok();
+        // Each property read is bounded on its own: a player that stops
+        // answering mid-read is skipped rather than stranding the whole loop.
+        let status = match with_dbus_timeout(proxy.get_property::<String>("PlaybackStatus")).await {
+            Some(r) => r.ok(),
+            None => continue,
+        };
+        let metadata =
+            match with_dbus_timeout(proxy.get_property::<HashMap<String, OwnedValue>>("Metadata"))
+                .await
+            {
+                Some(r) => r.unwrap_or_default(),
+                None => continue,
+            };
+        let position = match with_dbus_timeout(proxy.get_property::<i64>("Position")).await {
+            Some(r) => r.ok(),
+            None => continue,
+        };
 
         let pstatus = parse_status(status.as_deref());
         let parsed = parse_metadata(&metadata);
