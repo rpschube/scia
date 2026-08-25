@@ -48,6 +48,10 @@ realfft = "3"
 rtrb = "0.4"
 thiserror = "2"
 triple_buffer = "9"
+# Structured logging facade. Zero-cost when no subscriber is installed
+# (the default), so the DSP hot path pays nothing for logging that is off; not a
+# UI/scripting dependency, so the `core-deps` isolation gate holds.
+tracing = "0.1"
 # Machine-readable feature stream (US-UX-2): serde derives on the wire frame and
 # NDJSON encoding. Both crates already ride in the workspace tree (the golden
 # DSP tests use them), so this adds no new third-party dependency. Kept UI-free —

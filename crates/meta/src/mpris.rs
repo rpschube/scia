@@ -490,6 +490,7 @@ async fn reconcile(
     match select_winner(&states).map(|s| s.bus_name.clone()) {
         None => {
             if recon.last_bus.is_some() {
+                tracing::info!(target: "scia::meta", "now-playing session cleared");
                 let _ = tx.send(MetaEvent::Cleared);
                 recon.last_bus = None;
                 recon.last_key = None;
@@ -503,6 +504,13 @@ async fn reconcile(
             let status_changed = recon.last_status != Some(np.status);
 
             if key_changed || bus_changed || status_changed {
+                // Track titles are acceptable in local logs (see docs/logging.md).
+                tracing::info!(
+                    target: "scia::meta",
+                    title = ?np.title,
+                    status = ?np.status,
+                    "now-playing session changed"
+                );
                 let _ = tx.send(MetaEvent::TrackChanged(np.clone()));
             }
             // Only (re)fetch art when the track itself (or the winning player)
@@ -555,6 +563,12 @@ fn run_fetch_worker(rx: Receiver<ArtworkJob>, tx: Sender<MetaEvent>, stop: Arc<A
         if let Some((key, art)) = sched.due(Instant::now()) {
             match fetch_artwork(&art) {
                 Some(bytes) if !bytes.is_empty() => {
+                    tracing::debug!(
+                        target: "scia::meta",
+                        stage = "fetch",
+                        bytes = bytes.len(),
+                        "artwork campaign succeeded"
+                    );
                     sched.on_success(&key);
                     let _ = tx.send(MetaEvent::Artwork {
                         track_key: key,
@@ -562,7 +576,14 @@ fn run_fetch_worker(rx: Receiver<ArtworkJob>, tx: Sender<MetaEvent>, stop: Arc<A
                         source_app: source_app.clone(),
                     });
                 }
-                _ => sched.on_failure(Instant::now(), &key),
+                _ => {
+                    tracing::debug!(
+                        target: "scia::meta",
+                        stage = "fetch",
+                        "artwork campaign attempt failed; will retry or abandon"
+                    );
+                    sched.on_failure(Instant::now(), &key);
+                }
             }
             // Loop back promptly to drain and re-check.
             continue;

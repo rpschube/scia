@@ -551,7 +551,14 @@ impl LuauScene {
     /// Latch a fault: freeze the scene and remember the message.
     fn fail(&mut self, err: &mlua::Error) {
         self.errored = true;
-        self.last_error = Some(one_line(err));
+        let msg = one_line(err);
+        tracing::warn!(
+            target: "scia::scene",
+            scene = self.info.id,
+            error = %msg,
+            "Luau scene faulted; holding last good frame"
+        );
+        self.last_error = Some(msg);
     }
 
     /// Rewrite the shared feature snapshot and the in-place bars table.

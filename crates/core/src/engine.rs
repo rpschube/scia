@@ -366,6 +366,13 @@ impl Shared {
                 route.format = format;
                 route.route_id = route.backend.route_id();
                 self.reopens.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    target: "scia::engine",
+                    sample_rate = format.sample_rate,
+                    channels = format.channels,
+                    down,
+                    "capture reopened"
+                );
                 // Recovery: end any reconnect episode.
                 self.errored_since_ns.store(0, Ordering::Release);
                 self.episode_attempts.store(0, Ordering::Relaxed);
@@ -388,6 +395,12 @@ impl Shared {
                 // The DSP thread keeps synthesizing silence until a later attempt
                 // succeeds.
                 self.reopen_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "scia::engine",
+                    error = %err,
+                    down,
+                    "capture reopen failed"
+                );
                 *self
                     .last_reopen_error
                     .lock()
@@ -634,6 +647,14 @@ impl Engine {
         let format = stream.format();
         stats.set_channels(format.channels);
         let route_id = backend.route_id();
+        tracing::info!(
+            target: "scia::engine",
+            sample_rate = format.sample_rate,
+            channels = format.channels,
+            perf_mode = config.perf_mode,
+            route_watch = config.route_watch,
+            "capture engine started"
+        );
 
         let (writer, reader) = feature_bus();
         let stop = Arc::new(AtomicBool::new(false));
@@ -910,6 +931,7 @@ impl Engine {
     /// inert (nothing drives the reopen). Callable from any thread.
     #[cfg(feature = "capture-cpal")]
     pub fn set_device(&self, selector: crate::backends::cpal::DeviceSelector) {
+        tracing::info!(target: "scia::engine", "capture device switch requested");
         *self
             .shared
             .pending_device

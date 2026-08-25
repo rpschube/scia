@@ -1,0 +1,18 @@
+[package]
+name = "scia-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Run-record schema and low-level record/rotating writers for scia telemetry."
+
+# This crate is the data plane for the scene-quality harness: it owns the frozen
+# run-record schema (v1) and the two small, dependency-free writers the harness
+# and the app share. It deliberately depends on NO other workspace crate — the
+# app maps a `scia-core` FeatureSnapshot into these plain structs — so the schema
+# can be mirrored by a sibling tool without dragging the engine in.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

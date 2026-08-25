@@ -826,7 +826,19 @@ pub fn load_preset(path: &Path) -> Result<Preset, PresetError> {
         col: None,
         kind: PresetErrorKind::Io(e.to_string()),
     })?;
-    parse_preset(&text, Some(path))
+    let result = parse_preset(&text, Some(path));
+    // Log the outcome without the path (privacy: no filesystem paths in
+    // messages) — the parser's line/col on failure is enough to locate the edit.
+    match &result {
+        Ok(_) => tracing::debug!(target: "scia::scene", "preset loaded from disk"),
+        Err(err) => tracing::warn!(
+            target: "scia::scene",
+            line = ?err.line,
+            col = ?err.col,
+            "preset load failed"
+        ),
+    }
+    result
 }
 
 fn validate(raw: RawDoc, src: &str, file: Option<&Path>) -> Result<Preset, PresetError> {
