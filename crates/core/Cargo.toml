@@ -41,6 +41,12 @@ realfft = "3"
 rtrb = "0.4"
 thiserror = "2"
 triple_buffer = "9"
+# Machine-readable feature stream (US-UX-2): serde derives on the wire frame and
+# NDJSON encoding. Both crates already ride in the workspace tree (the golden
+# DSP tests use them), so this adds no new third-party dependency. Kept UI-free —
+# the `core-deps` gate still holds.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dependencies.cpal]
 # Pinned exactly. The Linux system-mix baseline relies on cpal's PipeWire host

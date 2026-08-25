@@ -23,7 +23,8 @@ pub const SPECTRUM_BINS: usize = 256;
 /// The states form a monotone ladder as silence persists (`Active` → `Quiet` →
 /// `Idle`) and collapse straight back to `Active` the moment signal returns.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Activity {
     /// Signal is present: the DSP thread processes at full hop rate.
     #[default]
