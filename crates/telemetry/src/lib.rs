@@ -18,7 +18,9 @@
 pub mod record;
 pub mod rotate;
 
-pub use record::{CanvasStats, Event, Hop, Record, RecordWriter, RunEnd, RunStart, SCHEMA};
+pub use record::{
+    CanvasStats, Event, Hop, Record, RecordWriter, RunEnd, RunStart, SCHEMA, to_line,
+};
 pub use rotate::RotatingFile;
 
 /// The crate name, resolved at compile time from Cargo metadata.

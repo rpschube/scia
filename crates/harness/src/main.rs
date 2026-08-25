@@ -12,10 +12,10 @@ use scia_harness::clip;
 use scia_harness::corpus;
 use scia_harness::freeze::{DEFAULT_FLOOR, DEFAULT_MARGIN, Envelope};
 use scia_harness::metrics::{MetricParams, Metrics};
-use scia_harness::records::to_line;
 use scia_harness::replay::{RunRequest, load_preset_labeled, run as replay_run};
 use scia_harness::synth::{SYNTH_SPECS, synth_spec};
 use scia_harness::verdict;
+use scia_telemetry::record::to_line;
 
 /// Scene-quality harness: replay golden clips through scenes, score the display
 /// lists, and run the A/B / preference-log / envelope plumbing.

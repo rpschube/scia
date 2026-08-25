@@ -2339,6 +2339,7 @@ dependencies = [
  "clap",
  "scia-core",
  "scia-scenes",
+ "scia-telemetry",
  "serde",
  "serde_json",
  "toml 0.9.12+spec-1.1.0",

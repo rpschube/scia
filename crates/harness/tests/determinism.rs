@@ -2,9 +2,9 @@
 //! identical metrics and identical run records.
 
 use scia_harness::metrics::MetricParams;
-use scia_harness::records::to_line;
 use scia_harness::replay::{RunRequest, run};
 use scia_harness::synth::{SynthSpec, synth_spec};
+use scia_telemetry::record::to_line;
 
 fn short_clip() -> SynthSpec {
     SynthSpec {

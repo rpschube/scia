@@ -19,7 +19,7 @@ use scia_scenes::{
 
 use crate::canvas_stats::CanvasProbe;
 use crate::metrics::{self, MetricParams, Metrics, Series};
-use crate::records::{Event, Hop, RECORD_SCHEMA, Record, RunEnd, RunStart};
+use scia_telemetry::record::{Event, Hop, Record, RunEnd, RunStart, SCHEMA};
 
 /// The canonical drawing aspect ratio (width / height) a headless run renders
 /// at: a 16:9 display. Coverage is aspect-independent (it is a normalised-area
@@ -152,7 +152,7 @@ pub fn run(req: &RunRequest) -> RunOutput {
 
     let mut records: Vec<Record> = Vec::with_capacity(req.frames.len() + 2);
     records.push(Record::RunStart(RunStart {
-        schema: RECORD_SCHEMA,
+        schema: SCHEMA,
         scene: record_scene,
         preset: req.preset_label.clone(),
         params: params_map,
