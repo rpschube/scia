@@ -1275,6 +1275,29 @@ impl Preset {
         self.palette
     }
 
+    /// A synthesized, layerless preset that runs the scene described by `info`
+    /// with its manifest defaults and `palette`. This is how a Luau scene reaches
+    /// the `--scene`/browser path, which is built around presets: it carries no
+    /// `[map]` mappings and one implicit layer (the scene itself). `info` is
+    /// typically a Luau [`SceneInfo`] from the catalog, but the shape works for
+    /// any registered scene.
+    #[must_use]
+    pub fn for_scene(info: &crate::registry::SceneInfo, palette: Palette) -> Self {
+        let params = merge_params(info.params, &[]);
+        Self {
+            name: info.id.to_string(),
+            scene: info.id.to_string(),
+            description: Some(info.summary.to_string()),
+            mood: info.mood.to_string(),
+            params,
+            layers: Vec::new(),
+            mappings: Vec::new(),
+            palette_source: PaletteSource::Static,
+            params_overlay: Vec::new(),
+            palette,
+        }
+    }
+
     /// Instantiate the preset into its live layers at the given aspect ratio.
     ///
     /// A layerless preset yields exactly one layer (the preset scene with the
@@ -1328,8 +1351,14 @@ impl Preset {
         mappings: &[MapEntry],
         aspect: f32,
     ) -> LayerInstance {
+        // A layer scene is a built-in or a discovered Luau scene; fall back to
+        // the preset's own scene (then to a Luau scene of that id) so a
+        // synthesized Luau preset instantiates its scripted scene.
         let mut scene = create_builtin(scene_id)
-            .unwrap_or_else(|| create_builtin(&self.scene).expect("preset scene is registered"));
+            .or_else(|| crate::luau::catalog::create_luau(scene_id))
+            .or_else(|| create_builtin(&self.scene))
+            .or_else(|| crate::luau::catalog::create_luau(&self.scene))
+            .expect("preset scene is registered");
         let ctx = SceneCtx::new(aspect, self.palette, params);
         scene.init(&ctx);
         LayerInstance {

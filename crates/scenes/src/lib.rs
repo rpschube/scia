@@ -17,12 +17,18 @@
 
 pub mod builtin;
 pub mod canvas;
+pub mod luau;
 pub mod palette;
 pub mod preset;
 pub mod registry;
 pub mod scene;
 
 pub use canvas::{Canvas, PALETTE_SLOTS, Primitive, Slot, Style};
+pub use luau::{
+    LuauError, LuauErrorKind, LuauLimits, LuauReloadEvent, LuauScene, LuauSource, LuauWatcher,
+    catalog_scene_info, catalog_scenes, compile_manifest, create_scene, is_luau_scene,
+    luau_scene_ids, luau_scene_path, scene_preset, scenes_dir, shipped_scenes,
+};
 pub use palette::{Palette, Rgb};
 pub use preset::{
     Blend, Curve, ExprError, ExprMapping, Feature, Layer, LayerInstance, MapEntry, Mapping,

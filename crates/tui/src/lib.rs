@@ -53,7 +53,7 @@ use scia_core::engine::EngineHealth;
 use scia_core::{
     Activity, DeviceInfo, DeviceSelector, EngineStats, FeatureReader, FeatureSnapshot, list_devices,
 };
-use scia_scenes::{Palette, Preset, ReloadEvent, builtin_preset, builtin_presets, builtin_scenes};
+use scia_scenes::{Palette, Preset, ReloadEvent, builtin_presets, catalog_scenes, scene_preset};
 
 pub use chrome::{ChromeMode, ChromeState, Fade};
 pub use devicepick::{
@@ -354,7 +354,7 @@ fn run_loop(
     let initial_scene = opts
         .scene
         .as_deref()
-        .and_then(|name| builtin_scenes().iter().position(|s| s.id == name))
+        .and_then(|name| catalog_scenes().iter().position(|s| s.id == name))
         .unwrap_or(0);
     let mut ui = UiState {
         label: opts.label.clone(),
@@ -453,7 +453,7 @@ fn run_loop(
         // rather than blanking between them.
         if let Some(id) = ui.scene_nav.take_pending() {
             if let Some(p) = presenter.as_mut() {
-                if let Some(Ok(preset)) = builtin_preset(id) {
+                if let Some(Ok(preset)) = scene_preset(id) {
                     p.swap_preset(&preset);
                     // The new scene carries its own palette; a swap cancels the
                     // applied art palette so a later palette key re-captures the
@@ -1489,6 +1489,7 @@ fn file_label(path: &Path) -> String {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+    use scia_scenes::builtin_preset;
 
     fn press(code: KeyCode) -> Event {
         Event::Key(KeyEvent {
@@ -1725,31 +1726,41 @@ mod tests {
 
     #[test]
     fn arrows_cycle_scenes_in_registry_order_and_wrap() {
+        use scia_scenes::{builtin_scenes, catalog_scenes};
+
+        // Cycling follows the catalogue order and wraps. The catalogue is the
+        // built-ins first, in their locked order, then the Luau scenes (the two
+        // shipped ones, plus any drop-ins on this machine), so the expected
+        // sequence is derived from it — robust to whatever is installed — while
+        // the two explicit checks below pin the guarantees that matter: the
+        // built-in prefix is in its locked order, and the shipped Luau scenes
+        // are catalogued.
+        let ids: Vec<&str> = catalog_scenes().iter().map(|i| i.id).collect();
+        let builtins = builtin_scenes();
+        for (i, b) in builtins.iter().enumerate() {
+            assert_eq!(ids[i], b.id, "built-ins keep their locked order");
+        }
+        assert!(
+            ids.contains(&"ripple") && ids.contains(&"swarm"),
+            "the shipped Luau scenes are catalogued: {ids:?}"
+        );
+
         let mut ui = scene_ui();
-        for expected in [
-            "lattice",
-            "aurora",
-            "starfall",
-            "tide",
-            "verso",
-            "phosphor",
-            "sonar",
-            "ember-drift",
-            "bloom",
-            "spectra",
-        ] {
+        // Starting committed at index 0, each Right advances one step and wraps
+        // after the last back to the first.
+        for k in 1..=ids.len() {
             assert!(matches!(
                 handle_event(press(KeyCode::Right), &mut ui),
                 Action::Redraw
             ));
-            assert_eq!(ui.scene_nav.take_pending(), Some(expected));
+            assert_eq!(ui.scene_nav.take_pending(), Some(ids[k % ids.len()]));
         }
-        // Left wraps backward from spectra to the last scene.
+        // Left wraps backward from the first scene to the last.
         assert!(matches!(
             handle_event(press(KeyCode::Left), &mut ui),
             Action::Redraw
         ));
-        assert_eq!(ui.scene_nav.take_pending(), Some("bloom"));
+        assert_eq!(ui.scene_nav.take_pending(), Some(*ids.last().unwrap()));
     }
 
     #[test]

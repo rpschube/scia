@@ -22,13 +22,18 @@ notify = "8"
 # against a fixed variable set.
 fasteval = { version = "0.2", default-features = false }
 
-# The scenes crate now carries serde + toml for the preset format. The mlua and
-# criterion dev-dependencies below remain probe-only (P5): they exist solely for
-# benches/tests that measure a Luau scene tick against the real FeatureSnapshot
-# shapes. See docs/probes/p5-luau-tick.md.
+# Sandboxed Luau scenes (US-CFG-4): a `.lua` scene binds to the same Scene trait
+# as a built-in. `luau` selects the Luau VM (its `Lua::sandbox()` and per-VM
+# memory limit + instruction interrupt are the isolation primitives), `vendored`
+# builds the Luau runtime from source so no system library is needed.
+mlua = { version = "0.11", features = ["luau", "vendored"] }
+
+# The scenes crate now carries serde + toml for the preset format. The criterion
+# dev-dependency below remains probe-only (P5): it exists solely for the bench
+# that measures a Luau scene tick against the real FeatureSnapshot shapes. See
+# docs/probes/p5-luau-tick.md.
 [dev-dependencies]
 scia-core = { path = "../core", version = "0.0.0" }
-mlua = { version = "0.11", features = ["luau", "vendored"] }
 criterion = { version = "0.6", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

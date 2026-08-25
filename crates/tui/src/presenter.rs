@@ -16,7 +16,7 @@ use ratatui::style::{Color, Style};
 
 use scia_scenes::{
     Blend, Canvas, LayerInstance, MapEntry, Palette, ParamSpec, Params, Preset, Rgb,
-    builtin_preset, builtin_presets, scene_info,
+    catalog_scene_info, catalog_scenes, scene_preset,
 };
 
 use crate::mosaic::{CellGrid, FrameBuffer, TextRun, Tier};
@@ -202,7 +202,7 @@ impl ScenePresenter {
     #[must_use]
     pub fn layer0_specs(&self) -> &'static [ParamSpec] {
         self.layer0_scene_id()
-            .and_then(scene_info)
+            .and_then(catalog_scene_info)
             .map_or(&[], |i| i.params)
     }
 
@@ -759,16 +759,19 @@ pub fn build_scene_presenter_mode(
     name: &str,
     mode: PresenterMode,
 ) -> Result<ScenePresenter, SceneError> {
-    match builtin_preset(name) {
+    // The catalog resolves both a built-in preset and a discovered Luau scene
+    // (via a synthesized preset), so a `.lua` drop-in is reachable by `--scene`
+    // exactly like a built-in.
+    match scene_preset(name) {
         Some(Ok(preset)) => Ok(ScenePresenter::with_mode(&preset, mode)),
         Some(Err(err)) => Err(SceneError {
             message: format!("invalid scene preset '{name}': {err}"),
         }),
         None => {
-            let names: Vec<&str> = builtin_presets().iter().map(|(n, _)| *n).collect();
+            let names: Vec<&str> = catalog_scenes().iter().map(|i| i.id).collect();
             Err(SceneError {
                 message: format!(
-                    "unknown scene preset '{name}'; available presets: {}",
+                    "unknown scene '{name}'; available scenes: {}",
                     names.join(", ")
                 ),
             })
@@ -780,6 +783,7 @@ pub fn build_scene_presenter_mode(
 mod tests {
     use super::*;
     use ratatui::buffer::Buffer;
+    use scia_scenes::builtin_preset;
 
     /// Rasterize the presenter's current grid into a fresh buffer of `cols × rows`.
     fn snapshot_buffer(p: &ScenePresenter, cols: u16, rows: u16) -> Buffer {
