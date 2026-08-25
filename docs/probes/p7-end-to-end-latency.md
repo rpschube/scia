@@ -369,6 +369,11 @@ residual bias. Raw-arrival is now a trustworthy direct measurement of capture
 delivery: from the click's emission (at the output callback) to its samples
 entering scia's ring, ≈ 108.7 ms on this endpoint.
 
+> **Superseded by round 7.** This "clean read" was clean *bookkeeping* over a
+> *wrong* correlation peak: the exact `ncc 1.000` is the degenerate silence match,
+> not a real click arrival. The `108.7 ms` raw-arrival is an artifact ~30 ms
+> downstream of the click — see *Field reconciliation — seventh round*.
+
 That reading forced the real diagnosis. Raw-arrival (≈ 108.7 ms) sat *above* the
 same-endpoint normal-run `emit → publish` (≈ 81.3 ms) by ~27.4 ms — impossible for
 two honest clocks, since a sample enters the ring **before** any hop that carries
@@ -553,6 +558,14 @@ to the **exact** delivery time of the push that carried it (the tee's per-push l
 no inference) — it is trustworthy (the round-3 finding stands). So the **publish
 leg lied, reading ~29.4 ms early**.
 
+> **Superseded by round 7.** This attribution is wrong. The exact per-push mapping
+> was sound, but it was fed the *wrong frame* — the raw correlator's degenerate
+> silence peak ~30 ms past the click (round 7). It was the **raw leg** that carried
+> the ~29.4 ms, not the publish leg; `emit → publish ≈ 79 ms` was honest. The
+> per-push publish clock below is still a genuine improvement (it removes a real
+> occupancy-inference error under bursty delivery, proved by the `dsp.rs` test),
+> but it was not the source of this inversion.
+
 The mechanism is the publish clock's **occupancy inference**. The pre-fix stamp was
 `last_push_ns − ring_occupancy × ns_per_frame`, which assumes the ring's occupancy
 was delivered at a uniform nominal frame rate. On this endpoint it is not: WASAPI
@@ -583,6 +596,12 @@ too. The tee's raw-arrival reconstruction was not touched.
   **not** scia's path) and ≈ 68.8 ms is loopback/endpoint capture buffering upstream
   of scia — the dominant pre-pixel term on this endpoint, in front of every
   visualiser equally.
+
+  > **Superseded by round 7.** `108.7 ms` is **not** capture transport — it is the
+  > degenerate-NCC silence match ~30 ms downstream of the click. The exact-mapping
+  > was sound, but it mapped the *wrong frame* (the correlator's flat-region peak).
+  > The raw leg, not the publish leg, carried the ~29.4 ms; `emit → publish ≈ 79 ms`
+  > was honest. See *Field reconciliation — seventh round*.
 - The pre-fix `emit → publish` figures — the `81.3 ms` first-run table *and* this
   round's `79.33 ms` — are **both retired**: the first was the DSP's processing
   wall-clock, the second the occupancy inference, and neither is the hop's true
@@ -597,6 +616,15 @@ too. The tee's raw-arrival reconstruction was not touched.
   large endpoint-capture term is upstream of scia and not scia's audio→pixel budget.
   The confirming on-hardware run: `latency_probe --dual-tap --clicks 25` must now
   read `subset 25/25` with every `Δ ∈ [0, 5.33 ms]`.
+
+> **Superseded by round 7 (numbers only).** This round mis-attributed the ~29 ms:
+> it retired `emit → publish ≈ 79.33 ms` and expected a post-fix
+> `emit → raw-arrival ≈ 108.7 … 114.0 ms`. Round 7's forensic coordinate shows the
+> opposite — the `~79 ms` publish series was **honest**, and the `108.7 ms`
+> raw-arrival was the degenerate-NCC artifact. The correct post-fix expectation is
+> `emit → raw-arrival ≈ 74–79.5 ms`, landing just at/under publish with
+> `Δ ∈ [0, 5.33 ms]`. The `subset 25/25` invariant target below is unchanged and
+> still correct. See *Field reconciliation — seventh round*.
 
 ## Forensic mode (`--forensic`) — round-6 diagnostic
 
@@ -674,3 +702,117 @@ The forensic seam is additive: the dual-tap tee now logs a per-push driver captu
 timestamp (`SampleSink::stamp_driver_capture`, stamped by the cpal callback and
 carried into the tee's per-push log), read only by `--forensic`; the shipped
 `--dual-tap` path and the production capture path are behaviourally unchanged.
+
+## Field reconciliation — seventh round (the raw-arrival artifact, found and removed)
+
+The round-6 forensic dump put both detectors on one absolute frame coordinate and,
+on real hardware with every click identical, read:
+
+```
+F.coord : peak_abs 53200  (the click's energy, inside the detecting hop)
+          raw_edge 54658  →  Dframes 1458 (+30.38 ms), constant; ncc 1.000 exactly
+F.energy : the click reads 'dfa5642333322111' at buckets ~18–33 (sharp attack +
+           ~15 ms decay tail); bucket 50 — where the correlation places the click —
+           is ALL ZEROS
+F.hops   : peaks_before all 0.000, detect_peak 0.856 — the publish side is clean
+F.output : one emission per click, output_delay ≈ 39.9 ms
+```
+
+That is the whole answer. `Dframes` is a rock-constant +1458 frames with
+`ncc = 1.000` **exactly**, the energy the correlation fired on (bucket 50) is
+silence, and the real click sits ~30 ms *earlier* (buckets 18–33). The raw
+correlator was not finding the click — it was finding the flat region after it.
+
+**Mechanism — the degenerate NCC.** The click template is a **rectangle**: a
+constant all-ones vector (`--click-ms 1.0` ⇒ 48 constant-amplitude frames).
+Normalized cross-correlation of a constant template against **any** constant
+window is `Σ / (√(Σ²)·√L) = ±1.0`, independent of amplitude — a mathematical
+degeneracy (a window of `L` copies of `c` gives `L·c / (√(L·c²)·√L) = 1`, see
+`crates/core/src/capture.rs::rect_xcorr_peak`). Digital silence's DC floor is
+exactly such a constant window, so it scores a perfect `1.000`. The real captured
+click is shaped by the render/capture chain into an attack + decay, so it is
+**not** constant, scores **below** 1.0, and loses to the first perfectly-flat
+region after its own decay settles (~1458 frames downstream on this endpoint —
+hence the immovable constant). Round 2's exact-recompute + clamp made `ncc ≤ 1`
+but did **not** exclude the degenerate silence match; round 5 chased the ~30 ms
+inversion on the *publish* side, but the forensic coordinate shows the publish
+side was clean all along — the inversion was entirely the raw leg.
+
+**The fix.** `rect_xcorr_peak` now makes degenerate/near-silent windows
+**ineligible** through two energy gates, both pure ratios of the strongest scanned
+window's energy — so they carry **no new user knob** and are invariant under any
+overall gain (scaling every sample by `k` scales both a candidate's energy and the
+reference by `k²`, leaving the decision unchanged — robust across capture volumes):
+
+- an **excursion gate** that rejects a globally flat search — pure silence, or
+  constant DC at *any* amplitude (whose raw NCC would otherwise be a spurious 1.0),
+  or steady wideband noise: with `E_max ≈ E_min` no offset localizes a click, so
+  every window scores 0; and
+- a **per-window floor** (energy ≥ 0.25 · `E_max`, i.e. RMS ≥ 0.5× the strongest
+  window's RMS) that rejects the low-energy flat regions — silence, the DC floor,
+  and the click's own decay tail — so only the click's energetic core (attack +
+  peak) is eligible.
+
+A failing window scores **0, never 1**; ties among eligible windows resolve to the
+leading edge (largest first-sample magnitude, then earliest offset), so a burst
+wider than the template anchors at its rising edge with no late drift. A shaped
+click's core clears the floor and wins; the flat region that used to win is
+excluded. (Mean-subtracting the *template* is **not** the fix — an all-ones
+template minus its mean is the zero vector and the score is undefined everywhere;
+the gate is on the *window's* energy.) Regression tests build the field profile —
+a shaped click in silence with a long flat tail — and assert the pre-fix scorer
+picks the flat tail while the fixed scorer picks the click's leading edge, plus
+that pure-silence and constant-DC windows score 0
+(`crates/core/src/capture.rs` tests).
+
+**Which figures stand, which are retired.**
+
+- **Every raw-arrival figure ever measured is this artifact.** `109.6 ms`
+  (round 1), `108.7 ms` (rounds 2–3), and the `108.72 ms` dual-tap raw leg
+  (round 5) were all the degenerate silence match ~30 ms downstream of the click,
+  not capture transport. Do **not** score US-PERF-1 against any of them. The
+  round-3 "clean read" (`ncc 1.000`, backlog 0) was clean *bookkeeping* over a
+  *wrong* correlation peak — the exact `ncc 1.000` was the tell, not a reassurance.
+- **The publish series (~79 ms) was honest all along.** `emit → publish ≈ 79.3 ms`
+  is the trustworthy end-to-end capture-to-publish figure on the reference
+  endpoint; `F.hops` (peaks_before all `0.000`, a clean `detect_peak`) confirms the
+  publish side fired on the real click. (The first-run `81.3 ms` was a pre-clock
+  upper bound; the per-push publish clock of round 5 remains the right anchor — it
+  simply was never the source of the inversion the earlier rounds pinned on it.)
+
+**Corrected interpretation.**
+
+- `emit → publish ≈ 79 ms` is the reference-endpoint end-to-end, from the output
+  callback to the carrying hop's publish.
+- Of that, `output delay (cb→play) ≈ 39.9 ms` is the probe player's own render
+  buffering — **not** scia's capture path (a real player's audio is already in the
+  mix). So **capture transport ≈ publish − output delay ≈ 39 ms** on this
+  endpoint: the audio→ring→publish latency scia actually sees.
+- **Hop gather is ≤ one hop (5.33 ms).** With the correlator fixed, a fresh
+  dual-tap run reads `emit → raw-arrival` just at or under `emit → publish`, and
+  the per-click Δ = publish − raw-arrival sits in `[0, 5.33 ms]` by construction —
+  that Δ is scia's own gather term above ring entry.
+- **US-PERF-1 scoring** uses that hop-gather Δ (≤ 5.33 ms), plus ~1 ms feature-bus
+  poll into `emit → observe`, plus up to one render frame (~16.7 ms at 60 fps) this
+  probe does not measure. The large endpoint-capture term is upstream of scia — in
+  front of every visualiser on the endpoint equally — and is not scia's audio→pixel
+  budget.
+
+**The confirming on-hardware run.**
+
+```
+latency_probe --dual-tap --clicks 25        # on the reference endpoint
+```
+
+Expected, post-fix: `subset 25/25` with every per-click `Δ ∈ [0, 5.33 ms]`;
+`emit → raw-arrival` lands just at or under `emit → publish` — **≈ 74–79.5 ms** on
+the reference endpoint (the ~30 ms artifact removed); and `ncc` is high but
+**plausibly below 1.0** for a shaped click — which is correct, not a failure. The
+≥ 80 % exit-code contract keys on the acceptance floor (`RAW_CORR_ACCEPT = 0.1`),
+which a sub-1.0 shaped click clears comfortably, so the contract stays honest for
+shaped clicks; it is emphatically not an `ncc ≥ 1` test.
+
+The six prior rounds are kept above in full: they are the record of how the answer
+was found — each clock-model fix was real and read clean on its own terms, and it
+took putting both detectors on one coordinate (round 6) to see that the raw leg,
+not any clock, carried the ~30 ms.
