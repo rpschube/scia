@@ -13,8 +13,20 @@
 //!   capture device (microphone-level), not the system mix.** Capturing system
 //!   audio on Linux needs either PipeWire (this feature) or an ALSA loopback /
 //!   monitor device selected by name via [`DeviceSelector::Named`].
-//! - **macOS (Core Audio):** the default *input* device, as a best-effort
-//!   placeholder; a true system-audio tap is a later card.
+//! - **macOS (Core Audio):** the system mix is captured by opening the *default
+//!   output device* and building an **input** stream on it, exactly like the
+//!   Windows WASAPI loopback and the PipeWire sink monitor. cpal 0.18.2's
+//!   Core Audio host recognises that an output endpoint has no input channels
+//!   and transparently builds a **process tap** over that endpoint plus a
+//!   private aggregate device (`AudioHardwareCreateProcessTap` /
+//!   `CATapDescription`, macOS 14.4+), so the input stream carries the whole
+//!   system output mix. This requires the user to grant the **System Audio
+//!   Recording** TCC permission the first time; macOS exposes no API to query
+//!   that permission's state, so a denied tap is detected by the engine's
+//!   zero-delivery heuristic (see [`crate::engine`]). On macOS older than 14.4
+//!   the tap APIs are absent and `open` fails cleanly; a user-installed
+//!   loopback device (e.g. BlackHole) selected via [`DeviceSelector::Named`]
+//!   is the fallback there. See `docs/macos.md`.
 //!
 //! The data callback does exactly one thing (Bencina rules — no allocation,
 //! locks, logging or syscalls): convert the incoming buffer to interleaved
@@ -152,12 +164,12 @@ impl CaptureBackend for CpalBackend {
     }
 }
 
-/// Which default-config direction a resolved device is opened with. WASAPI and
-/// the PipeWire sink-monitor path open the default *output* endpoint as a
-/// loopback input, so they negotiate against its output config; plain ALSA,
-/// Core Audio and the fallback open a real input device. Each platform (and
-/// feature) only ever constructs one direction, so a variant is dead on any
-/// single target — expected, like the enumeration helpers below.
+/// Which default-config direction a resolved device is opened with. WASAPI, the
+/// PipeWire sink-monitor path and the macOS Core Audio process tap open the
+/// default *output* endpoint as a loopback input, so they negotiate against its
+/// output config; plain ALSA and the fallback open a real input device. Each
+/// platform (and feature) only ever constructs one direction, so a variant is
+/// dead on any single target — expected, like the enumeration helpers below.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 enum ConfigDir {
@@ -233,13 +245,22 @@ impl CpalBackend {
     /// See the Windows [`resolve_device`](CpalBackend::resolve_device).
     #[cfg(target_os = "macos")]
     fn resolve_device(&self) -> Result<(cpal::Device, ConfigDir), CaptureError> {
-        // Best-effort: default input. A Core Audio system tap is a later card.
+        // System mix = the default output endpoint, opened as an input. cpal's
+        // Core Audio host sees the endpoint has no input channels and builds a
+        // process tap + aggregate device over it (macOS 14.4+), so the input
+        // stream carries the whole system output mix — the same output-as-input
+        // shape as the Windows WASAPI loopback and the PipeWire sink monitor.
+        // Negotiating against the endpoint's *output* config (ConfigDir::Output)
+        // matches the format the tap delivers. A `Named` selector picks an output
+        // endpoint by name and taps that endpoint's mix.
         let host = cpal::default_host();
         let device = match &self.device {
-            DeviceSelector::Default => host.default_input_device().ok_or(CaptureError::NoDevice)?,
-            DeviceSelector::Named(name) => find_by_name(input_devices(&host)?, name)?,
+            DeviceSelector::Default => {
+                host.default_output_device().ok_or(CaptureError::NoDevice)?
+            }
+            DeviceSelector::Named(name) => find_by_name(output_devices(&host)?, name)?,
         };
-        Ok((device, ConfigDir::Input))
+        Ok((device, ConfigDir::Output))
     }
 
     /// See the Windows [`resolve_device`](CpalBackend::resolve_device).
@@ -411,8 +432,8 @@ fn build_stream(
 }
 
 // The two enumeration helpers are each used only by some platforms' `resolve`
-// (output on Windows / PipeWire, input on ALSA / Core Audio), so one is dead on
-// any single target — that is expected, not a bug.
+// (output on Windows / PipeWire / macOS Core Audio, input on ALSA), so one is
+// dead on any single target — that is expected, not a bug.
 
 /// Enumerate output devices, mapping enumeration failure to a capture error.
 #[allow(dead_code)]

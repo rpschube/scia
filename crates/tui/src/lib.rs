@@ -842,6 +842,14 @@ fn run_loop(
                 ui.notice = Some(RECONNECT_NOTICE.to_string());
                 notice_deadline = None;
             }
+            HealthReaction::Unavailable(msg) => {
+                // A sticky, actionable notice (macOS system-audio permission): no
+                // TTL, so it stays up until capture starts delivering, when
+                // recovery replaces it with the restored notice. The loop keeps
+                // rendering the synthesized silence — never a black screen.
+                ui.notice = Some(msg);
+                notice_deadline = None;
+            }
             HealthReaction::Restored => {
                 ui.notice = Some(RESTORED_NOTICE.to_string());
                 notice_deadline = Some(frame_start + NOTICE_TTL);
@@ -1106,6 +1114,10 @@ enum HealthReaction {
     Steady,
     /// Capture is reconnecting; show the sticky degraded notice.
     Reconnecting,
+    /// Capture opened but is delivering nothing (e.g. a macOS system-audio
+    /// permission not yet granted or denied); show this sticky actionable notice
+    /// and keep rendering. Non-fatal — a later grant recovers to `Restored`.
+    Unavailable(String),
     /// Capture just recovered; show the one-shot "restored" notice.
     Restored,
     /// Capture failed past the deadline; leave the loop with this error.
@@ -1113,10 +1125,12 @@ enum HealthReaction {
 }
 
 /// Decide the loop's reaction to `health`, threading the "currently showing the
-/// reconnecting notice" flag so recovery is detected exactly once. Pure, so the
+/// degraded notice" flag so recovery is detected exactly once. Pure, so the
 /// loop's degraded-state behavior is unit-tested without a terminal:
 /// [`EngineHealth::Reconnecting`] never exits (it returns [`HealthReaction::Reconnecting`]),
-/// and only [`EngineHealth::Failed`] yields [`HealthReaction::Failed`].
+/// [`EngineHealth::Unavailable`] never exits either (it returns the actionable
+/// [`HealthReaction::Unavailable`]), and only [`EngineHealth::Failed`] yields
+/// [`HealthReaction::Failed`].
 fn health_transition(health: EngineHealth, reconnecting: &mut bool) -> HealthReaction {
     match health {
         EngineHealth::Ok => {
@@ -1130,6 +1144,12 @@ fn health_transition(health: EngineHealth, reconnecting: &mut bool) -> HealthRea
         EngineHealth::Reconnecting { .. } => {
             *reconnecting = true;
             HealthReaction::Reconnecting
+        }
+        EngineHealth::Unavailable { message } => {
+            // Reuse the degraded-notice flag so a later recovery to Ok clears the
+            // notice once via `Restored`, exactly as a reconnect episode does.
+            *reconnecting = true;
+            HealthReaction::Unavailable(message)
         }
         EngineHealth::Failed { error } => {
             *reconnecting = false;
@@ -2887,6 +2907,35 @@ mod tests {
             &mut reconnecting,
         );
         assert_eq!(r, HealthReaction::Reconnecting);
+    }
+
+    #[test]
+    fn unavailable_health_shows_actionable_notice_and_never_exits() {
+        // A macOS system-audio permission that is denied or not yet granted must
+        // not tear the loop down: the reaction is the sticky, actionable
+        // Unavailable notice, and a later grant (Ok) clears it once via Restored.
+        let mut ui = UiState::default();
+        let mut reconnecting = false;
+        let msg = "no system audio yet — allow System Audio Recording".to_string();
+
+        match health_transition(
+            EngineHealth::Unavailable {
+                message: msg.clone(),
+            },
+            &mut reconnecting,
+        ) {
+            HealthReaction::Unavailable(m) => ui.notice = Some(m),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        assert_eq!(ui.notice.as_deref(), Some(msg.as_str()));
+        assert!(reconnecting, "the degraded-notice flag is set");
+
+        // A later grant delivers audio → Ok → the notice clears once via Restored.
+        match health_transition(EngineHealth::Ok, &mut reconnecting) {
+            HealthReaction::Restored => ui.notice = Some(RESTORED_NOTICE.to_string()),
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert_eq!(ui.notice.as_deref(), Some(RESTORED_NOTICE));
     }
 
     #[test]

@@ -115,6 +115,61 @@ pub enum EngineHealth {
         /// The most recent reopen failure's message.
         error: String,
     },
+    /// Capture opened cleanly but has delivered nothing past the zero-delivery
+    /// window, so system audio is unavailable — on macOS, a denied or not-yet-
+    /// granted **System Audio Recording** permission (macOS exposes no API to
+    /// query it, so zero delivery is the only signal). Non-fatal, like
+    /// [`Reconnecting`](EngineHealth::Reconnecting): the loop keeps rendering the
+    /// synthesized silence and shows `message` as a calm, actionable notice, and
+    /// a later grant recovers to [`Ok`](EngineHealth::Ok) with no restart.
+    Unavailable {
+        /// A user-facing, actionable message (what to allow, and the System
+        /// Settings path to fix a prior denial).
+        message: String,
+    },
+}
+
+/// The macOS zero-delivery window: how long a freshly opened system-audio tap
+/// may deliver nothing before the engine reads the silence as a denied or
+/// not-yet-granted **System Audio Recording** permission. Long enough to clear
+/// the tap + aggregate-device warm-up and a prompt the user answers quickly,
+/// short enough that a genuine denial surfaces within a few seconds. macOS
+/// exposes no permission-state query, so a bounded zero-delivery timeout is the
+/// only detector available. Kept compiled everywhere the unit tests run so the
+/// heuristic is exercised off-target, not only on the macOS runner.
+#[cfg(any(target_os = "macos", test))]
+pub const MACOS_ZERO_DELIVERY_WINDOW: Duration = Duration::from_secs(5);
+
+/// The actionable notice surfaced when the macOS system-audio tap has delivered
+/// nothing past [`MACOS_ZERO_DELIVERY_WINDOW`]. Phrased to cover both a prompt
+/// the user has not answered yet and a prior denial, since the two are
+/// indistinguishable without a permission-state query.
+#[cfg(any(target_os = "macos", test))]
+pub const MACOS_TCC_NOTICE: &str = "no system audio yet — if macOS is asking to allow \
+\"System Audio Recording\", click Allow; if you denied it, enable scia under System \
+Settings > Privacy & Security > Screen & System Audio Recording, then reopen capture.";
+
+/// Zero-delivery denial heuristic (macOS). Maps a cumulative non-empty push
+/// count and the time elapsed since capture started onto an optional
+/// [`EngineHealth::Unavailable`]: a tap that has delivered nothing (`pushes == 0`)
+/// past `window_ns` is read as an unavailable system-audio permission. Pure and
+/// platform-agnostic so the mapping is unit-tested off-target (the "health seam
+/// with a fake"); the engine consults it only on macOS. A legitimate silent
+/// stream still delivers callbacks (zero-amplitude frames, so `pushes > 0`) and
+/// never trips this.
+#[cfg(any(target_os = "macos", test))]
+fn macos_zero_delivery_health(
+    pushes: u64,
+    elapsed_ns: u64,
+    window_ns: u64,
+) -> Option<EngineHealth> {
+    if pushes == 0 && elapsed_ns >= window_ns {
+        Some(EngineHealth::Unavailable {
+            message: MACOS_TCC_NOTICE.to_string(),
+        })
+    } else {
+        None
+    }
 }
 
 /// The runtime state of Windows perf mode, read with [`Engine::perf_mode_state`].
@@ -382,6 +437,25 @@ impl Shared {
     fn engine_health(&self) -> EngineHealth {
         let since = self.errored_since_ns.load(Ordering::Acquire);
         if since == 0 {
+            // Not in a reconnect episode: capture opened and has not errored.
+            // On macOS a tap can open cleanly yet deliver nothing when the
+            // "System Audio Recording" permission is denied or unanswered —
+            // there is no permission-state query, so zero delivery past the
+            // window is the only signal. Reads only atomics (no route lock), so
+            // a UI loop can poll it every frame. Non-macOS builds never compile
+            // this branch and always report Ok here.
+            #[cfg(target_os = "macos")]
+            {
+                let pushes = self.stats.pushes.load(Ordering::Relaxed);
+                let elapsed = self.stats.now_ns();
+                if let Some(health) = macos_zero_delivery_health(
+                    pushes,
+                    elapsed,
+                    MACOS_ZERO_DELIVERY_WINDOW.as_nanos() as u64,
+                ) {
+                    return health;
+                }
+            }
             return EngineHealth::Ok;
         }
         let now = self.stats.now_ns();
@@ -912,5 +986,73 @@ fn sleep_with_stop(stop: &AtomicBool, dur: Duration) -> bool {
             return false;
         }
         thread::sleep(STEP.min(deadline - now));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WINDOW_NS: u64 = 5_000_000_000; // 5 s, matching MACOS_ZERO_DELIVERY_WINDOW.
+
+    // The macOS zero-delivery heuristic is a pure mapping, so it is exercised
+    // off-target here (Linux/Windows CI) as well as on the macOS runner — the
+    // "health seam with a fake" the story asks for: fabricated push counts and
+    // elapsed times drive the mapping with no audio hardware.
+
+    #[test]
+    fn zero_delivery_within_window_is_not_yet_unavailable() {
+        // A freshly opened tap that has delivered nothing but is still inside the
+        // window is treated as healthy — the tap + aggregate warm-up and a prompt
+        // the user is answering must not be mistaken for a denial.
+        assert_eq!(macos_zero_delivery_health(0, 0, WINDOW_NS), None);
+        assert_eq!(
+            macos_zero_delivery_health(0, WINDOW_NS - 1, WINDOW_NS),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_delivery_past_window_maps_to_actionable_unavailable() {
+        let health = macos_zero_delivery_health(0, WINDOW_NS, WINDOW_NS)
+            .expect("zero delivery past the window must be Unavailable");
+        let EngineHealth::Unavailable { message } = health else {
+            panic!("expected EngineHealth::Unavailable, got {health:?}");
+        };
+        // The message is actionable: it names the permission and the exact
+        // System Settings path to fix a prior denial.
+        assert!(
+            message.contains("System Audio Recording"),
+            "message must name the permission: {message:?}"
+        );
+        assert!(
+            message
+                .contains("System Settings > Privacy & Security > Screen & System Audio Recording"),
+            "message must give the recovery path: {message:?}"
+        );
+    }
+
+    #[test]
+    fn any_delivery_is_never_unavailable() {
+        // A legitimate silent stream still delivers callbacks (zero-amplitude
+        // frames, pushes > 0), so it never trips the denial heuristic even long
+        // past the window.
+        assert_eq!(
+            macos_zero_delivery_health(1, WINDOW_NS * 100, WINDOW_NS),
+            None
+        );
+        assert_eq!(macos_zero_delivery_health(42, WINDOW_NS, WINDOW_NS), None);
+    }
+
+    #[test]
+    fn notice_constant_carries_the_recovery_path() {
+        // Guard the notice text the mapping surfaces so a reword cannot silently
+        // drop the actionable recovery path.
+        assert!(MACOS_TCC_NOTICE.contains("System Audio Recording"));
+        assert!(
+            MACOS_TCC_NOTICE
+                .contains("System Settings > Privacy & Security > Screen & System Audio Recording")
+        );
+        assert_eq!(MACOS_ZERO_DELIVERY_WINDOW.as_nanos() as u64, WINDOW_NS);
     }
 }
