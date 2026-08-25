@@ -167,6 +167,16 @@ pub struct SampleSink {
     /// `cumulative_frames` matches the frame stream the DSP consumes even when the
     /// ring drops on overflow.
     delivery_cum: u64,
+    /// Diagnostic-only (P7 forensic dual-tap): the most recent capture callback's
+    /// driver capture timestamp (ns on the backend's own clock — e.g. WASAPI QPC,
+    /// from cpal's `InputCallbackInfo::timestamp().capture`), stamped by the backend
+    /// via [`stamp_driver_capture`](SampleSink::stamp_driver_capture) just before it
+    /// pushes. `0` when the backend reports none (the synthetic source) and on every
+    /// production path (nothing reads it there). The dual-tap tee logs it alongside
+    /// each push so the forensic probe can compare the driver's own capture instant
+    /// against the wall-clock delivery time (`last_push_ns`) every other clock model
+    /// is derived from — the discriminator for a constant wall-vs-driver skew.
+    pending_driver_capture_ns: u64,
 }
 
 impl SampleSink {
@@ -244,7 +254,12 @@ impl SampleSink {
         // production path, so this is a never-taken branch there.
         if let Some(tee) = &mut self.tee {
             let whole = (interleaved.len() / channels) * channels;
-            tee.record(&interleaved[..whole], channels, now);
+            tee.record(
+                &interleaved[..whole],
+                channels,
+                now,
+                self.pending_driver_capture_ns,
+            );
         }
 
         let pushed = (to_write / channels) as u64;
@@ -266,6 +281,18 @@ impl SampleSink {
     #[must_use]
     pub fn free_samples(&self) -> usize {
         self.producer.slots()
+    }
+
+    /// Record the driver's capture timestamp for the next [`push`](SampleSink::push)
+    /// — the P7 forensic dual-tap seam. A capture backend that can read its driver's
+    /// capture-time clock (cpal's `InputCallbackInfo::timestamp().capture`) calls this
+    /// at the top of its callback, before it pushes; the value is carried into the
+    /// dual-tap tee's per-push log and surfaced only by the forensic probe. Inert on
+    /// every production path (the DSP never reads it) at a cost of one field store, so
+    /// the push hot path is otherwise unchanged. A backend with no usable driver
+    /// timestamp simply never calls this and the logged value stays `0`.
+    pub fn stamp_driver_capture(&mut self, driver_capture_ns: u64) {
+        self.pending_driver_capture_ns = driver_capture_ns;
     }
 
     /// Shared statistics for this sink.
@@ -388,6 +415,7 @@ pub(crate) fn sample_ring_with_stats(stats: Arc<SinkStats>) -> (SampleSink, Samp
             tee: None,
             delivery: Arc::clone(&delivery),
             delivery_cum: 0,
+            pending_driver_capture_ns: 0,
         },
         SampleConsumer {
             consumer,
@@ -957,6 +985,12 @@ impl PushLog {
 struct TeeProducer {
     samples: rtrb::Producer<f32>,
     log: Arc<PushLog>,
+    /// Parallel wait-free log of per-push driver capture timestamps (P7 forensic),
+    /// pushed one-for-one with each logged [`PushRecord`], in the same order, so the
+    /// forensic drain reads them in lockstep. `0` per entry when the backend never
+    /// stamped one. Only [`tee_drain_forensic`] reads it; the normal
+    /// [`tee_drain_into_timeline`] ignores it entirely.
+    driver: Arc<DriverLog>,
     /// Producer-owned running count of teed frames (only frames actually written
     /// to the sample ring; a dropped push does not advance it, so the count always
     /// matches the teed sample stream).
@@ -967,12 +1001,21 @@ struct TeeProducer {
 }
 
 impl TeeProducer {
-    /// Tee one whole-frame packet delivered at `delivery_ns`. All-or-nothing: if
+    /// Tee one whole-frame packet delivered at `delivery_ns`, carrying the driver's
+    /// capture timestamp `driver_capture_ns` (`0` when unknown). All-or-nothing: if
     /// the whole packet fits it is copied and logged; otherwise the packet is
     /// dropped and counted, so a logged record's samples are always present and
-    /// its newest frame is genuinely the packet's newest (the delivery anchor).
-    /// Wait-free and allocation-free.
-    fn record(&mut self, interleaved: &[f32], channels: usize, delivery_ns: u64) {
+    /// its newest frame is genuinely the packet's newest (the delivery anchor). The
+    /// driver stamp is pushed only when the record is (after a successful copy), so
+    /// the driver log and the record log stay one-for-one aligned. Wait-free and
+    /// allocation-free.
+    fn record(
+        &mut self,
+        interleaved: &[f32],
+        channels: usize,
+        delivery_ns: u64,
+        driver_capture_ns: u64,
+    ) {
         let frames = interleaved.len() / channels;
         if frames == 0 {
             return;
@@ -997,6 +1040,49 @@ impl TeeProducer {
             delivery_ns,
             cumulative_frames: self.cumulative_frames,
         });
+        self.driver.push(driver_capture_ns);
+    }
+}
+
+/// A wait-free single-producer / single-consumer log of per-push driver capture
+/// timestamps (ns on the backend's driver clock), the P7-forensic parallel to
+/// [`PushLog`]. One `u64` per teed push, pushed in lockstep with the [`PushRecord`]
+/// so [`tee_drain_forensic`] can read the two side by side. Overwrite-oldest past
+/// [`PUSH_LOG_SLOTS`] (never reached in a drained run). Shared as an [`Arc`].
+struct DriverLog {
+    slots: Box<[AtomicU64]>,
+    write: AtomicU64,
+    read: AtomicU64,
+}
+
+impl DriverLog {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(PUSH_LOG_SLOTS);
+        slots.resize_with(PUSH_LOG_SLOTS, || AtomicU64::new(0));
+        Self {
+            slots: slots.into_boxed_slice(),
+            write: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one driver timestamp. Wait-free; single producer only.
+    fn push(&self, driver_capture_ns: u64) {
+        let w = self.write.load(Ordering::Relaxed);
+        self.slots[(w as usize) % PUSH_LOG_SLOTS].store(driver_capture_ns, Ordering::Relaxed);
+        self.write.store(w.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Append every timestamp logged since the last drain to `out`, in push order.
+    /// Single consumer only.
+    fn drain(&self, out: &mut Vec<u64>) {
+        let w = self.write.load(Ordering::Acquire);
+        let mut r = self.read.load(Ordering::Relaxed);
+        while r < w {
+            out.push(self.slots[(r as usize) % PUSH_LOG_SLOTS].load(Ordering::Relaxed));
+            r += 1;
+        }
+        self.read.store(r, Ordering::Relaxed);
     }
 }
 
@@ -1007,9 +1093,14 @@ impl TeeProducer {
 pub struct TeeConsumer {
     samples: rtrb::Consumer<f32>,
     log: Arc<PushLog>,
+    /// Read half of the parallel driver-capture-timestamp log (P7 forensic). Drained
+    /// in lockstep with `log` by [`tee_drain_forensic`]; unused by the normal drain.
+    driver: Arc<DriverLog>,
     dropped_pushes: Arc<AtomicU64>,
     /// Reused record buffer, pre-reserved so a drain never allocates.
     records: Vec<PushRecord>,
+    /// Reused driver-stamp buffer for the forensic drain, pre-reserved likewise.
+    driver_scratch: Vec<u64>,
 }
 
 impl TeeConsumer {
@@ -1029,22 +1120,27 @@ impl TeeConsumer {
 fn new_tee() -> (TeeProducer, TeeConsumer) {
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(TEE_RING_SLOTS);
     let log = Arc::new(PushLog::new());
+    let driver = Arc::new(DriverLog::new());
     let dropped_pushes = Arc::new(AtomicU64::new(0));
     // A single 1 ms drain sees only a handful of pushes; reserve well above that
-    // so the reused buffer never grows on the drain path.
+    // so the reused buffers never grow on the drain path.
     let records = Vec::with_capacity(1024);
+    let driver_scratch = Vec::with_capacity(1024);
     (
         TeeProducer {
             samples: producer,
             log: Arc::clone(&log),
+            driver: Arc::clone(&driver),
             cumulative_frames: 0,
             dropped_pushes: Arc::clone(&dropped_pushes),
         },
         TeeConsumer {
             samples: consumer,
             log,
+            driver,
             dropped_pushes,
             records,
+            driver_scratch,
         },
     )
 }
@@ -1112,6 +1208,150 @@ pub fn tee_drain_into_timeline(
     }
     tee.records = records;
     appended
+}
+
+/// One teed push, surfaced for the P7 **forensic** dump: the push's own delivery
+/// record joined with the driver capture timestamp logged for it. All frame times
+/// are on the same absolute coordinate the tee's [`DrainTimeline`] uses — global
+/// teed frame index = cumulative frames since the stream started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForensicPush {
+    /// Cumulative teed frames through the end of this push (its newest frame is
+    /// global index `cumulative_frames − 1`).
+    pub cumulative_frames: u64,
+    /// Frames this push delivered.
+    pub frames: u32,
+    /// Wall-clock delivery time (`last_push_ns`, ns on the engine/ring epoch).
+    pub delivery_ns: u64,
+    /// Driver capture timestamp for this push (ns on the backend's driver clock),
+    /// `0` when the backend reported none.
+    pub driver_capture_ns: u64,
+}
+
+/// The forensic sibling of [`tee_drain_into_timeline`]: it drains the teed samples
+/// and per-push records into `mono` / `timeline` exactly as that function does, and
+/// **additionally** drains the parallel driver-capture log in lockstep, appending one
+/// [`ForensicPush`] per push to `pushes`. Returns the frames appended this call.
+///
+/// Kept a separate function so the shipped dual-tap path ([`tee_drain_into_timeline`])
+/// is byte-for-byte unchanged; this one is used only by the `--forensic` probe mode.
+/// The record log and the driver log are pushed one-for-one, so index `i` of the
+/// drained records aligns with index `i` of the drained driver stamps.
+pub fn tee_drain_forensic(
+    tee: &mut TeeConsumer,
+    scratch: &mut Vec<f32>,
+    mono: &mut Vec<f32>,
+    timeline: &mut DrainTimeline,
+    channels: usize,
+    pushes: &mut Vec<ForensicPush>,
+) -> usize {
+    let channels = channels.max(1);
+    // Move the reusable buffers out so the sample consumer and these buffers are not
+    // both borrowed through `tee` at once; restored at the end.
+    let mut records = std::mem::take(&mut tee.records);
+    let mut drivers = std::mem::take(&mut tee.driver_scratch);
+    records.clear();
+    drivers.clear();
+    tee.log.drain(&mut records);
+    tee.driver.drain(&mut drivers);
+    let mut appended = 0usize;
+    for (i, rec) in records.iter().enumerate() {
+        let need = rec.frames as usize * channels;
+        if need == 0 {
+            continue;
+        }
+        if tee.samples.slots() < need {
+            break;
+        }
+        scratch.clear();
+        if let Ok(chunk) = tee.samples.read_chunk(need) {
+            let (first, second) = chunk.as_slices();
+            scratch.extend_from_slice(first);
+            scratch.extend_from_slice(second);
+            chunk.commit_all();
+        } else {
+            break;
+        }
+        for f in 0..rec.frames as usize {
+            let base = f * channels;
+            let mut acc = 0.0f32;
+            for c in 0..channels {
+                acc += scratch[base + c];
+            }
+            mono.push(acc / channels as f32);
+        }
+        timeline.record_drain(rec.delivery_ns, u64::from(rec.frames));
+        pushes.push(ForensicPush {
+            cumulative_frames: rec.cumulative_frames,
+            frames: rec.frames,
+            delivery_ns: rec.delivery_ns,
+            driver_capture_ns: drivers.get(i).copied().unwrap_or(0),
+        });
+        appended += rec.frames as usize;
+    }
+    tee.records = records;
+    tee.driver_scratch = drivers;
+    appended
+}
+
+/// Index and value of the largest-magnitude sample in `signal[lo..=hi]`
+/// (inclusive), for the P7 forensic "in-hop peak sample" locator. The range is
+/// clamped to the signal; an empty or out-of-range range yields `(lo, 0.0)`.
+/// Ties resolve to the earliest index. Pure helper; unit-tested.
+#[must_use]
+pub fn peak_abs_in_range(signal: &[f32], lo: usize, hi: usize) -> (usize, f32) {
+    if signal.is_empty() {
+        return (lo, 0.0);
+    }
+    let start = lo.min(signal.len() - 1);
+    let end = hi.min(signal.len() - 1);
+    if start > end {
+        return (start, 0.0);
+    }
+    let mut best_idx = start;
+    let mut best_val = signal[start].abs();
+    for (off, &v) in signal[start..=end].iter().enumerate() {
+        let a = v.abs();
+        if a > best_val {
+            best_val = a;
+            best_idx = start + off;
+        }
+    }
+    (best_idx, best_val)
+}
+
+/// Per-millisecond peak-magnitude profile over a window for the P7 forensic energy
+/// dump. Bucket `k` covers global frames
+/// `start_frame + k*frames_per_bucket .. start_frame + (k+1)*frames_per_bucket` and
+/// holds the largest `|sample|` in that span (`0.0` for frames outside `signal`, so
+/// a window reaching before frame 0 or past the capture simply reads as silence
+/// there). `start_frame` is an `i64` so a window can legitimately begin before the
+/// stream start. Returns `n_buckets` values. Pure helper; unit-tested.
+#[must_use]
+pub fn bucket_peaks(
+    signal: &[f32],
+    start_frame: i64,
+    frames_per_bucket: usize,
+    n_buckets: usize,
+) -> Vec<f32> {
+    let fpb = frames_per_bucket.max(1) as i64;
+    let mut out = Vec::with_capacity(n_buckets);
+    for k in 0..n_buckets as i64 {
+        let lo = start_frame + k * fpb;
+        let hi = lo + fpb; // exclusive
+        let mut peak = 0.0f32;
+        // Clamp the bucket's frame span to the signal indices [0, len).
+        let a = lo.max(0);
+        let b = hi.min(signal.len() as i64);
+        for f in a..b {
+            let v = signal[f as usize].abs();
+            if v > peak {
+                peak = v;
+            }
+        }
+        out.push(peak);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1506,5 +1746,82 @@ mod tests {
         // A second drain with nothing buffered yields nothing.
         assert_eq!(consumer.drain_all(&mut out), 0);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn peak_abs_in_range_locates_the_extremum() {
+        let sig = [0.1f32, -0.9, 0.3, 0.8, -0.2];
+        // Whole-signal: the -0.9 at index 1 has the largest magnitude.
+        assert_eq!(peak_abs_in_range(&sig, 0, 4), (1, 0.9));
+        // Sub-range [2..=4]: the 0.8 at index 3.
+        assert_eq!(peak_abs_in_range(&sig, 2, 4), (3, 0.8));
+        // Range clamps to the signal; hi past the end still works.
+        assert_eq!(peak_abs_in_range(&sig, 3, 99), (3, 0.8));
+        // Empty signal is graceful.
+        assert_eq!(peak_abs_in_range(&[], 5, 9), (5, 0.0));
+        // Inverted range yields the floor.
+        assert_eq!(peak_abs_in_range(&sig, 4, 2), (4, 0.0));
+    }
+
+    #[test]
+    fn bucket_peaks_windows_by_frames_and_pads_out_of_range() {
+        // 12 samples, 4 frames per bucket. Put a spike in bucket 1 and bucket 2.
+        let mut sig = vec![0.0f32; 12];
+        sig[5] = 0.5; // bucket 1 (frames 4..8)
+        sig[9] = -0.7; // bucket 2 (frames 8..12)
+        let b = bucket_peaks(&sig, 0, 4, 3);
+        assert_eq!(b, vec![0.0, 0.5, 0.7]);
+
+        // A window that starts before frame 0 pads the leading buckets with 0 and
+        // still lands the spike in the correct (shifted) bucket. start=-4 => bucket
+        // 0 covers frames [-4,0) (all silence), bucket 1 covers [0,4), bucket 2
+        // covers [4,8) (the 0.5 spike).
+        let b = bucket_peaks(&sig, -4, 4, 4);
+        assert_eq!(b, vec![0.0, 0.0, 0.5, 0.7]);
+
+        // Reaching past the end pads trailing buckets with 0.
+        let b = bucket_peaks(&sig, 8, 4, 3);
+        assert_eq!(b, vec![0.7, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn tee_drain_forensic_surfaces_aligned_driver_stamps() {
+        let epoch = Instant::now();
+        let (mut sink, _primary, mut tee) = sample_ring_with_tee(epoch);
+        sink.stats().set_channels(1);
+
+        // Three pushes, each stamped with a distinct driver capture time before it.
+        let drivers = [111_000u64, 222_000, 333_000];
+        let sizes = [64usize, 32, 80];
+        for (&d, &n) in drivers.iter().zip(sizes.iter()) {
+            sink.stamp_driver_capture(d);
+            sink.push(&vec![0.25f32; n]);
+        }
+
+        let mut scratch: Vec<f32> = Vec::new();
+        let mut mono: Vec<f32> = Vec::new();
+        let mut timeline = DrainTimeline::new(48_000);
+        let mut pushes: Vec<ForensicPush> = Vec::new();
+        let appended = tee_drain_forensic(
+            &mut tee,
+            &mut scratch,
+            &mut mono,
+            &mut timeline,
+            1,
+            &mut pushes,
+        );
+
+        assert_eq!(appended, sizes.iter().sum::<usize>());
+        assert_eq!(pushes.len(), 3);
+        // Driver stamps come back in push order, aligned one-for-one with frames and
+        // the running cumulative frame count.
+        let mut cum = 0u64;
+        for (i, pf) in pushes.iter().enumerate() {
+            cum += sizes[i] as u64;
+            assert_eq!(pf.driver_capture_ns, drivers[i]);
+            assert_eq!(pf.frames as usize, sizes[i]);
+            assert_eq!(pf.cumulative_frames, cum);
+            assert!(pf.delivery_ns > 0);
+        }
     }
 }

@@ -275,6 +275,22 @@ impl CpalBackend {
     }
 }
 
+/// Stamp `sink` with this callback's driver capture timestamp — the P7 forensic
+/// dual-tap seam. cpal's [`InputCallbackInfo`](cpal::InputCallbackInfo) carries the
+/// driver's capture-time instant for the delivered buffer (WASAPI derives it from
+/// the performance counter; ALSA / PipeWire from the monotonic clock);
+/// `StreamInstant::as_nanos` yields it as nanoseconds on that driver clock. The
+/// dual-tap tee logs it per push so the forensic probe can compare the driver's own
+/// capture instant against the wall-clock delivery time everything else is derived
+/// from. Every other mode — and the DSP — ignores the value, so this is a single
+/// field store with no effect outside the forensic dump. Allocation-, lock- and
+/// syscall-free (pure field arithmetic on the info cpal already handed us).
+#[inline]
+fn stamp_driver_capture(sink: &mut SampleSink, info: &cpal::InputCallbackInfo) {
+    let capture = info.timestamp().capture;
+    sink.stamp_driver_capture(capture.as_nanos() as u64);
+}
+
 /// Build, start and wrap the cpal input stream. Selects the per-sample-format
 /// converter once, preallocates the conversion buffer, and installs the data
 /// and error callbacks.
@@ -376,7 +392,8 @@ fn build_stream(
     let stream = match sample_format {
         cpal::SampleFormat::F32 => device.build_input_stream(
             config,
-            move |data: &[f32], _| {
+            move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                stamp_driver_capture(&mut sink, info);
                 convert_and_push(data, f32_id, &downmix, &mut out_buf, &mut sink)
             },
             error_callback,
@@ -384,7 +401,8 @@ fn build_stream(
         ),
         cpal::SampleFormat::I16 => device.build_input_stream(
             config,
-            move |data: &[i16], _| {
+            move |data: &[i16], info: &cpal::InputCallbackInfo| {
+                stamp_driver_capture(&mut sink, info);
                 convert_and_push(data, i16_to_f32, &downmix, &mut out_buf, &mut sink)
             },
             error_callback,
@@ -392,7 +410,8 @@ fn build_stream(
         ),
         cpal::SampleFormat::U16 => device.build_input_stream(
             config,
-            move |data: &[u16], _| {
+            move |data: &[u16], info: &cpal::InputCallbackInfo| {
+                stamp_driver_capture(&mut sink, info);
                 convert_and_push(data, u16_to_f32, &downmix, &mut out_buf, &mut sink)
             },
             error_callback,
@@ -400,7 +419,8 @@ fn build_stream(
         ),
         cpal::SampleFormat::I32 => device.build_input_stream(
             config,
-            move |data: &[i32], _| {
+            move |data: &[i32], info: &cpal::InputCallbackInfo| {
+                stamp_driver_capture(&mut sink, info);
                 convert_and_push(data, i32_to_f32, &downmix, &mut out_buf, &mut sink)
             },
             error_callback,
@@ -408,7 +428,8 @@ fn build_stream(
         ),
         cpal::SampleFormat::U8 => device.build_input_stream(
             config,
-            move |data: &[u8], _| {
+            move |data: &[u8], info: &cpal::InputCallbackInfo| {
+                stamp_driver_capture(&mut sink, info);
                 convert_and_push(data, u8_to_f32, &downmix, &mut out_buf, &mut sink)
             },
             error_callback,

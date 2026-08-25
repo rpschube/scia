@@ -597,3 +597,80 @@ too. The tee's raw-arrival reconstruction was not touched.
   large endpoint-capture term is upstream of scia and not scia's audio→pixel budget.
   The confirming on-hardware run: `latency_probe --dual-tap --clicks 25` must now
   read `subset 25/25` with every `Δ ∈ [0, 5.33 ms]`.
+
+## Forensic mode (`--forensic`) — round-6 diagnostic
+
+Five rounds of clock-model fixes each read clean on their own terms and each still
+left the ~30 ms cross-mode gap on hardware, so round 6 stops modelling and starts
+**dumping**. `--forensic` implies `--dual-tap`: it runs the full dual-tap instrument
+unchanged (same `subset`/`Δ` verdict) and, for each matched click, writes a raw
+forensic trace to **stderr** — machine-readable single lines, no files. It measures
+nothing new; it puts both detectors on **one absolute frame coordinate** and shows
+the raw content and stream structure around each click, so a ~30 ms divergence is
+visible as *where the energy is* or *how the pushes are timed* rather than inferred
+from a model.
+
+**Coordinate.** Every frame index in the dump is absolute — cumulative teed frames
+since the stream started (the tee's `DrainTimeline` coordinate). The publish side is
+placed on it by inverting the detecting hop's `timestamp_ns` to its newest frame; the
+raw side is the cross-correlation leading edge directly. Both therefore live in the
+same space and can be subtracted.
+
+**How to run.**
+
+```
+# On the endpoint under test (headless):
+latency_probe --forensic --clicks 25
+latency_probe --forensic --output-device "NAME"
+
+# No audio hardware (CI-shaped smoke; driver column is absent):
+latency_probe --forensic --synthetic --clicks 12
+```
+
+**The five line kinds, per matched click.**
+
+- **`F.coord`** — the shared coordinate. `hop=[first,last]` and `hop_newest` are the
+  detecting hop's absolute frames; `peak_abs`/`in_hop`/`peak_val` locate the loudest
+  sample inside that hop (from the teed samples), and `snap_peak` is the peak the DSP
+  reported for the same hop (they should match — a mismatch means the two sides see
+  different content). `raw_edge` and `ncc` are the raw correlation's leading edge and
+  score. **`Dframes`** is `raw_edge − peak_abs`: **under one hop ⇒ both sides fired on
+  the same energy event; ≈ 1440 frames (~30 ms) ⇒ they fired on different events, or
+  one side carries a constant mapping offset.** This single number is the round-6
+  discriminator.
+- **`F.energy`** — a 70-bucket, 1 ms-per-bucket peak profile over
+  `[raw_edge − 50 ms, raw_edge + 20 ms]`, printed as 70 hex levels (`0`–`f`) scaled to
+  the window's own peak (`peak_scale`). The correlation position sits at **bucket 50**.
+  A second energy event ~30 ms *before* the click (a double render, an enhancement
+  pre-echo, a second copy) shows as a bump of high digits left of bucket 50.
+- **`F.push`** — the teed pushes covering the click window, one per line:
+  `cum` (cumulative frames), `frames`, `wall_delivery_ns` (the `last_push_ns` clock
+  every other model is derived from), and — when the backend exposes it —
+  `driver_capture_ns` (cpal's `InputCallbackInfo` capture instant, the driver's own
+  capture-time clock) with `wall_minus_driver_ns`. A **constant ~30 ms**
+  `wall_minus_driver` across pushes would indict the delivery timestamp wholesale. On
+  a backend with no usable driver instant (the synthetic source, or a host cpal
+  reports none for) the column is dropped and a one-time `F.push-driver: … NOT
+  available` line says so.
+- **`F.hops`** — the detector `threshold`, the detecting hop's generation and peak,
+  and `peaks_before=[…]`: the peak of the **10 hops before** the one that fired, so a
+  premature/noise trigger (a hop crossing threshold early) is visible.
+- **`F.output`** — the click's emission bookkeeping: `emit_ns` (the output callback
+  time) and `output_delay_ns` (host callback→playback delay plus the burst's
+  intra-buffer offset), plus `emissions_for_index`; more than one emission for an
+  index prints `<== DOUBLE-WRITE`, surfacing a double-write or wrap in the click
+  player.
+
+**Reading the dump.** Start at `F.coord`'s `Dframes`. If it is under a hop for every
+click, the two detectors agree on the event and the ~30 ms lives elsewhere (read
+`F.push` for a constant wall-vs-driver skew). If it is ~1440 frames, read `F.energy`:
+a high-digit bump left of bucket 50 says a *second, earlier* energy event exists in
+the stream that one detector locks onto — the "different events" branch — while a flat
+profile with only bucket 50 hot says the same single event is being *placed* ~30 ms
+apart by a shared mapping constant. The dump is the deliverable; it does not decide
+the branch, it makes the branch visible.
+
+The forensic seam is additive: the dual-tap tee now logs a per-push driver capture
+timestamp (`SampleSink::stamp_driver_capture`, stamped by the cpal callback and
+carried into the tee's per-push log), read only by `--forensic`; the shipped
+`--dual-tap` path and the production capture path are behaviourally unchanged.

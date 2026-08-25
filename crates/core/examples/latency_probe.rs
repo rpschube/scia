@@ -2,9 +2,9 @@
 //! stick for the audio→feature path.
 //!
 //! ```text
-//! latency_probe [--synthetic] [--raw-ring] [--device NAME] [--output-device NAME]
-//!               [--clicks N] [--spacing-ms N] [--amp F] [--click-ms F]
-//!               [--threshold F] [--perf-mode] [--list]
+//! latency_probe [--synthetic] [--raw-ring] [--dual-tap] [--forensic] [--device NAME]
+//!               [--output-device NAME] [--clicks N] [--spacing-ms N] [--amp F]
+//!               [--click-ms F] [--threshold F] [--perf-mode] [--list]
 //! ```
 //!
 //! It emits a train of known clicks into the system output, captures them back
@@ -36,6 +36,14 @@
 //!   invariant verdict `raw-arrival ≤ publish ≤ raw-arrival + one hop` — the
 //!   definitive discriminator for the cross-mode constant the two separate modes
 //!   could never settle.
+//! - **Forensic** (`--forensic`, implies `--dual-tap`): the round-6 diagnostic. It
+//!   runs the full dual-tap instrument and, for each matched click, dumps a raw
+//!   forensic trace to stderr (`F.coord` / `F.energy` / `F.push` / `F.hops` /
+//!   `F.output`) that puts both detectors on one absolute frame coordinate, profiles
+//!   the energy around the click, and surfaces the per-push driver-vs-wall
+//!   timestamps — so a ~30 ms discrepancy is visible as content location or stream
+//!   structure rather than modelled. It measures nothing new; it makes the raw data
+//!   visible. See `docs/probes/p7-end-to-end-latency.md`.
 //!
 //! Three intervals are reported as nearest-rank percentiles (ms): emit→publish
 //! (capture + one hop), publish→observe (poll latency), and the end-to-end
@@ -47,6 +55,7 @@
 //!
 //! Run with: `just _cargo run -p scia-core --example latency_probe -- --synthetic --clicks 10`
 
+use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,14 +65,14 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use scia_core::capture::{
-    DrainTimeline, RAW_CORR_ACCEPT, RING_FRAMES, drain_into_timeline, rect_xcorr_peak,
-    tee_drain_into_timeline,
+    DrainTimeline, ForensicPush, RAW_CORR_ACCEPT, RING_FRAMES, bucket_peaks, drain_into_timeline,
+    peak_abs_in_range, rect_xcorr_peak, tee_drain_forensic, tee_drain_into_timeline,
 };
 use scia_core::{
     CaptureBackend, CaptureError, CaptureTarget, ClickDetector, CpalBackend, Detection, DeviceKind,
     DeviceSelector, DualTapSample, DualTapStats, Emission, EmitLog, Engine, EngineConfig,
-    EngineError, FeatureReader, LatencyStats, Matcher, Pacing, Percentiles, PerfModeState, Signal,
-    StreamHealth, SyntheticBackend, list_devices, sample_ring,
+    EngineError, FeatureReader, LatencyStats, Matcher, Pacing, Percentiles, PerfModeState, Sample,
+    Signal, StreamHealth, SyntheticBackend, list_devices, sample_ring,
 };
 
 /// Tolerance the dual-tap invariant is scored within (ms) — a few frame-periods,
@@ -104,6 +113,7 @@ fn main() -> ExitCode {
     let mut do_list = false;
     let mut raw_ring = false;
     let mut dual_tap = false;
+    let mut forensic = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -113,6 +123,7 @@ fn main() -> ExitCode {
             "--list" => do_list = true,
             "--raw-ring" => raw_ring = true,
             "--dual-tap" => dual_tap = true,
+            "--forensic" => forensic = true,
             "--device" => {
                 i += 1;
                 match args.get(i) {
@@ -149,10 +160,12 @@ fn main() -> ExitCode {
             },
             "-h" | "--help" => {
                 println!(
-                    "usage: latency_probe [--synthetic] [--raw-ring] [--dual-tap] [--device NAME]\n\
-                     \x20                    [--output-device NAME] [--clicks N=25] [--spacing-ms N=400]\n\
-                     \x20                    [--amp F=0.8] [--click-ms F=1.0] [--threshold F=0.3]\n\
-                     \x20                    [--perf-mode] [--list]"
+                    "usage: latency_probe [--synthetic] [--raw-ring] [--dual-tap] [--forensic]\n\
+                     \x20                    [--device NAME] [--output-device NAME] [--clicks N=25]\n\
+                     \x20                    [--spacing-ms N=400] [--amp F=0.8] [--click-ms F=1.0]\n\
+                     \x20                    [--threshold F=0.3] [--perf-mode] [--list]\n\
+                     \x20  --forensic implies --dual-tap and dumps a per-click forensic trace \
+                     (see docs/probes/p7-end-to-end-latency.md)."
                 );
                 return ExitCode::SUCCESS;
             }
@@ -167,11 +180,16 @@ fn main() -> ExitCode {
     if do_list {
         return list();
     }
+    // --forensic is an extension of dual-tap: it runs the full dual-tap instrument
+    // and additionally dumps a per-click forensic trace to stderr.
+    if forensic {
+        dual_tap = true;
+    }
     if dual_tap && raw_ring {
-        return usage_err("--dual-tap and --raw-ring are mutually exclusive");
+        return usage_err("--dual-tap/--forensic and --raw-ring are mutually exclusive");
     }
     if dual_tap {
-        run_dual_tap(&params, device, output_device, synthetic)
+        run_dual_tap(&params, device, output_device, synthetic, forensic)
     } else if raw_ring {
         run_raw_ring(&params, device, output_device, synthetic)
     } else if synthetic {
@@ -762,6 +780,7 @@ fn run_dual_tap(
     capture_device: Option<String>,
     output_device: Option<String>,
     synthetic: bool,
+    forensic: bool,
 ) -> ExitCode {
     let emit_log = Arc::new(EmitLog::new());
 
@@ -862,6 +881,16 @@ fn run_dual_tap(
     let half_spacing_ns = u64::from(p.spacing_ms) / 2 * 1_000_000;
     let mut detector = ClickDetector::new(p.threshold, half_spacing_ns);
     let mut detections: Vec<Detection> = Vec::new();
+    // Forensic-only collection (empty and untouched unless --forensic):
+    //  - `forensic_pushes`: every teed push with its wall/driver stamps (item 3);
+    //  - `hop_history`: one (generation, peak, rms, timestamp_ns) per published hop,
+    //    so the 10 hops before a detection can be dumped (item 4).
+    let mut forensic_pushes: Vec<ForensicPush> = Vec::new();
+    let mut hop_history: Vec<(u64, f32, f32, u64)> = Vec::new();
+    if forensic {
+        forensic_pushes.reserve(4096);
+        hop_history.reserve((total_hops_estimate(p)) as usize);
+    }
     let total_ms = observe_ms + flush_ms;
     let deadline = Instant::now() + Duration::from_millis(total_ms);
     let mut last_gen: Option<u64> = None;
@@ -869,15 +898,45 @@ fn run_dual_tap(
         let snapshot = *reader.latest();
         if last_gen != Some(snapshot.generation) {
             last_gen = Some(snapshot.generation);
+            if forensic {
+                hop_history.push((
+                    snapshot.generation,
+                    snapshot.peak,
+                    snapshot.rms,
+                    snapshot.timestamp_ns,
+                ));
+            }
             if let Some(d) = detector.observe(&snapshot, engine.now_ns()) {
                 detections.push(d);
             }
         }
-        tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+        if forensic {
+            tee_drain_forensic(
+                &mut tee,
+                &mut scratch,
+                &mut mono,
+                &mut timeline,
+                channels,
+                &mut forensic_pushes,
+            );
+        } else {
+            tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+        }
         sleep(Duration::from_millis(1));
     }
     // One final drain catches the tail before capture is torn down.
-    tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+    if forensic {
+        tee_drain_forensic(
+            &mut tee,
+            &mut scratch,
+            &mut mono,
+            &mut timeline,
+            channels,
+            &mut forensic_pushes,
+        );
+    } else {
+        tee_drain_into_timeline(&mut tee, &mut scratch, &mut mono, &mut timeline, channels);
+    }
 
     let engine_stats = engine.stats();
     let dropped_pushes = tee.dropped_pushes();
@@ -899,7 +958,10 @@ fn run_dual_tap(
 
     // Raw-arrival side: cross-correlate each emitted click against the teed stream.
     let click_frames = ((p.click_ms * sample_rate as f32 / 1000.0).ceil() as usize).max(1);
-    let mut raw_by_index: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    // Per click, the raw-arrival hit: (ms, correlation leading-edge frame, ncc).
+    // The extra frame/ncc are only read by the forensic dump; the normal join reads
+    // `.0`.
+    let mut raw_by_index: HashMap<u32, (f32, usize, f32)> = HashMap::new();
     let mut raw_matched = 0u32;
     for e in &emissions {
         let lo = timeline.frame_at_or_after(e.emit_ns.saturating_sub(half_spacing_ns)) as usize;
@@ -908,7 +970,7 @@ fn run_dual_tap(
             if peak >= RAW_CORR_ACCEPT {
                 let arrival = timeline.sample_time_ns(offset as u64).unwrap_or(e.emit_ns);
                 let ms = (arrival as i64 - e.emit_ns as i64) as f32 / 1.0e6;
-                raw_by_index.insert(e.index, ms);
+                raw_by_index.insert(e.index, (ms, offset, peak));
                 raw_matched += 1;
             }
         }
@@ -917,7 +979,7 @@ fn run_dual_tap(
     // Join: a click measured BOTH ways becomes one dual-tap sample.
     let mut samples: Vec<DualTapSample> = Vec::new();
     for s in &matched.samples {
-        if let Some(&raw_ms) = raw_by_index.get(&s.index) {
+        if let Some(&(raw_ms, _, _)) = raw_by_index.get(&s.index) {
             let publish_ms = (s.publish_ns.saturating_sub(s.emit_ns)) as f32 / 1.0e6;
             samples.push(DualTapSample {
                 index: s.index,
@@ -991,6 +1053,21 @@ fn run_dual_tap(
          player's audio already in the mix."
     );
 
+    if forensic {
+        dump_forensic(
+            p,
+            sample_rate,
+            &mono,
+            &timeline,
+            &matched.samples,
+            &raw_by_index,
+            &detections,
+            &emissions,
+            &forensic_pushes,
+            &hop_history,
+        );
+    }
+
     // Exit contract mirrors the other modes: success when ≥ 80 % of emitted clicks
     // were measured both ways.
     if emitted == 0 {
@@ -1006,6 +1083,187 @@ fn run_dual_tap(
         );
         ExitCode::from(4)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Forensic dump (P7 round-6 diagnostic, `--forensic`)
+// ---------------------------------------------------------------------------
+
+/// Rough upper bound on published hops in a run, for pre-reserving the forensic hop
+/// history: the observation span in ms over the ~5.33 ms hop period, plus slack.
+fn total_hops_estimate(p: &Params) -> u64 {
+    let ms = 1000 + u64::from(p.clicks) * u64::from(p.spacing_ms) + 2000;
+    ms / 5 + 64
+}
+
+/// Emit the per-click forensic trace to stderr (machine-readable single lines). This
+/// does NOT model anything — it dumps raw positions and content so the discrepancy is
+/// visible directly. Every frame index is absolute (cumulative teed frames since the
+/// stream started), so the publish side and the raw side share one coordinate.
+///
+/// Five line kinds per matched click (see the P7 doc's forensic legend):
+///   F.coord  — the SHARED COORDINATE: the detecting hop's absolute frame range and
+///              its loudest sample vs the raw correlation's leading edge, with the
+///              frame delta between them (≈0 = same event; ≈1440 = ~30 ms apart).
+///   F.energy — a 70×1 ms peak profile over [raw_edge-50 ms, +20 ms], hex levels
+///              scaled to the window max, so a second energy event before the click
+///              is visible as a bump left of bucket 50.
+///   F.push   — the teed pushes covering the click: wall delivery vs driver capture
+///              timestamp (column dropped when the backend has no driver instant).
+///   F.hops   — the detector threshold and the peak of the 10 hops before the one
+///              that fired, so a premature/noise trigger shows.
+///   F.output — the click's emission bookkeeping and a double-write check.
+#[allow(clippy::too_many_arguments)]
+fn dump_forensic(
+    p: &Params,
+    sample_rate: u32,
+    mono: &[f32],
+    timeline: &DrainTimeline,
+    matched: &[Sample],
+    raw_by_index: &HashMap<u32, (f32, usize, f32)>,
+    detections: &[Detection],
+    emissions: &[Emission],
+    pushes: &[ForensicPush],
+    hop_history: &[(u64, f32, f32, u64)],
+) {
+    let fpb = (sample_rate as usize / 1000).max(1); // frames per 1 ms bucket
+    let ns_per_frame = 1.0e9 / f64::from(sample_rate.max(1));
+
+    // Recover the detecting hop's generation from a matched sample via its publish
+    // time (the hop's timestamp_ns).
+    let det_by_publish: HashMap<u64, Detection> =
+        detections.iter().map(|d| (d.publish_ns, *d)).collect();
+    // Emissions per index — more than one flags a double-write on the output side.
+    let mut emit_count: HashMap<u32, u32> = HashMap::new();
+    for e in emissions {
+        *emit_count.entry(e.index).or_insert(0) += 1;
+    }
+
+    // Does the backend expose a usable driver capture timestamp? 0 everywhere on the
+    // synthetic path (and on any host cpal reports no capture instant for).
+    let driver_available = pushes.iter().any(|pf| pf.driver_capture_ns != 0);
+
+    eprintln!("-- FORENSIC DUMP ----------------------------------------------");
+    eprintln!(
+        "F.legend  coordinate=absolute-teed-frame rate={sample_rate}Hz frames_per_ms={fpb} \
+         hop_frames={HOP_FRAMES} clicks={} threshold={:.3} — a ~1440-frame Δframes (~30 ms) \
+         between raw_edge and the hop peak means the two sides see DIFFERENT events / a shared \
+         mapping constant; a Δframes under one hop means the same event.",
+        p.clicks, p.threshold,
+    );
+    if !driver_available {
+        eprintln!(
+            "F.push-driver: driver capture timestamp NOT available on this backend \
+             (synthetic, or cpal reported no capture instant) — driver_capture_ns column omitted."
+        );
+    }
+
+    let mut ms_sorted: Vec<&Sample> = matched.iter().collect();
+    ms_sorted.sort_by_key(|s| s.index);
+
+    for s in ms_sorted {
+        let idx = s.index;
+
+        // ---- 1. SHARED COORDINATE ----
+        // Publish side: invert the hop's publish time to its newest absolute frame,
+        // hop = [newest-(HOP-1), newest]; find the loudest sample in it.
+        let g_newest = timeline
+            .frame_at_or_after(s.publish_ns)
+            .min(mono.len().saturating_sub(1) as u64);
+        let first = g_newest.saturating_sub(u64::from(HOP_FRAMES - 1));
+        let (peak_idx, peak_val) = peak_abs_in_range(mono, first as usize, g_newest as usize);
+        let in_hop = peak_idx as i64 - first as i64;
+        // Detecting hop's reported peak (both sides should see the same content).
+        let snap_peak = det_by_publish
+            .get(&s.publish_ns)
+            .and_then(|d| hop_history.iter().find(|h| h.0 == d.generation))
+            .map_or(f32::NAN, |h| h.1);
+
+        if let Some(&(_ms, edge, ncc)) = raw_by_index.get(&idx) {
+            let delta = edge as i64 - peak_idx as i64;
+            let delta_ms = delta as f64 * ns_per_frame / 1.0e6;
+            eprintln!(
+                "F.coord   click={idx:>3} hop=[{first},{g_newest}] hop_newest={g_newest} \
+                 peak_abs={peak_idx} in_hop={in_hop} peak_val={peak_val:.4} snap_peak={snap_peak:.4} \
+                 raw_edge={edge} ncc={ncc:.3} Dframes={delta} (D={delta_ms:+.2}ms)"
+            );
+
+            // ---- 2. ENERGY PROFILE: 70 one-ms buckets over [edge-50ms, edge+20ms] ----
+            let start = edge as i64 - 50 * fpb as i64;
+            let levels = bucket_peaks(mono, start, fpb, 70);
+            let scale = levels.iter().copied().fold(0.0f32, f32::max).max(1e-9);
+            let hexline: String = levels
+                .iter()
+                .map(|&v| {
+                    let lvl = ((v / scale) * 15.0).round().clamp(0.0, 15.0) as u32;
+                    char::from_digit(lvl, 16).unwrap_or('0')
+                })
+                .collect();
+            eprintln!(
+                "F.energy  click={idx:>3} span=[-50..+20]ms corr@bucket50 peak_scale={scale:.4} \
+                 lvl={hexline}"
+            );
+
+            // ---- 3. PER-PUSH timestamps covering the click's window ----
+            let lo_frame = start.max(0) as u64;
+            let hi_frame = (edge as i64 + 20 * fpb as i64).max(0) as u64;
+            for pf in pushes {
+                let push_first = pf.cumulative_frames.saturating_sub(u64::from(pf.frames));
+                let push_last = pf.cumulative_frames.saturating_sub(1);
+                if push_last < lo_frame || push_first > hi_frame {
+                    continue;
+                }
+                if driver_available {
+                    let skew = pf.delivery_ns as i64 - pf.driver_capture_ns as i64;
+                    eprintln!(
+                        "F.push    click={idx:>3} cum={} frames={} wall_delivery_ns={} \
+                         driver_capture_ns={} wall_minus_driver_ns={skew}",
+                        pf.cumulative_frames, pf.frames, pf.delivery_ns, pf.driver_capture_ns,
+                    );
+                } else {
+                    eprintln!(
+                        "F.push    click={idx:>3} cum={} frames={} wall_delivery_ns={}",
+                        pf.cumulative_frames, pf.frames, pf.delivery_ns,
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "F.coord   click={idx:>3} hop=[{first},{g_newest}] hop_newest={g_newest} \
+                 peak_abs={peak_idx} in_hop={in_hop} peak_val={peak_val:.4} snap_peak={snap_peak:.4} \
+                 raw_edge=NONE (no raw correlation) — publish side only"
+            );
+        }
+
+        // ---- 4. HOP DETECTION context: threshold + peaks of the 10 hops before ----
+        if let Some(d) = det_by_publish.get(&s.publish_ns) {
+            if let Some(pos) = hop_history.iter().position(|h| h.0 == d.generation) {
+                let lo = pos.saturating_sub(10);
+                let before: Vec<String> = hop_history[lo..pos]
+                    .iter()
+                    .map(|h| format!("{:.3}", h.1))
+                    .collect();
+                eprintln!(
+                    "F.hops    click={idx:>3} threshold={:.3} detect_gen={} detect_peak={:.3} \
+                     peaks_before=[{}]",
+                    p.threshold,
+                    d.generation,
+                    hop_history[pos].1,
+                    before.join(" "),
+                );
+            }
+        }
+
+        // ---- 5. OUTPUT side: emission bookkeeping + double-write check ----
+        let dup = emit_count.get(&idx).copied().unwrap_or(0);
+        eprintln!(
+            "F.output  click={idx:>3} emit_ns={} output_delay_ns={} emissions_for_index={dup}{}",
+            s.emit_ns,
+            s.output_delay_ns,
+            if dup > 1 { "  <== DOUBLE-WRITE" } else { "" },
+        );
+    }
+    eprintln!("-- END FORENSIC DUMP ------------------------------------------");
 }
 
 // ---------------------------------------------------------------------------
