@@ -18,6 +18,13 @@ different half of it:
   spectrum table. Source:
   [`crates/scenes/src/luau/scenes/swarm.lua`](../crates/scenes/src/luau/scenes/swarm.lua).
 
+New to authoring? Start from the runnable skeleton
+[`templates/scene-template.lua`](../templates/scene-template.lua) (simpler than
+either shipped scene) and the narrative guide
+[`docs/authoring.md`](authoring.md), which walks the whole ladder — presets,
+expressions, and Luau scenes — and the in-app author workflow. This file is the
+API reference those point back to.
+
 ## Drop-in directory
 
 Put your own `.lua` scenes in the scenes directory under the config dir (the same

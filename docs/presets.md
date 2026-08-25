@@ -10,6 +10,12 @@ This is rung 0 of the scene engine: the library, the files and this reference.
 See [What is not yet wired](#what-is-not-yet-wired) for the pieces that arrive
 with later cards.
 
+New to authoring? Copy the fully commented skeleton
+[`templates/preset-template.toml`](../templates/preset-template.toml) and read
+the narrative guide [`docs/authoring.md`](authoring.md), which walks presets,
+expressions and Luau scenes end to end. This file is the format reference they
+point back to.
+
 ## Quick start
 
 A minimal preset is just a name and a scene:
