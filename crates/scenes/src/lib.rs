@@ -27,7 +27,8 @@ pub use canvas::{Canvas, PALETTE_SLOTS, Primitive, Slot, Style};
 pub use luau::{
     LuauError, LuauErrorKind, LuauLimits, LuauReloadEvent, LuauScene, LuauSource, LuauWatcher,
     catalog_scene_info, catalog_scenes, compile_manifest, create_scene, is_luau_scene,
-    luau_scene_ids, luau_scene_path, scene_preset, scenes_dir, shipped_scenes,
+    luau_feature_vocabulary, luau_scene_ids, luau_scene_path, rebuild_luau_scene, scene_preset,
+    scenes_dir, shipped_scenes,
 };
 pub use palette::{Palette, Rgb};
 pub use preset::{

@@ -29,7 +29,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
 use scia_core::FeatureSnapshot;
-use scia_scenes::{PresetError, PresetErrorKind, ReloadEvent, SceneSource};
+use scia_scenes::{
+    LuauError, LuauReloadEvent, PresetError, PresetErrorKind, ReloadEvent, SceneSource, SourceKind,
+};
 
 use crate::palette;
 use crate::render::{self, UiState};
@@ -101,6 +103,38 @@ fn offending_identifier(kind: &PresetErrorKind) -> Option<&str> {
         PresetErrorKind::UnknownFeature { name } => Some(name),
         _ => None,
     }
+}
+
+/// The identifier a Luau error message names, if any — the seam did-you-mean runs
+/// against for a `.lua` source. Luau runtime errors quote the offending name in
+/// single quotes (e.g. `attempt to call a nil value (global 'reset')`, `attempt
+/// to index nil with 'bas'`), so this returns the first single-quoted,
+/// identifier-shaped token. A message with no such token (a bare syntax error,
+/// say) yields `None`, so no hint is ever guessed.
+fn luau_offending_identifier(message: &str) -> Option<&str> {
+    let mut rest = message;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let close = after.find('\'')?;
+        let candidate = &after[..close];
+        if is_identifier(candidate) {
+            return Some(candidate);
+        }
+        rest = &after[close + 1..];
+    }
+    None
+}
+
+/// Whether `s` is a Lua-identifier-shaped token: an ASCII letter or `_` then
+/// letters, digits or `_`. Used to filter single-quoted tokens in an error
+/// message down to ones worth a did-you-mean suggestion.
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +322,14 @@ impl AuthorMode {
         if !self.open {
             return;
         }
+        // A preset (`ReloadEvent`) folds into a TOML pane only; a `.lua` pane
+        // tracks the Luau channel via [`on_luau_reload`] instead. The two channels
+        // never cross in the loop (a `--scene-file` run uses the preset watcher,
+        // the `--scene` Luau path uses the Luau watcher), but the guard keeps the
+        // pane's model correct regardless of which event reaches it.
+        if self.source.as_ref().map(|s| s.kind) != Some(SourceKind::Toml) {
+            return;
+        }
         if let Some(source) = self.source.take() {
             self.load(&source);
             self.source = Some(source);
@@ -312,6 +354,43 @@ impl AuthorMode {
         }
     }
 
+    /// Fold in a live [`LuauReloadEvent`] for a `.lua` source: the sibling of
+    /// [`on_reload`](Self::on_reload) on the Luau channel. Re-reads the (path)
+    /// source so the pane shows the just-saved bytes — broken or not — then sets
+    /// the status and, on failure, the resolved inline error (message plus a
+    /// did-you-mean hint drawn from the Luau feature-API vocabulary). A no-op
+    /// while closed or when the pane is not showing a Luau source. The running
+    /// scene is never touched here: the last good scene holds in the pipeline
+    /// (LuauScene keeps its last good frame); this only reports what happened.
+    pub fn on_luau_reload(&mut self, event: &LuauReloadEvent) {
+        if !self.open {
+            return;
+        }
+        if self.source.as_ref().map(|s| s.kind) != Some(SourceKind::Lua) {
+            return;
+        }
+        if let Some(source) = self.source.take() {
+            self.load(&source);
+            self.source = Some(source);
+        }
+        match &event.result {
+            Ok(_) => {
+                self.status = ReloadStatus::Reloaded {
+                    ms: event.elapsed_ms,
+                };
+                self.error = None;
+            }
+            Err(err) => {
+                let detail = self.resolve_luau_error(err);
+                if let Some(line) = detail.line {
+                    self.scroll = line.saturating_sub(1).min(self.max_scroll());
+                }
+                self.status = ReloadStatus::Failed;
+                self.error = Some(detail);
+            }
+        }
+    }
+
     /// Resolve a [`PresetError`] into an inline [`SourceError`]: its line, its
     /// message, and a did-you-mean hint when the offending identifier is within
     /// [`MAX_EDIT_DISTANCE`] of the vocabulary.
@@ -323,6 +402,25 @@ impl AuthorMode {
         SourceError {
             line: err.line,
             message: err.kind.to_string(),
+            hint,
+        }
+    }
+
+    /// Resolve a [`LuauError`] into an inline [`SourceError`]: the Luau twin of
+    /// [`resolve_error`](Self::resolve_error). A Luau error carries no structured
+    /// line (Luau positions live inside the message text, not the error type), so
+    /// no line is reported; the message shows in full, and a did-you-mean hint is
+    /// offered when a single-quoted identifier in the message is within
+    /// [`MAX_EDIT_DISTANCE`] of the (Luau feature-API) vocabulary.
+    fn resolve_luau_error(&self, err: &LuauError) -> SourceError {
+        let message = err.kind.to_string();
+        let hint = luau_offending_identifier(&message).and_then(|ident| {
+            let vocab: Vec<&str> = self.vocab.iter().map(String::as_str).collect();
+            did_you_mean(ident, &vocab).map(|s| format!("did you mean '{s}'?"))
+        });
+        SourceError {
+            line: None,
+            message,
             hint,
         }
     }
@@ -513,7 +611,7 @@ fn gutter_width(line_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scia_scenes::{PresetErrorKind, SourceKind};
+    use scia_scenes::{LuauErrorKind, LuauSource, PresetErrorKind, SourceKind, compile_manifest};
     use std::time::Instant;
 
     fn file_source(path: &std::path::Path) -> SceneSource {
@@ -534,6 +632,48 @@ mod tests {
             .map(|s| (*s).to_string())
             .chain(["gap".to_string(), "punch".to_string()])
             .collect()
+    }
+
+    /// The did-you-mean vocabulary for a `.lua` source: the feature-API field
+    /// names the scripting bridge serves.
+    fn luau_vocab() -> Vec<String> {
+        scia_scenes::luau_feature_vocabulary()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    /// A minimal valid Luau scene source with the given id.
+    fn luau_src(id: &str) -> String {
+        format!(
+            "return {{ id = \"{id}\", mood = \"kinetic\", summary = \"s\", \
+             update = function(f, dt) end, render = function(c) end }}"
+        )
+    }
+
+    /// A successful Luau reload event carrying re-validated source. Only the
+    /// Ok discriminant and elapsed_ms matter to author mode.
+    fn luau_reload_ok(id: &str, ms: f32) -> LuauReloadEvent {
+        let src = luau_src(id);
+        let manifest = compile_manifest(&src, id).expect("valid manifest");
+        LuauReloadEvent {
+            result: Ok(LuauSource {
+                source: src,
+                manifest,
+            }),
+            elapsed_ms: ms,
+        }
+    }
+
+    /// A failed Luau reload event carrying a runtime error message.
+    fn luau_reload_err(message: &str, ms: f32) -> LuauReloadEvent {
+        LuauReloadEvent {
+            result: Err(LuauError {
+                file: None,
+                kind: LuauErrorKind::Runtime(message.to_string()),
+            }),
+            elapsed_ms: ms,
+        }
     }
 
     fn preset_err(line: Option<usize>, kind: PresetErrorKind) -> PresetError {
@@ -876,5 +1016,144 @@ mod tests {
             "author draw {per_frame_ms:.4} ms/frame should be < 8.0 ms (under the frame budget)"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    // -- Luau sources -----------------------------------------------------
+
+    #[test]
+    fn luau_did_you_mean_uses_the_feature_api_vocabulary() {
+        let vocab: Vec<&str> = scia_scenes::luau_feature_vocabulary().to_vec();
+        // Near-misses of feature-API names resolve to them.
+        assert_eq!(did_you_mean("bas", &vocab), Some("bass"));
+        assert_eq!(did_you_mean("bar_coun", &vocab), Some("bar_count"));
+        assert_eq!(did_you_mean("beet", &vocab), Some("beat"));
+        // A preset-only name that is not a Luau feature is not suggested from far.
+        assert_eq!(did_you_mean("saxophone", &vocab), None);
+    }
+
+    #[test]
+    fn luau_error_string_identifier_extraction() {
+        // Luau runtime errors quote the offending name; the first quoted,
+        // identifier-shaped token is extracted.
+        assert_eq!(
+            luau_offending_identifier("attempt to call a nil value (global 'reset')"),
+            Some("reset")
+        );
+        assert_eq!(
+            luau_offending_identifier("attempt to index nil with 'bas'"),
+            Some("bas")
+        );
+        // A message with no quoted identifier yields nothing (no guess).
+        assert_eq!(
+            luau_offending_identifier("attempt to perform arithmetic on a nil value"),
+            None
+        );
+        // A quoted non-identifier token is skipped, not offered.
+        assert_eq!(
+            luau_offending_identifier("unexpected symbol near '}'"),
+            None
+        );
+    }
+
+    #[test]
+    fn opens_a_shipped_luau_read_only() {
+        // A shipped (embedded) Luau scene: read-only, not watched, labeled like a
+        // built-in, with the embedded source on show.
+        let src = luau_src("ripple");
+        let mut a = AuthorMode::default();
+        a.open(SceneSource::luau_builtin("ripple", &src), luau_vocab());
+        assert!(a.is_open());
+        assert_eq!(a.status(), &ReloadStatus::Builtin);
+        assert!(!a.lines().is_empty(), "the embedded source loads");
+        assert!(
+            a.lines().iter().any(|l| l.contains("ripple")),
+            "the embedded Luau source shows: {:?}",
+            a.lines()
+        );
+        assert!(
+            a.label().contains("built-in"),
+            "labeled like a builtin: {:?}",
+            a.label()
+        );
+    }
+
+    #[test]
+    fn opens_a_dropin_luau_file_and_watches() {
+        // A drop-in Luau file source is read live and watched.
+        let path = write_temp("dropin.lua", &luau_src("dropin"));
+        let mut a = AuthorMode::default();
+        a.open(file_source(&path), luau_vocab());
+        assert!(a.is_open());
+        assert_eq!(a.status(), &ReloadStatus::Watching);
+        assert!(
+            a.lines().iter().any(|l| l.contains("dropin")),
+            "the live file source shows: {:?}",
+            a.lines()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_successful_luau_reload_records_the_time() {
+        let path = write_temp("reload-ok.lua", &luau_src("dropin"));
+        let mut a = AuthorMode::default();
+        a.open(file_source(&path), luau_vocab());
+        a.on_luau_reload(&luau_reload_ok("dropin", 21.0));
+        assert_eq!(a.status(), &ReloadStatus::Reloaded { ms: 21.0 });
+        assert!(a.error().is_none(), "a clean reload clears any error");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_broken_luau_reload_surfaces_the_error_and_holds_the_source() {
+        // A broken edit surfaces the error in the pane with a did-you-mean hint,
+        // and the running scene holds (the pane keeps showing the source).
+        let path = write_temp("reload-bad.lua", &luau_src("dropin"));
+        let mut a = AuthorMode::default();
+        a.open(file_source(&path), luau_vocab());
+        let before = a.lines().len();
+
+        // A runtime error naming a near-miss of a feature-API field.
+        a.on_luau_reload(&luau_reload_err(
+            "attempt to perform arithmetic on a nil value (field 'bas')",
+            7.0,
+        ));
+        assert_eq!(a.status(), &ReloadStatus::Failed);
+        let detail = a.error().expect("an error is surfaced");
+        assert_eq!(detail.hint.as_deref(), Some("did you mean 'bass'?"));
+        // Luau errors carry no structured line, so none is reported.
+        assert_eq!(detail.line, None);
+        // The source is still shown (the running scene holds; only the report
+        // changed), re-read rather than dropped.
+        assert!(!a.lines().is_empty(), "the pane still shows the source");
+        assert_eq!(
+            a.lines().len(),
+            before,
+            "the source is re-read, not dropped"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_two_reload_channels_do_not_cross() {
+        // A preset event on a Luau pane is ignored, and a Luau event on a TOML
+        // pane is ignored — the pane's model stays correct whichever arrives.
+        let lua_path = write_temp("cross.lua", &luau_src("dropin"));
+        let mut a = AuthorMode::default();
+        a.open(file_source(&lua_path), luau_vocab());
+        a.on_reload(&reload_ok(9.0)); // preset event on a .lua pane
+        assert_eq!(a.status(), &ReloadStatus::Watching, "preset event ignored");
+
+        let toml_path = write_temp(
+            "cross.toml",
+            "[preset]\nname = \"demo\"\nscene = \"spectra\"\n",
+        );
+        let mut b = AuthorMode::default();
+        b.open(file_source(&toml_path), vocab());
+        b.on_luau_reload(&luau_reload_ok("dropin", 9.0)); // Luau event on a .toml pane
+        assert_eq!(b.status(), &ReloadStatus::Watching, "luau event ignored");
+
+        std::fs::remove_file(&lua_path).ok();
+        std::fs::remove_file(&toml_path).ok();
     }
 }

@@ -16,7 +16,8 @@ use crate::registry::{SceneInfo, builtin_scenes, create_builtin};
 use crate::scene::Scene;
 
 use super::discover::{DiscoveredScene, discover};
-use super::{LuauLimits, LuauScene, default_palette};
+use super::watch::LuauSource;
+use super::{LuauError, LuauLimits, LuauScene, default_palette};
 
 /// A catalog entry for one Luau scene: its listing info, the source to build
 /// (and rebuild) a live VM from, and the drop-in file it came from (if any, for
@@ -116,6 +117,31 @@ pub fn luau_scene_path(id: &str) -> Option<std::path::PathBuf> {
         .iter()
         .find(|e| e.info.id == id)
         .and_then(|e| e.path.clone())
+}
+
+/// Recompile a live scene from re-validated hot-reload [`LuauSource`], for the
+/// `.lua` live-reload path.
+///
+/// The source has already been read and validated off the render thread (by
+/// [`super::LuauWatcher`]); this rebuilds the non-`Send` live VM on the render
+/// thread and returns it as a [`Scene`], ready for the presenter to swap in with
+/// its crossfade. The catalog's leaked `SceneInfo` for the source's id is reused
+/// (a hot reload keeps the same id and reuses the info — see
+/// [`super::LuauManifest::leak_info`]), so a reload allocates no new `'static`
+/// listing; a source whose id is not in the catalog (an unusual id-changing edit)
+/// falls back to leaking a fresh info from its own manifest.
+///
+/// # Errors
+/// [`LuauError`] if the source fails to recompile (rare, since the watcher
+/// already validated it) — the caller then keeps the running scene.
+pub fn rebuild_luau_scene(source: &LuauSource) -> Result<Box<dyn Scene>, LuauError> {
+    let limits = LuauLimits::default();
+    let id = source.manifest.id.as_str();
+    let scene = match catalog_scene_info(id) {
+        Some(info) => LuauScene::compile(&source.source, info, limits)?,
+        None => LuauScene::from_source(&source.source, id, limits)?,
+    };
+    Ok(Box::new(scene))
 }
 
 /// A preset for scene `id`, for the `--scene`/browser path: the built-in TOML

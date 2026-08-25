@@ -11,7 +11,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use scia_scenes::{builtin_scenes, catalog_scenes, create_scene, scene_preset, scenes_dir};
+use scia_scenes::{
+    builtin_scenes, catalog_scenes, create_scene, luau_scene_path, scene_preset, scenes_dir,
+    shipped_scenes,
+};
 
 /// A private temp directory, removed when dropped.
 struct TempDir {
@@ -134,6 +137,46 @@ fn a_dropin_scene_is_discovered_and_constructs() {
         scene_preset("dropin-demo").is_some_and(|r| r.is_ok()),
         "the drop-in has a --scene preset"
     );
+}
+
+#[test]
+fn a_dropin_exposes_its_watchable_path_a_shipped_scene_does_not() {
+    // The scene-author / live-reload seam keys off `luau_scene_path`: a drop-in
+    // resolves to its on-disk `.lua` (the file the TUI watches and author mode
+    // reads live), while a shipped (embedded) scene has none (read-only, no watch).
+    let tmp = TempDir::new();
+    set_config_home(&tmp.path);
+    let dir = scenes_dir().expect("scenes dir");
+    fs::create_dir_all(&dir).expect("create scenes dir");
+    let file = dir.join("mine.lua");
+    fs::write(
+        &file,
+        r#"
+        return {
+          id = "mine",
+          mood = "kinetic",
+          summary = "a watchable drop-in",
+          update = function(f, dt) end,
+          render = function(c) c:point(0.5, 0.5, 0.1, 1, 1.0) end,
+        }
+        "#,
+    )
+    .expect("write drop-in");
+
+    assert_eq!(
+        luau_scene_path("mine").as_deref(),
+        Some(file.as_path()),
+        "a drop-in resolves to its live file"
+    );
+    // A shipped scene is bundled, not on disk.
+    let shipped = shipped_scenes()[0].0;
+    assert!(
+        luau_scene_path(shipped).is_none(),
+        "a shipped scene has no watchable file"
+    );
+    // A built-in and an unknown id have no path either.
+    assert!(luau_scene_path("spectra").is_none());
+    assert!(luau_scene_path("nope").is_none());
 }
 
 #[test]

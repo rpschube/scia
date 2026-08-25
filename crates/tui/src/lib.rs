@@ -58,7 +58,7 @@ use scia_core::{
     Activity, DeviceInfo, DeviceSelector, EngineStats, FeatureReader, FeatureSnapshot, list_devices,
 };
 use scia_scenes::{
-    Palette, Preset, ReloadEvent, SceneSource, builtin_presets, catalog_scenes,
+    Palette, Preset, ReloadEvent, SceneSource, SourceKind, builtin_presets, catalog_scenes,
     expression_vocabulary, scene_preset,
 };
 
@@ -474,6 +474,22 @@ fn run_loop(
     let mut sixel_encoder = SixelEncoder::new();
     let mut sixel_out: Vec<u8> = Vec::new();
 
+    // The live-reload watch on the active Luau drop-in, and the scene id it is
+    // watching. This is the `.lua` sibling of the preset `reload` receiver above,
+    // on its own watcher and event type (never unified). Unlike the preset watch
+    // — created once in the CLI for a fixed `--scene-file` — the drop-in target is
+    // the *running* scene, which cycling and the browser change at runtime, so the
+    // watch is owned here and reconciled each frame: it is created when the active
+    // scene becomes a file-backed drop-in and dropped (its thread joined) when the
+    // active scene changes to another drop-in, a shipped/embedded scene, or a
+    // built-in. It stays inert on a `--scene-file` run, whose reloads flow on the
+    // preset channel. `None` until the first frame resolves the active scene.
+    let mut luau_watch: Option<(
+        scia_scenes::LuauWatcher,
+        Receiver<scia_scenes::LuauReloadEvent>,
+    )> = None;
+    let mut luau_watch_id: Option<&'static str> = None;
+
     loop {
         let frame_start = Instant::now();
         let mut dt = default_dt;
@@ -511,6 +527,37 @@ fn run_loop(
             }
         }
         ui.scene_nav.tick(scene_dt);
+
+        // Reconcile the Luau drop-in live-reload watch with the active scene. The
+        // watched target is the running scene when it is a file-backed drop-in;
+        // an embedded shipped scene has no file (`luau_scene_path` is `None`) and
+        // is excluded, as are built-ins. When the active scene changes to another
+        // drop-in the watch moves with it; when it changes away the watch is
+        // dropped (joining its thread). Only on the `--scene`/browser path — a
+        // `--scene-file` run's reloads flow on the preset `reload` channel, so the
+        // Luau watch stays inert there and the two seams never overlap.
+        if opts.scene_file.is_none() {
+            let desired = presenter
+                .as_ref()
+                .and_then(ScenePresenter::layer0_scene_id)
+                .filter(|id| scia_scenes::luau_scene_path(id).is_some());
+            if desired != luau_watch_id {
+                // Drop the old watch first (its thread joins), then start the new.
+                luau_watch = None;
+                luau_watch_id = None;
+                if let Some(id) = desired {
+                    if let Some(path) = scia_scenes::luau_scene_path(id) {
+                        if let Ok(pair) = scia_scenes::LuauWatcher::start(&path) {
+                            luau_watch = Some(pair);
+                            luau_watch_id = Some(id);
+                        }
+                        // A watch that fails to start leaves the scene running
+                        // unwatched rather than failing the frame; reloads simply
+                        // do not arrive until the scene is reselected.
+                    }
+                }
+            }
+        }
 
         // Drain now-playing backend events into the state, dispatching artwork to
         // the decode worker, then fold in any finished decodes. Both are
@@ -585,7 +632,8 @@ fn run_loop(
         if std::mem::take(&mut ui.author_open_pending) {
             if let Some(p) = presenter.as_ref() {
                 if let Some(source) = author_source(opts, &ui.scene_nav, p) {
-                    ui.author.open(source, author_vocab(p));
+                    let vocab = author_vocab(&source, p);
+                    ui.author.open(source, vocab);
                 }
             }
         }
@@ -730,6 +778,48 @@ fn run_loop(
                 ui.author.on_reload(&event);
             }
         }
+
+        // Luau drop-in hot reload: the `.lua` sibling of the preset reload seam
+        // above, drained on its own channel and event type (kept separate, never
+        // unified). At most one event per frame. On a valid edit, rebuild the live
+        // scene from the re-validated source and swap it in with the same crossfade
+        // the preset path uses; on a broken edit keep the running scene (the
+        // watcher already re-validated, and LuauScene holds its last good frame)
+        // and surface the error's first line. Audio capture is never touched here.
+        if let Some((_, rx)) = luau_watch.as_ref() {
+            if let Ok(event) = rx.try_recv() {
+                if let Some(p) = presenter.as_mut() {
+                    match &event.result {
+                        Ok(source) => match scia_scenes::rebuild_luau_scene(source) {
+                            Ok(scene) => {
+                                p.swap_scene(scene);
+                                ui.notice = Some(format!("reloaded {:.0}ms", event.elapsed_ms));
+                            }
+                            // Re-validated but failed to rebuild the live VM (rare):
+                            // keep the running scene, surface the message.
+                            Err(err) => {
+                                let msg = err.to_string();
+                                let first = msg.lines().next().unwrap_or_default();
+                                ui.notice = Some(first.to_string());
+                            }
+                        },
+                        // A broken edit keeps the running scene; surface the error.
+                        Err(err) => {
+                            let msg = err.to_string();
+                            let first = msg.lines().next().unwrap_or_default();
+                            ui.notice = Some(first.to_string());
+                        }
+                    }
+                    notice_deadline = Some(frame_start + NOTICE_TTL);
+                }
+                // Scene-author mode surfaces the reload for a `.lua` source exactly
+                // as it does for a preset: re-read the source, record the time, and
+                // on failure highlight the error inline. A no-op while closed or on
+                // a non-Luau source.
+                ui.author.on_luau_reload(&event);
+            }
+        }
+
         // Auto-clear the notice once its deadline passes.
         if let Some(deadline) = notice_deadline {
             if frame_start >= deadline {
@@ -1677,20 +1767,53 @@ fn author_source(
         .current_id()
         .or(opts.scene.as_deref())
         .or_else(|| presenter.layer0_scene_id())?;
+    // A Luau scene: a drop-in resolves to its live `.lua` file (watchable); a
+    // shipped (embedded) scene resolves to its bundled source text, read-only
+    // like a built-in preset. Anything else is a built-in TOML preset.
+    if scia_scenes::is_luau_scene(name) {
+        return Some(luau_scene_source(name));
+    }
     SceneSource::builtin(name)
 }
 
-/// The did-you-mean vocabulary for scene-author mode: the expression signal
-/// names plus the active scene's parameter keys (its `ParamSpec` manifest).
-fn author_vocab(presenter: &ScenePresenter) -> Vec<String> {
-    let mut vocab: Vec<String> = expression_vocabulary()
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-    for spec in presenter.layer0_specs() {
-        vocab.push(spec.key.to_string());
+/// The [`SceneSource`] scene-author mode opens on for a Luau scene `id`: a
+/// drop-in's live file (`luau_scene_path` → a watchable path source), or a
+/// shipped scene's embedded source text (read-only, labeled like a built-in).
+fn luau_scene_source(id: &str) -> SceneSource {
+    if let Some(path) = scia_scenes::luau_scene_path(id) {
+        // A drop-in: the on-disk `.lua`, read live and hot-reloaded.
+        return SceneSource::from_file(&path);
     }
-    vocab
+    // A shipped (embedded) scene: its bundled source, read-only and unwatched.
+    let text = scia_scenes::shipped_scenes()
+        .iter()
+        .find(|(n, _)| *n == id)
+        .map(|(_, s)| *s)
+        .unwrap_or_default();
+    SceneSource::luau_builtin(id, text)
+}
+
+/// The did-you-mean vocabulary for scene-author mode, keyed to the source
+/// language. A `.lua` source uses the Luau feature-API field names (the scripting
+/// bridge's `features.<name>` getters); a TOML preset uses the `[map]` expression
+/// signal names plus the active scene's parameter keys (its `ParamSpec` manifest).
+fn author_vocab(source: &SceneSource, presenter: &ScenePresenter) -> Vec<String> {
+    match source.kind {
+        SourceKind::Lua => scia_scenes::luau_feature_vocabulary()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        SourceKind::Toml => {
+            let mut vocab: Vec<String> = expression_vocabulary()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            for spec in presenter.layer0_specs() {
+                vocab.push(spec.key.to_string());
+            }
+            vocab
+        }
+    }
 }
 
 /// Pin the picker's selected device into the config file, returning the status
@@ -2970,5 +3093,61 @@ mod tests {
         let outcome = pump_input(deadline, &mut poll, &mut read, &mut ui).unwrap();
         assert_eq!(outcome, PumpOutcome::Redraw);
         assert!(ui.help, "the help toggle was applied");
+    }
+
+    // -- Luau scene-author source resolution ------------------------------
+
+    #[test]
+    fn author_source_resolves_a_shipped_luau_scene_read_only() {
+        // A shipped (embedded) Luau scene resolves to its bundled source: no path
+        // (so unwatched), the Lua kind, non-empty embedded text, labeled like a
+        // builtin. `ripple` is always shipped, so no config-dir setup is needed.
+        let source = luau_scene_source("ripple");
+        assert!(
+            source.path.is_none(),
+            "a shipped scene has no watchable file"
+        );
+        assert_eq!(source.kind, SourceKind::Lua);
+        assert!(!source.text.is_empty(), "the embedded source is carried");
+        assert!(
+            source.label.contains("built-in"),
+            "labeled like a builtin: {}",
+            source.label
+        );
+    }
+
+    // A drop-in's resolution to its live file path is covered at the scenes level
+    // (`luau_scene_path`, in crates/scenes/tests/luau_discovery.rs), where the
+    // `XDG_CONFIG_HOME` override needed to plant a drop-in is permitted; this
+    // crate forbids `unsafe`, so it cannot set the env. `luau_scene_source`'s
+    // drop-in branch is a thin `SceneSource::from_file(path)` over that path,
+    // whose `.lua` → `SourceKind::Lua` mapping is covered in author.rs.
+
+    #[test]
+    fn author_vocab_is_keyed_to_the_source_language() {
+        let preset = builtin_preset("spectra")
+            .expect("spectra preset")
+            .expect("parses");
+        let p = ScenePresenter::from_preset(&preset, Tier::default());
+
+        // A Lua source uses the feature-API field names (a `bar_count` that no
+        // TOML `[map]` expression vocabulary carries).
+        let lua = SceneSource::luau_builtin("ripple", "return {}");
+        let lua_vocab = author_vocab(&lua, &p);
+        assert!(lua_vocab.iter().any(|v| v == "bar_count"));
+        assert!(lua_vocab.iter().any(|v| v == "onset_age"));
+        assert!(
+            !lua_vocab.iter().any(|v| v == "gap"),
+            "a Lua source does not carry TOML preset params"
+        );
+
+        // A TOML source uses the expression vocabulary plus the scene's params.
+        let toml = SceneSource::builtin("spectra").expect("spectra builtin");
+        let toml_vocab = author_vocab(&toml, &p);
+        assert!(
+            toml_vocab.iter().any(|v| v == "gap"),
+            "a TOML source carries the scene's params: {toml_vocab:?}"
+        );
+        assert!(toml_vocab.iter().any(|v| v == "loud"));
     }
 }
