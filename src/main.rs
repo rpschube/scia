@@ -41,13 +41,13 @@ CONFIG:
   missing file is not an error.
     Unix:     $XDG_CONFIG_HOME/scia/config.toml  (else ~/.config/scia/config.toml)
     Windows:  %APPDATA%\\scia\\config.toml
-  [defaults]  scene, presenter, overlay, perf_mode, demo_bpm, chrome
+  [defaults]  scene, presenter, overlay, perf_mode, demo_bpm, chrome, device
               (presenter = octant | sextant | quadrant | half | kitty | sixel;
               chrome = invisible | instrument | playful | utilitarian;
-              both overridden by their flags)
+              device = exact capture device name; all overridden by their flags)
   [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
-              quit, chrome, now_playing, palette, tuning, mapping. A value is a
-              single character, a named
+              quit, chrome, now_playing, palette, tuning, mapping, devices. A
+              value is a single character, a named
               key (tab, esc, left, right, up, down, enter, space, backtick), or
               ctrl+<key>. Unknown actions or unparseable keys warn and are
               ignored.
@@ -57,9 +57,11 @@ KEYS (defaults, all rebindable; press ? in-app for the active map):
   `           debug overlay          space  pause         q  quit
   n           now-playing panel      p      apply palette
   c           cycle chrome           t      tuning strip
-  m           expression map         esc    back (overlay) / quit   ?  toggle help
+  m           expression map         d      device picker  s  debug line
+  esc         back (overlay) / quit  ?      toggle help
   tuning:     tab param · ←/→ adjust · w write preset · esc done
   mapping:    ↑↓ row · ⏎ edit (⏎ apply · esc cancel) · w write · esc done
+  devices:    ↑↓ select · ⏎ switch · p pin · esc close
 
 EXIT CODES:
   0  success            1  runtime error         2  usage / unsupported
@@ -314,6 +316,7 @@ fn main() -> ExitCode {
             perf_mode: cli.perf_mode,
             demo_bpm: cli.demo_bpm,
             chrome: cli.chrome.map(ChromeArg::mode),
+            device: cli.device.clone(),
         },
         &cfg.defaults,
     );
@@ -477,6 +480,8 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         chrome: resolved.chrome,
         scene_file: cli.scene_file.clone(),
         config_dir: config::config_dir(),
+        device: DeviceSelector::Default,
+        prefer_pipewire: true,
     };
 
     let outcome = run(
@@ -484,6 +489,8 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         || engine.stats(),
         || engine.health(),
         || engine.now_ns(),
+        // The synthetic demo feed has no device to switch; the picker is inert.
+        |_sel| {},
         reload,
         opts,
     );
@@ -494,7 +501,8 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
 /// Start live capture on the cpal backend and run the TUI or the headless
 /// status loop.
 fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
-    let selector = match &cli.device {
+    // Device precedence is already merged (flag > config > default) in `resolved`.
+    let selector = match &resolved.device {
         Some(name) => DeviceSelector::Named(name.clone()),
         None => DeviceSelector::Default,
     };
@@ -502,7 +510,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     // prefers PipeWire.
     let prefer_pipewire = cli.pipewire || !cli.no_pipewire;
     let backend = CpalBackend {
-        device: selector,
+        device: selector.clone(),
         prefer_pipewire,
     };
 
@@ -526,7 +534,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     // Print the negotiated format once. The host is a best-effort lookup: known
     // for a named device, omitted otherwise.
     let format = engine.format();
-    match capture_host(&cli.device) {
+    match capture_host(&resolved.device) {
         Some(host) => eprintln!(
             "capture: {} Hz, {} ch via {}",
             format.sample_rate, format.channels, host
@@ -594,6 +602,8 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         chrome: resolved.chrome,
         scene_file: cli.scene_file.clone(),
         config_dir: config::config_dir(),
+        device: selector,
+        prefer_pipewire,
     };
 
     let outcome = run(
@@ -601,6 +611,12 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         || engine.stats(),
         || engine.health(),
         || engine.now_ns(),
+        |sel| {
+            // Record the new selector and drive the route watcher to reopen on
+            // the newly chosen device; the reopen never blocks the UI thread.
+            engine.set_device(sel);
+            engine.request_reopen();
+        },
         reload,
         opts,
     );

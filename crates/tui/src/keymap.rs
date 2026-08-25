@@ -45,12 +45,14 @@ pub enum InputAction {
     Tuning,
     /// Toggle the expression-mapping overlay (default `m`).
     Mapping,
+    /// Toggle the capture device picker (default `d`).
+    Devices,
 }
 
 impl InputAction {
     /// Every action, in a stable order. [`Keymap::action_for`] scans this order,
     /// so an earlier action wins if two are ever bound to the same chord.
-    pub const ALL: [InputAction; 11] = [
+    pub const ALL: [InputAction; 12] = [
         InputAction::SceneNext,
         InputAction::ScenePrev,
         InputAction::Browser,
@@ -62,6 +64,7 @@ impl InputAction {
         InputAction::Palette,
         InputAction::Tuning,
         InputAction::Mapping,
+        InputAction::Devices,
     ];
 
     /// The config `[keys]` name this action is bound under.
@@ -79,6 +82,7 @@ impl InputAction {
             InputAction::Palette => "palette",
             InputAction::Tuning => "tuning",
             InputAction::Mapping => "mapping",
+            InputAction::Devices => "devices",
         }
     }
 
@@ -97,6 +101,7 @@ impl InputAction {
             InputAction::Palette => "apply palette",
             InputAction::Tuning => "tuning strip",
             InputAction::Mapping => "expression map",
+            InputAction::Devices => "device picker",
         }
     }
 
@@ -255,6 +260,8 @@ pub struct Keymap {
     pub tuning: Option<KeyChord>,
     /// Toggle the expression-mapping overlay.
     pub mapping: Option<KeyChord>,
+    /// Toggle the capture device picker.
+    pub devices: Option<KeyChord>,
 }
 
 impl Default for Keymap {
@@ -271,6 +278,7 @@ impl Default for Keymap {
             palette: Some(KeyChord::plain(KeyCode::Char('p'))),
             tuning: Some(KeyChord::plain(KeyCode::Char('t'))),
             mapping: Some(KeyChord::plain(KeyCode::Char('m'))),
+            devices: Some(KeyChord::plain(KeyCode::Char('d'))),
         }
     }
 }
@@ -291,6 +299,7 @@ impl Keymap {
             InputAction::Palette => self.palette,
             InputAction::Tuning => self.tuning,
             InputAction::Mapping => self.mapping,
+            InputAction::Devices => self.devices,
         }
     }
 
@@ -308,6 +317,7 @@ impl Keymap {
             InputAction::Palette => &mut self.palette,
             InputAction::Tuning => &mut self.tuning,
             InputAction::Mapping => &mut self.mapping,
+            InputAction::Devices => &mut self.devices,
         };
         *slot = chord;
     }

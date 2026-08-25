@@ -12,6 +12,7 @@ use scia_core::{Activity, EngineStats, FeatureSnapshot};
 use scia_scenes::{SceneInfo, builtin_scenes};
 
 use crate::chrome::ChromeState;
+use crate::devicepick::DevicePicker;
 use crate::keymap::{InputAction, Keymap};
 use crate::mapping_ui::MappingUi;
 use crate::nowplaying::{self, NowPlayingState};
@@ -126,6 +127,18 @@ pub struct UiState {
     /// A one-shot request from the overlay's write key, consumed by the render
     /// loop to write the edited expression rows back to the preset file.
     pub mapping_write_pending: bool,
+    /// The capture device picker model: enumeration state, selection, and the
+    /// active device marker. Drawn over the body top-left when open.
+    pub devices: DevicePicker,
+    /// A one-shot request from the devices key to open the picker, consumed by
+    /// the render loop (which spawns the off-thread enumeration).
+    pub device_open_pending: bool,
+    /// A one-shot request from the picker's switch key (`⏎`), consumed by the
+    /// render loop to switch capture to the selected device.
+    pub device_switch_pending: bool,
+    /// A one-shot request from the picker's pin key (`p`), consumed by the render
+    /// loop to pin the selected device into the config file.
+    pub device_pin_pending: bool,
 }
 
 impl UiState {
@@ -183,6 +196,8 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
         }
         // The help overlay is the topmost body layer; inert unless toggled on.
         draw_help(buf, body, ui);
+        // The device picker is a modal overlay above the rest; inert when closed.
+        crate::devicepick::draw_devices(buf, body, &ui.devices);
     }
     if let Some(debug) = debug {
         render_debug(buf, debug, snap, ui);
@@ -611,7 +626,7 @@ fn help_rows(keymap: &Keymap) -> Vec<(String, &'static str)> {
     rows.push(("esc".to_string(), "back / quit"));
     rows.push(("↑↓ jk".to_string(), "browse move"));
     rows.push(("enter".to_string(), "browse keep"));
-    rows.push(("d".to_string(), "debug line"));
+    rows.push(("s".to_string(), "debug line"));
     rows.push(("ctrl+c".to_string(), "force quit"));
     rows.push(("?".to_string(), "toggle help"));
     rows

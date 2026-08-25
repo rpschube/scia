@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use scia_core::DeviceSelector;
 use scia_core::capture::{
     CaptureBackend, CaptureError, CaptureStream, CaptureTarget, SampleSink, StreamFormat,
     StreamHealth,
@@ -39,6 +40,9 @@ pub struct FaultyControl {
     opens: AtomicU64,
     fail_next: AtomicU32,
     route: Mutex<String>,
+    /// The last selector handed to `set_device`, so a test can assert the engine
+    /// applied a runtime device switch to the backend on reopen.
+    last_device: Mutex<Option<DeviceSelector>>,
     /// State of the most recently opened live stream, so `trip_fault` hits the
     /// current stream even after a reopen swapped in a new one.
     current: Mutex<Option<Arc<StreamState>>>,
@@ -55,8 +59,15 @@ impl FaultyControl {
             opens: AtomicU64::new(0),
             fail_next: AtomicU32::new(0),
             route: Mutex::new(route_id.to_owned()),
+            last_device: Mutex::new(None),
             current: Mutex::new(None),
         })
+    }
+
+    /// The last selector the engine applied via `set_device`, if any.
+    #[must_use]
+    pub fn last_device(&self) -> Option<DeviceSelector> {
+        self.last_device.lock().unwrap().clone()
     }
 
     /// Set the format the next `open` will negotiate.
@@ -146,6 +157,10 @@ impl CaptureBackend for FaultyBackend {
 
     fn route_id(&self) -> Option<String> {
         Some(self.control.route.lock().unwrap().clone())
+    }
+
+    fn set_device(&mut self, selector: DeviceSelector) {
+        *self.control.last_device.lock().unwrap() = Some(selector);
     }
 }
 

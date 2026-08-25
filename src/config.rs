@@ -43,6 +43,7 @@ struct RawDefaults {
     perf_mode: Option<bool>,
     demo_bpm: Option<f32>,
     chrome: Option<String>,
+    device: Option<String>,
 }
 
 /// The config-file `[defaults]` after validation. Each is `None` when the file
@@ -61,6 +62,8 @@ pub struct FileDefaults {
     pub demo_bpm: Option<f32>,
     /// Default chrome personality.
     pub chrome: Option<ChromeMode>,
+    /// Default (pinned) capture device name; `None` follows the system default.
+    pub device: Option<String>,
 }
 
 /// The fully loaded config: validated defaults, the resolved keymap, and any
@@ -104,6 +107,8 @@ pub struct CliLayer {
     pub demo_bpm: Option<f32>,
     /// `--chrome MODE`.
     pub chrome: Option<ChromeMode>,
+    /// `--device NAME`.
+    pub device: Option<String>,
 }
 
 /// The resolved options after applying precedence: built-in defaults < config <
@@ -122,6 +127,9 @@ pub struct Resolved {
     pub demo_bpm: f32,
     /// The chrome personality to start in.
     pub chrome: ChromeMode,
+    /// The capture device name to open, if any; `None` follows the system
+    /// default.
+    pub device: Option<String>,
 }
 
 /// Merge the CLI layer over the file defaults over the built-in defaults.
@@ -139,6 +147,7 @@ pub fn resolve(cli: CliLayer, file: &FileDefaults) -> Resolved {
         perf_mode: cli.perf_mode || file.perf_mode.unwrap_or(false),
         demo_bpm: cli.demo_bpm.or(file.demo_bpm).unwrap_or(DEFAULT_DEMO_BPM),
         chrome: cli.chrome.or(file.chrome).unwrap_or_default(),
+        device: cli.device.or_else(|| file.device.clone()),
     }
 }
 
@@ -214,6 +223,7 @@ pub fn parse(text: &str) -> Config {
         perf_mode: raw.defaults.perf_mode,
         demo_bpm: raw.defaults.demo_bpm,
         chrome,
+        device: raw.defaults.device,
     };
 
     // Apply the [keys] overrides on top of the built-in map.
@@ -417,6 +427,7 @@ mod tests {
             perf_mode: Some(true),
             demo_bpm: Some(90.0),
             chrome: Some(ChromeMode::Instrument),
+            device: Some("Speakers".to_string()),
         };
 
         // No flags: the config layer wins over the built-in defaults.
@@ -428,6 +439,7 @@ mod tests {
                 perf_mode: false,
                 demo_bpm: None,
                 chrome: None,
+                device: None,
             },
             &file,
         );
@@ -437,6 +449,11 @@ mod tests {
         assert!(from_config.perf_mode);
         assert_eq!(from_config.demo_bpm, 90.0);
         assert_eq!(from_config.chrome, ChromeMode::Instrument);
+        assert_eq!(
+            from_config.device.as_deref(),
+            Some("Speakers"),
+            "the config device applies with no flag"
+        );
 
         // Flags present: they beat the config layer.
         let from_flags = resolve(
@@ -447,10 +464,16 @@ mod tests {
                 perf_mode: true,
                 demo_bpm: Some(140.0),
                 chrome: Some(ChromeMode::Playful),
+                device: Some("Headset".to_string()),
             },
             &file,
         );
         assert_eq!(from_flags.scene.as_deref(), Some("starfall"));
+        assert_eq!(
+            from_flags.device.as_deref(),
+            Some("Headset"),
+            "the --device flag beats the config device"
+        );
         assert_eq!(from_flags.presenter, Some(PresenterTier::Octant));
         assert_eq!(from_flags.demo_bpm, 140.0);
         assert_eq!(
@@ -468,10 +491,12 @@ mod tests {
                 perf_mode: false,
                 demo_bpm: None,
                 chrome: None,
+                device: None,
             },
             &FileDefaults::default(),
         );
         assert_eq!(bare.scene, None);
+        assert_eq!(bare.device, None, "no device anywhere is None");
         assert_eq!(bare.presenter, None);
         assert!(!bare.overlay);
         assert!(!bare.perf_mode);
@@ -481,6 +506,48 @@ mod tests {
             ChromeMode::Invisible,
             "the built-in default is invisible"
         );
+    }
+
+    #[test]
+    fn device_key_parses_and_resolves_under_a_flag() {
+        // The config `[defaults] device` is read as the pinned device name.
+        let cfg = parse(
+            r#"
+            [defaults]
+            device = "Speakers (USB Audio)"
+            "#,
+        );
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(cfg.defaults.device.as_deref(), Some("Speakers (USB Audio)"));
+
+        // With no --device flag the config device wins; a flag beats it.
+        let no_flag = resolve(
+            CliLayer {
+                scene: None,
+                presenter: None,
+                overlay: false,
+                perf_mode: false,
+                demo_bpm: None,
+                chrome: None,
+                device: None,
+            },
+            &cfg.defaults,
+        );
+        assert_eq!(no_flag.device.as_deref(), Some("Speakers (USB Audio)"));
+
+        let with_flag = resolve(
+            CliLayer {
+                scene: None,
+                presenter: None,
+                overlay: false,
+                perf_mode: false,
+                demo_bpm: None,
+                chrome: None,
+                device: Some("Line In".to_string()),
+            },
+            &cfg.defaults,
+        );
+        assert_eq!(with_flag.device.as_deref(), Some("Line In"));
     }
 
     #[test]

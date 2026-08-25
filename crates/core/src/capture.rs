@@ -355,4 +355,13 @@ pub trait CaptureBackend: Send {
     fn route_id(&self) -> Option<String> {
         None
     }
+
+    /// Change the device the next [`open`](CaptureBackend::open) binds to. The
+    /// engine's runtime device switch ([`Engine::set_device`](crate::Engine::set_device))
+    /// records the new selector here before the route watcher performs the
+    /// reopen, so the switch lands on the watcher's next tick. The default is a
+    /// no-op for backends with no device concept (the synthetic source); the
+    /// cpal backend stores the selector so its next resolution binds it.
+    #[cfg(feature = "capture-cpal")]
+    fn set_device(&mut self, _selector: crate::backends::cpal::DeviceSelector) {}
 }
