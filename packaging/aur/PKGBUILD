@@ -1,0 +1,51 @@
+# Maintainer: Ryan Schubert <ryan@stomale.cc>
+#
+# AUR PKGBUILD for scia — TEMPLATE. Builds from the GitHub release source
+# tarball. Fields wrapped in __DOUBLE_UNDERSCORES__ are filled at release time
+# (see packaging/aur/README.md); nothing here is submitted automatically.
+#
+#   __VERSION__  the released version, e.g. 1.2.0 (no leading "v")
+#   __SHA256__   sha256 of the source tarball below — run `updpkgsums` after
+#                setting pkgver, or paste the archive's checksum. Use 'SKIP'
+#                only for local test builds, never in the submitted package.
+#
+# This is a build-from-source package: Arch ships ALSA and PipeWire, so it is
+# built with the `capture-pipewire` feature and captures the system output mix
+# (a PipeWire sink monitor) — the full system-audio experience, with no musl
+# static-linking caveats.
+pkgname=scia
+pkgver=__VERSION__
+pkgrel=1
+pkgdesc="A real-time music visualizer for the terminal"
+arch=('x86_64')
+url="https://github.com/rpschube/scia"
+license=('MIT OR Apache-2.0')
+# Runtime shared libraries; on Arch these packages also carry the headers the
+# build links against (alsa-lib -> libasound, pipewire -> libpipewire/libspa).
+depends=('alsa-lib' 'pipewire')
+makedepends=('rust' 'cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/rpschube/scia/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('__SHA256__')
+
+build() {
+    cd "$pkgname-$pkgver"
+    export CARGO_TARGET_DIR=target
+    # --frozen honours the committed Cargo.lock; --features capture-pipewire
+    # enables the Linux system-mix capture backend.
+    cargo build --frozen --release --bin scia --features capture-pipewire
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export CARGO_TARGET_DIR=target
+    # Workspace unit/golden tests need no audio hardware.
+    cargo test --frozen --release --workspace
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+    install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

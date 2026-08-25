@@ -1,0 +1,28 @@
+# winget default-locale manifest for scia — TEMPLATE.
+# Replace __VERSION__ with the released version (no leading "v").
+PackageIdentifier: rpschube.scia
+PackageVersion: __VERSION__
+PackageLocale: en-US
+Publisher: rpschube
+PublisherUrl: https://github.com/rpschube
+PublisherSupportUrl: https://github.com/rpschube/scia/issues
+PackageName: scia
+PackageUrl: https://github.com/rpschube/scia
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/rpschube/scia/blob/master/LICENSE-MIT
+Copyright: Copyright (c) Ryan Schubert
+ShortDescription: A real-time music visualizer for the terminal.
+Description: >-
+  scia captures whatever your system is playing and renders generative scenes
+  at 60 fps in modern terminals. A single small binary, no configuration, with
+  TOML presets and sandboxed Luau scenes.
+Moniker: scia
+Tags:
+  - audio
+  - visualizer
+  - music
+  - terminal
+  - tui
+  - spectrum
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

@@ -7,7 +7,53 @@ tab — with no configuration, and renders generative scenes at 60 fps in modern
 terminals (Windows Terminal, ghostty, and others). One engine core is designed
 to grow a GPU window and a desktop-wallpaper mode later.
 
-**Status: pre-alpha, under construction.** There is nothing to install yet.
+**Status: pre-alpha, under construction.** Packaging is release-ready, but no
+version has been tagged yet — the install commands below activate with the
+first release.
+
+## Install
+
+scia is a single self-contained binary (under 10 MiB, no runtime dependencies
+beyond the OS and its system audio libraries). Full per-platform detail,
+including the Linux audio notes, is in [docs/installing.md](docs/installing.md).
+Replace `X.Y.Z` with the release version.
+
+**Windows**
+
+```powershell
+winget install rpschube.scia
+```
+
+**macOS (Apple Silicon)**
+
+```sh
+brew install rpschube/tap/scia
+```
+
+**Arch Linux (AUR)**
+
+```sh
+paru -S scia      # or: yay -S scia
+```
+
+**Shell / PowerShell installer (any release, direct download)**
+
+```sh
+# Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rpschube/scia/releases/download/vX.Y.Z/scia-installer.sh | sh
+```
+
+```powershell
+# Windows
+irm https://github.com/rpschube/scia/releases/download/vX.Y.Z/scia-installer.ps1 | iex
+```
+
+**Manual:** download the archive for your platform from the
+[releases page](https://github.com/rpschube/scia/releases), verify it against
+the adjacent `.sha256`, extract, and put `scia` on your `PATH`. On Linux, the
+prebuilt binaries capture the microphone-level input; for system-mix capture use
+the AUR package or build with `--features capture-pipewire` (see
+[docs/installing.md](docs/installing.md)).
 
 ## Goals
 

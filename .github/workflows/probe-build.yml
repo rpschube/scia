@@ -73,6 +73,18 @@ jobs:
           # built with the release profile (fat LTO per Cargo.toml).
           cargo build --release --bin scia "${features[@]}"
 
+      - name: Enforce release binary size budget (US-DIST-1)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The scia binary above is the release profile dist ships (fat LTO,
+          # stripped). Assert it stays within the 10 MiB budget on the real
+          # per-OS build, so the guard also covers the Windows and macOS sizes
+          # that dist-size-guard.yml (Linux-only) does not.
+          bin="target/release/scia"
+          [[ "${{ runner.os }}" == "Windows" ]] && bin="target/release/scia.exe"
+          scripts/check-dist-size.sh "$bin"
+
       - name: Collect
         shell: bash
         run: |

@@ -164,3 +164,12 @@ changelog tag:
 # Show what a release would build (cargo-dist plan; no compilation).
 dist-plan:
     dist plan
+
+# Verify the checked-in release.yml matches dist-workspace.toml (no drift).
+dist-check:
+    dist generate --check
+
+# Assert a built binary is within the release size budget (default 10 MiB).
+# Release builds never run here; point this at a CI-built binary if you have one.
+size-check binary:
+    scripts/check-dist-size.sh {{binary}}
