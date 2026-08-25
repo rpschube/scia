@@ -541,6 +541,8 @@ fn run_input_mode(cli: &Cli, resolved: &Resolved, addr: String, keymap: Keymap) 
         config_dir: config::config_dir(),
         device: DeviceSelector::Default,
         prefer_pipewire: true,
+        // A remote stream is not a local WSL capture; the WSL notice never applies.
+        wsl: false,
     };
 
     let stats = handle.stats_fn();
@@ -724,6 +726,8 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         config_dir: config::config_dir(),
         device: DeviceSelector::Default,
         prefer_pipewire: true,
+        // The demo feed needs no audio hardware, so the WSL notice never applies.
+        wsl: false,
     };
 
     let outcome = run(
@@ -743,6 +747,27 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
 /// Start live capture on the cpal backend and run the TUI or the headless
 /// status loop.
 fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
+    // A Linux process inside WSL cannot see the Windows system mix (WSL carries
+    // only WSL-app audio). Detect it and say so plainly — here on the way in and
+    // in-app via the guidance overlay — rather than presenting a black screen
+    // reacting only to WSL sounds. Capture still proceeds: WSL-app audio is
+    // legitimate, just labeled.
+    let wsl = scia_core::detect_wsl();
+    if wsl {
+        eprintln!(
+            "note: running inside WSL — Windows system audio is not visible here \
+             (WSL carries only WSL-app audio)."
+        );
+        eprintln!(
+            "  · run scia.exe from this shell to visualize Windows audio directly \
+             (the Windows PATH is on your WSL PATH), or"
+        );
+        eprintln!(
+            "  · run scia-bridge on Windows and render it with `scia --input <windows-host>:7526`."
+        );
+        eprintln!("  see docs/wsl.md for both paths.");
+    }
+
     // Device precedence is already merged (flag > config > default) in `resolved`.
     let selector = match &resolved.device {
         Some(name) => DeviceSelector::Named(name.clone()),
@@ -846,6 +871,8 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         config_dir: config::config_dir(),
         device: selector,
         prefer_pipewire,
+        // Opens the WSL guidance overlay at startup when detected above.
+        wsl,
     };
 
     let outcome = run(
@@ -863,6 +890,13 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         opts,
     );
     engine.stop();
+    // The WSL overlay's `[s]` key asks to leave live capture for the demo feed:
+    // the live engine is torn down above; relaunch in demo mode.
+    if let Ok(summary) = &outcome {
+        if summary.demo_requested {
+            return run_demo(cli, resolved, keymap);
+        }
+    }
     report_tui_outcome(outcome)
 }
 

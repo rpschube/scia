@@ -32,6 +32,7 @@ mod render;
 mod sixel;
 mod stats;
 mod tuning;
+mod wsl;
 
 use std::fmt;
 use std::io::{self, Stdout, Write as _};
@@ -87,6 +88,7 @@ pub use tuning::{
     TuningParam, TuningStrip, apply_map_edit, apply_params_edit, draw_tuning, write_back_export,
     write_back_file, write_map_export, write_map_file,
 };
+pub use wsl::{BRIDGE_COMMAND, DOCS_PATH, WslLine, WslScreen, draw_wsl, osc52_copy};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");
@@ -150,6 +152,12 @@ pub struct TuiOptions {
     /// Whether the capture backend prefers the PipeWire host, so the device
     /// picker filters to the matching capture direction. Defaults to `true`.
     pub prefer_pipewire: bool,
+    /// Whether the binary detected it is running inside WSL on a live-capture
+    /// run. When `true` the WSL guidance overlay (storyboard 1n) opens at
+    /// startup, explaining that Windows audio is not visible and pointing at the
+    /// two supported paths; capture still proceeds underneath. Defaults to
+    /// `false` (not WSL, or a mode where the notice does not apply).
+    pub wsl: bool,
 }
 
 impl Default for TuiOptions {
@@ -171,6 +179,7 @@ impl Default for TuiOptions {
             config_dir: None,
             device: DeviceSelector::Default,
             prefer_pipewire: true,
+            wsl: false,
         }
     }
 }
@@ -188,6 +197,11 @@ pub struct RunSummary {
     /// an error; `None` on a clean quit or frame-limit exit. The caller reports
     /// the message and exits non-zero.
     pub error: Option<String>,
+    /// `true` when the loop exited because the WSL guidance overlay's `[s]` key
+    /// asked to switch to the demo feed. The caller (which owns the engine)
+    /// tears down live capture and relaunches in demo mode. `false` on every
+    /// other exit.
+    pub demo_requested: bool,
 }
 
 /// Run the terminal frontend until the user quits (or `opts.frames` frames have
@@ -376,6 +390,9 @@ fn run_loop(
         keymap: opts.keymap,
         chrome: ChromeState::new(opts.chrome),
         devices: DevicePicker::new(opts.device.clone(), opts.prefer_pipewire),
+        // Opens at startup when the binary detected WSL on a live capture, so the
+        // guidance is the first thing seen rather than a black, WSL-only screen.
+        wsl: wsl::WslScreen::new(opts.wsl),
         ..UiState::default()
     };
     // The in-flight device-enumeration worker's result channel, alive only while
@@ -592,6 +609,38 @@ fn run_loop(
             notice_deadline = Some(frame_start + NOTICE_TTL);
         }
 
+        // Fulfil the WSL overlay's copy request (`[c]`): write the bridge command
+        // to the terminal clipboard with an OSC 52 escape and mark it copied. The
+        // command stays highlighted regardless, so a terminal that ignores OSC 52
+        // can still be selected from by hand — the graceful fallback.
+        if std::mem::take(&mut ui.wsl_copy_pending) {
+            let seq = wsl::osc52_copy(ui.wsl.command());
+            let mut out = io::stdout();
+            let _ = out.write_all(&seq);
+            let _ = out.flush();
+            ui.wsl.mark_copied();
+            ui.notice = Some("bridge command copied — or select the highlighted line".to_string());
+            notice_deadline = Some(frame_start + NOTICE_TTL);
+        }
+        // Fulfil the WSL overlay's docs request (`[?]`): point at the docs file.
+        if std::mem::take(&mut ui.wsl_docs_pending) {
+            ui.notice = Some(format!("WSL paths documented in {}", wsl::DOCS_PATH));
+            notice_deadline = Some(frame_start + NOTICE_TTL);
+        }
+        // Fulfil the WSL overlay's demo request (`[s]`): leave the loop so the
+        // caller (which owns the live engine) tears it down and relaunches on the
+        // synthetic feed.
+        if std::mem::take(&mut ui.wsl_demo_pending) {
+            let (p50, p99) = frame_times.percentiles();
+            return Ok(RunSummary {
+                frames,
+                p50_frame_ms: p50,
+                p99_frame_ms: p99,
+                error: None,
+                demo_requested: true,
+            });
+        }
+
         // Seam: keep the chrome's track line current from the metadata state.
         // Only a session that is actually *Playing* reaches the ambient chrome
         // and the scene text; a paused (or stopped) session is definitionally
@@ -689,6 +738,7 @@ fn run_loop(
                     p50_frame_ms: p50,
                     p99_frame_ms: p99,
                     error: Some(msg),
+                    demo_requested: false,
                 });
             }
         }
@@ -795,6 +845,9 @@ fn run_loop(
                         // The device picker is a modal overlay drawn above the
                         // rest, like the help panel.
                         devicepick::draw_devices(frame.buffer_mut(), body, &ui.devices);
+                        // The WSL guidance overlay is a modal above the rest,
+                        // the sibling of the device picker.
+                        wsl::draw_wsl(frame.buffer_mut(), body, &ui.wsl);
                     }
                     // The reload notice lands on top of the scene body, so it
                     // draws after the presenter rather than inside the chrome.
@@ -880,6 +933,7 @@ fn run_loop(
                     p50_frame_ms: p50,
                     p99_frame_ms: p99,
                     error: None,
+                    demo_requested: false,
                 });
             }
             // A resize or state toggle redraws promptly on the next frame; a
@@ -895,6 +949,7 @@ fn run_loop(
         p50_frame_ms: p50,
         p99_frame_ms: p99,
         error: None,
+        demo_requested: false,
     })
 }
 
@@ -1086,6 +1141,32 @@ fn handle_event(event: Event, ui: &mut UiState) -> Action {
             // Ctrl-C is a structural, always-on quit, independent of the keymap.
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 return Action::Quit;
+            }
+            // While the WSL guidance overlay is open it is modal, taking priority
+            // over every other binding: `c` copies the bridge command, `s`
+            // switches to the demo feed, `?` points at the docs file, and esc
+            // dismisses it (capture continues underneath). Plain `c` reaches here
+            // because Ctrl-C was already handled above.
+            if ui.wsl.is_open() {
+                match key.code {
+                    KeyCode::Char('c') => {
+                        ui.wsl_copy_pending = true;
+                        return Action::Redraw;
+                    }
+                    KeyCode::Char('s') => {
+                        ui.wsl_demo_pending = true;
+                        return Action::Redraw;
+                    }
+                    KeyCode::Char('?') => {
+                        ui.wsl_docs_pending = true;
+                        return Action::Redraw;
+                    }
+                    KeyCode::Esc => {
+                        ui.wsl.close();
+                        return Action::Redraw;
+                    }
+                    _ => {}
+                }
             }
             // While the tuning strip is open its keys take priority over scene
             // cycling and the browser: tab cycles the parameter, the arrows

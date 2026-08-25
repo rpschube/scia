@@ -36,6 +36,7 @@ pub mod onset;
 pub mod spectrum;
 pub mod stream;
 pub mod synthetic;
+pub mod wsl;
 
 #[cfg(feature = "capture-cpal")]
 pub use backends::cpal::{CpalBackend, DeviceInfo, DeviceKind, DeviceSelector, list_devices};
@@ -62,11 +63,13 @@ pub use latency::{
 pub use onset::{OnsetConfig, OnsetDetector};
 pub use spectrum::{SpectrumAnalyzer, SpectrumConfig};
 pub use stream::{
-    Encoding, FeatureFrame, FrameStreamReader, STREAM_MAGIC, STREAM_SCHEMA_VERSION, StreamError,
-    decode_binary_payload, encode_binary_payload, from_json_line, read_binary_frame,
-    read_binary_header, to_json_line, write_binary_frame, write_binary_header,
+    DEFAULT_STREAM_RATE, Encoding, FeatureFrame, FrameStreamReader, IDLE_KEEPALIVE, STREAM_MAGIC,
+    STREAM_SCHEMA_VERSION, StreamError, decode_binary_payload, emit_interval,
+    encode_binary_payload, from_json_line, read_binary_frame, read_binary_header, run_output,
+    to_json_line, write_binary_frame, write_binary_header,
 };
 pub use synthetic::{Pacing, Signal, SyntheticBackend};
+pub use wsl::{detect_wsl, is_wsl};
 
 /// The crate name, resolved at compile time from Cargo metadata.
 pub const NAME: &str = env!("CARGO_PKG_NAME");

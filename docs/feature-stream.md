@@ -156,3 +156,13 @@ The `schema` field is the compatibility contract:
 The stream schema is pinned to the underlying `FeatureSnapshot` contract: the
 two versions move together, so a change to the snapshot layout bumps the stream
 version in lock-step.
+
+## Consumers
+
+- **`scia --input <ADDR>`** — the built-in renderer, driving the full terminal UI
+  from a remote stream (see [Command line](#command-line)).
+- **`scia-bridge`** — the Windows-side capture companion. It serves this exact
+  stream (the same serving loop as `scia --output --listen`), so a `scia
+  --input` elsewhere can render Windows audio. It is the second of the two
+  [WSL](wsl.md) paths, where the Windows system mix is not visible to a Linux
+  process directly.

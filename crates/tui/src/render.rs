@@ -147,6 +147,18 @@ pub struct UiState {
     /// by the render loop (which builds the source descriptor from the presenter
     /// and the scene-file / builtin source).
     pub author_open_pending: bool,
+    /// The WSL guidance overlay model (storyboard 1n). Opens at startup when the
+    /// binary detected WSL on a live capture; drawn as a modal over the body.
+    pub wsl: crate::wsl::WslScreen,
+    /// A one-shot request from the WSL overlay's `[c]` key, consumed by the
+    /// render loop to write the bridge command to the clipboard (OSC 52).
+    pub wsl_copy_pending: bool,
+    /// A one-shot request from the WSL overlay's `[s]` key, consumed by the
+    /// render loop to leave live capture and relaunch in the demo feed.
+    pub wsl_demo_pending: bool,
+    /// A one-shot request from the WSL overlay's `[?]` key, consumed by the
+    /// render loop to surface the docs-file pointer as a status notice.
+    pub wsl_docs_pending: bool,
 }
 
 impl UiState {
@@ -206,6 +218,9 @@ pub fn draw(frame: &mut Frame, snap: &FeatureSnapshot, ui: &UiState) {
         draw_help(buf, body, ui);
         // The device picker is a modal overlay above the rest; inert when closed.
         crate::devicepick::draw_devices(buf, body, &ui.devices);
+        // The WSL guidance overlay is a modal above the rest, like the picker;
+        // inert when closed.
+        crate::wsl::draw_wsl(buf, body, &ui.wsl);
     }
     if let Some(debug) = debug {
         render_debug(buf, debug, snap, ui);
