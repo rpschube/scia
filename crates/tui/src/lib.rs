@@ -576,17 +576,11 @@ fn run_loop(
         }
 
         // Seam: keep the chrome's track line current from the metadata state.
-        ui.track = ui
-            .now_playing
-            .current
-            .as_ref()
-            .map(|np| match (np.title.as_deref(), np.artist.as_deref()) {
-                (Some(t), Some(a)) => format!("{t} — {a}"),
-                (Some(t), None) => t.to_string(),
-                (None, Some(a)) => a.to_string(),
-                (None, None) => String::new(),
-            })
-            .filter(|s| !s.is_empty());
+        // Only a session that is actually *Playing* reaches the ambient chrome
+        // and the scene text; a paused (or stopped) session is definitionally
+        // not the audio source, so it produces nothing here even though the
+        // selection policy still keeps it (the explicit `n` panel shows it).
+        ui.track = playing_track_line(ui.now_playing.current.as_ref());
 
         // Advance the chrome timers on the real frame period: the invisible-mode
         // fade tracks time-since-input, not scene motion, so it keeps counting
@@ -1296,6 +1290,31 @@ fn apply_action(action: InputAction, ui: &mut UiState, browsing: bool) -> Action
     }
 }
 
+/// The chrome track line for a now-playing snapshot, gated on playback status.
+///
+/// Only a session that is actually [`Playing`](scia_meta::PlaybackStatus::Playing)
+/// yields a formatted `title — artist` line; a paused or stopped session yields
+/// `None`, because such a session is not the audio source the ambient surfaces
+/// should name (a paused player's metadata can even be a track that never played
+/// on this machine, via cross-device sync). The selection policy still keeps
+/// paused sessions — the explicit now-playing panel shows them — but this seam
+/// is the one place the chrome and the scene text read, so gating here reverts
+/// verso to its fallback word and leaves the invisible-chrome fade untouched by
+/// paused-session churn, with no parallel gates elsewhere.
+fn playing_track_line(np: Option<&scia_meta::NowPlaying>) -> Option<String> {
+    let np = np?;
+    if !np.status.is_playing() {
+        return None;
+    }
+    let line = match (np.title.as_deref(), np.artist.as_deref()) {
+        (Some(t), Some(a)) => format!("{t} — {a}"),
+        (Some(t), None) => t.to_string(),
+        (None, Some(a)) => a.to_string(),
+        (None, None) => String::new(),
+    };
+    Some(line).filter(|s| !s.is_empty())
+}
+
 /// Resolve a palette-key press: apply the current track's art palette to the
 /// live scene via crossfade, or, if it is already applied, revert to the scene's
 /// own palette. With no presenter (direct-bars / no `--scene`) or no decoded art
@@ -1910,6 +1929,175 @@ mod tests {
             p.frame(&scia_core::FeatureSnapshot::default(), 0.05);
         }
         assert_eq!(p.palette(), scene_palette, "reverts to the scene palette");
+    }
+
+    /// A now-playing snapshot with the given title/artist and playback status.
+    fn np_status(
+        title: &str,
+        artist: &str,
+        status: scia_meta::PlaybackStatus,
+    ) -> scia_meta::NowPlaying {
+        scia_meta::NowPlaying::new(
+            Some(title.into()),
+            Some(artist.into()),
+            None,
+            status,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn paused_session_produces_no_chrome_track_line() {
+        // A paused session is not the audio source, so the ambient seam yields
+        // nothing even though the metadata carries a title and artist.
+        let paused = np_status(
+            "Ghost Track",
+            "Someone Else",
+            scia_meta::PlaybackStatus::Paused,
+        );
+        assert_eq!(playing_track_line(Some(&paused)), None);
+
+        // A stopped session likewise yields nothing.
+        let stopped = np_status(
+            "Ghost Track",
+            "Someone Else",
+            scia_meta::PlaybackStatus::Stopped,
+        );
+        assert_eq!(playing_track_line(Some(&stopped)), None);
+
+        // Absence yields nothing.
+        assert_eq!(playing_track_line(None), None);
+    }
+
+    #[test]
+    fn playing_session_produces_the_formatted_track_line() {
+        let playing = np_status("Real Song", "Real Band", scia_meta::PlaybackStatus::Playing);
+        assert_eq!(
+            playing_track_line(Some(&playing)).as_deref(),
+            Some("Real Song — Real Band"),
+        );
+    }
+
+    #[test]
+    fn play_to_pause_flip_clears_the_chrome_track_line() {
+        // The single seam: flipping Playing→Paused turns the chrome line from the
+        // formatted string to `None`; the loop's track-change path then pushes an
+        // empty `set_text("track", "")`, which the verso test below verifies.
+        let np = np_status("Real Song", "Real Band", scia_meta::PlaybackStatus::Playing);
+        assert!(playing_track_line(Some(&np)).is_some());
+        let np = np_status("Real Song", "Real Band", scia_meta::PlaybackStatus::Paused);
+        assert_eq!(playing_track_line(Some(&np)), None);
+    }
+
+    #[test]
+    fn pausing_reverts_verso_to_its_fallback_word() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        // Rasterize a verso presenter into a fresh buffer and flatten it to text.
+        fn text_of(p: &ScenePresenter, cols: u16, rows: u16) -> String {
+            let area = Rect::new(0, 0, cols, rows);
+            let mut buf = Buffer::empty(area);
+            p.draw(&mut buf, area);
+            buf.content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect()
+        }
+
+        let preset = builtin_preset("verso")
+            .expect("verso is a built-in preset")
+            .expect("verso parses");
+        let mut p = presenter::ScenePresenter::from_preset(&preset, Tier::Half);
+        let (cols, rows) = (48u16, 16u16);
+        p.resize(cols, rows);
+
+        let mut snap = FeatureSnapshot {
+            spectrum_len: scia_core::SPECTRUM_BINS as u16,
+            ..FeatureSnapshot::default()
+        };
+        for b in &mut snap.spectrum {
+            *b = 0.8;
+        }
+
+        // A Playing session drives the seam, and the loop forwards its line to the
+        // scene: verso draws the title's glyphs.
+        let playing = np_status("Zephyr", "Band", scia_meta::PlaybackStatus::Playing);
+        let line = playing_track_line(Some(&playing));
+        p.set_text("track", line.as_deref().unwrap_or(""));
+        for _ in 0..8 {
+            p.frame(&snap, 0.05);
+        }
+        let showing = text_of(&p, cols, rows);
+        assert!(
+            showing.contains('Z') && showing.contains('y'),
+            "verso shows the playing title: {showing:?}"
+        );
+
+        // The session pauses: the seam yields `None`, the loop pushes an empty
+        // track line, and verso reverts to its fallback word `scia`.
+        let paused = np_status("Zephyr", "Band", scia_meta::PlaybackStatus::Paused);
+        let line = playing_track_line(Some(&paused));
+        assert_eq!(line, None, "a paused session clears the chrome line");
+        p.set_text("track", line.as_deref().unwrap_or(""));
+        for _ in 0..8 {
+            p.frame(&snap, 0.05);
+        }
+        let fallback = text_of(&p, cols, rows);
+        for ch in ['s', 'c', 'i', 'a'] {
+            assert!(
+                fallback.contains(ch),
+                "verso reverts to the fallback word `scia` (`{ch}`): {fallback:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_paused_session_change_does_not_reset_the_invisible_fade() {
+        // The invisible-mode fade resets only when the chrome track line changes.
+        // Two different paused sessions both gate to `None`, so the loop's
+        // `cur_track != last_track` guard never fires and the fade keeps counting.
+        let mut cs = ChromeState::new(ChromeMode::Invisible);
+        cs.tick(5.0);
+        assert_eq!(cs.fade(), Fade::Hidden);
+
+        let last = playing_track_line(Some(&np_status(
+            "First Paused",
+            "A",
+            scia_meta::PlaybackStatus::Paused,
+        )));
+        let next = playing_track_line(Some(&np_status(
+            "Second Paused",
+            "B",
+            scia_meta::PlaybackStatus::Paused,
+        )));
+        assert_eq!(last, None);
+        assert_eq!(next, None);
+        if last != next {
+            cs.on_track_change();
+        }
+        assert_eq!(
+            cs.fade(),
+            Fade::Hidden,
+            "a paused-session metadata change must not reset the fade"
+        );
+
+        // For contrast: a session that starts Playing does change the line and so
+        // resets the fade, exactly as a track change does today.
+        let playing = playing_track_line(Some(&np_status(
+            "Now Live",
+            "C",
+            scia_meta::PlaybackStatus::Playing,
+        )));
+        if next != playing {
+            cs.on_track_change();
+        }
+        assert_eq!(
+            cs.fade(),
+            Fade::Full,
+            "a session becoming Playing resets the fade like a track change"
+        );
     }
 
     /// A scene-mode UiState with the tuning strip already open on two params, as

@@ -401,11 +401,22 @@ fn render_np_panel(
         "now playing"
     };
 
-    // Size the panel to the widest of the art, the minimum, and the title, so
-    // the title is never clipped; then clamp to the body.
-    let inner_target = ART_CELLS_W
-        .max(NP_MIN_WIDTH - 2)
-        .max(title.chars().count() as u16);
+    // A clear textual status tag for a session that is not actually playing, so a
+    // paused (or stopped) session in the explicit panel can never be mistaken for
+    // the live audio source. Playing sessions carry no tag — the panel is
+    // unchanged for them.
+    let status_tag: Option<&str> = match np.status {
+        PlaybackStatus::Playing => None,
+        PlaybackStatus::Paused => Some("⏸ paused"),
+        PlaybackStatus::Stopped => Some("■ stopped"),
+    };
+    // The full title row width: the title, plus the tag and a two-cell gap.
+    let title_row_len = title.chars().count() + status_tag.map_or(0, |t| t.chars().count() + 2);
+
+    // Size the panel to the widest of the art, the minimum, and the title row, so
+    // neither the title nor the status tag is ever clipped; then clamp to the
+    // body.
+    let inner_target = ART_CELLS_W.max(NP_MIN_WIDTH - 2).max(title_row_len as u16);
     let width = (inner_target + 2).clamp(NP_MIN_WIDTH, body.width);
     let inner_w = width.saturating_sub(2) as usize;
 
@@ -433,6 +444,21 @@ fn render_np_panel(
         fill.add_modifier(Modifier::BOLD)
     };
     buf.set_stringn(inner_x, panel.y, title, inner_w, title_style);
+    // The status tag sits just after the title on the same row, only for a
+    // non-Playing session, and only when the panel is wide enough to hold it.
+    if let Some(tag) = status_tag {
+        let used = title.chars().count() + 2;
+        if used < inner_w {
+            let tag_style = fill.add_modifier(Modifier::BOLD).fg(palette::QUIET);
+            buf.set_stringn(
+                inner_x + used as u16,
+                panel.y,
+                tag,
+                inner_w - used,
+                tag_style,
+            );
+        }
+    }
 
     // Content cursor, kept inside the panel and clear of the hint row.
     let content_top = panel.y + 1;
@@ -794,5 +820,74 @@ mod tests {
         for (i, slot) in art.slots.iter().enumerate() {
             assert_eq!(pal.slots[i], Rgb(slot[0], slot[1], slot[2]));
         }
+    }
+
+    /// Flatten the whole buffer into one string.
+    fn buffer_text(buf: &Buffer) -> String {
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// Concatenate one buffer row into a string.
+    fn row_text(buf: &Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn panel_tags_a_paused_session_near_the_title() {
+        let nps = NowPlayingState {
+            current: Some(np("Song", "s", PlaybackStatus::Paused)),
+            ..Default::default()
+        };
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        draw_now_playing(&mut buf, area, &nps, false);
+
+        // The status tag reads clearly as a word, on the title row next to it.
+        let title_row = row_text(&buf, 0, 40);
+        assert!(
+            title_row.contains("now playing"),
+            "title present: {title_row:?}"
+        );
+        assert!(
+            title_row.contains("paused"),
+            "a paused session is tagged near the title: {title_row:?}"
+        );
+    }
+
+    #[test]
+    fn panel_tags_a_stopped_session_near_the_title() {
+        let nps = NowPlayingState {
+            current: Some(np("Song", "s", PlaybackStatus::Stopped)),
+            ..Default::default()
+        };
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        draw_now_playing(&mut buf, area, &nps, false);
+        let title_row = row_text(&buf, 0, 40);
+        assert!(
+            title_row.contains("stopped"),
+            "a stopped session is tagged near the title: {title_row:?}"
+        );
+    }
+
+    #[test]
+    fn panel_leaves_a_playing_session_untagged() {
+        let nps = NowPlayingState {
+            current: Some(np("Song", "s", PlaybackStatus::Playing)),
+            ..Default::default()
+        };
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        draw_now_playing(&mut buf, area, &nps, false);
+        let all = buffer_text(&buf);
+        assert!(
+            !all.contains("paused") && !all.contains("stopped"),
+            "a playing session carries no status tag: {all:?}"
+        );
     }
 }
