@@ -24,6 +24,13 @@ use crate::PresenterTier;
 /// The built-in demo tempo when neither a flag nor the config supplies one.
 pub const DEFAULT_DEMO_BPM: f32 = 112.0;
 
+/// The scene a bare `scia` lands in when neither a `--scene` flag nor a config
+/// `[defaults] scene` supplies one: the canonical analyzer. The scene engine is
+/// the product, so a first run must open in it rather than the legacy bars. The
+/// legacy direct spectrum-bars renderer stays reachable through the reserved
+/// name `bars` (see [`resolve`] and `main`'s scene seam).
+pub const DEFAULT_SCENE: &str = "spectra";
+
 /// The raw `[defaults]` and `[keys]` tables as parsed from the file. Every field
 /// is optional; unknown `[defaults]` keys are ignored, unknown `[keys]` actions
 /// are surfaced as warnings during resolution.
@@ -115,7 +122,9 @@ pub struct CliLayer {
 /// flags.
 #[derive(Debug, PartialEq)]
 pub struct Resolved {
-    /// Scene preset to render, if any.
+    /// Scene to render. Always `Some` after [`resolve`] — CLI > config >
+    /// [`DEFAULT_SCENE`] — so a bare run opens in the default scene. The
+    /// reserved value `"bars"` selects the legacy direct-bars path in `main`.
     pub scene: Option<String>,
     /// Forced presenter tier, if any.
     pub presenter: Option<PresenterTier>,
@@ -138,10 +147,19 @@ pub struct Resolved {
 /// that, the built-in default. `overlay`/`perf_mode` presence flags can only
 /// turn a setting on (there is no `--no-*` form), so a config value of `true`
 /// cannot be overridden off from the command line.
+///
+/// The scene resolves CLI > config > the built-in [`DEFAULT_SCENE`], so it is
+/// always `Some`: a bare invocation lands in the default scene, never the legacy
+/// bars. The reserved name `bars` survives this merge unchanged; `main` maps it
+/// to the legacy direct-bars path where it consumes the resolved scene.
 #[must_use]
 pub fn resolve(cli: CliLayer, file: &FileDefaults) -> Resolved {
     Resolved {
-        scene: cli.scene.or_else(|| file.scene.clone()),
+        scene: Some(
+            cli.scene
+                .or_else(|| file.scene.clone())
+                .unwrap_or_else(|| DEFAULT_SCENE.to_string()),
+        ),
         presenter: cli.presenter.or(file.presenter),
         overlay: cli.overlay || file.overlay.unwrap_or(false),
         perf_mode: cli.perf_mode || file.perf_mode.unwrap_or(false),
@@ -495,7 +513,11 @@ mod tests {
             },
             &FileDefaults::default(),
         );
-        assert_eq!(bare.scene, None);
+        assert_eq!(
+            bare.scene.as_deref(),
+            Some(DEFAULT_SCENE),
+            "with nothing set the scene defaults to spectra, not the legacy bars"
+        );
         assert_eq!(bare.device, None, "no device anywhere is None");
         assert_eq!(bare.presenter, None);
         assert!(!bare.overlay);
@@ -562,6 +584,93 @@ mod tests {
             assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
             assert_eq!(cfg.defaults.chrome, Some(mode));
         }
+    }
+
+    /// A [`CliLayer`] with nothing set — the shape of a bare invocation.
+    fn empty_cli() -> CliLayer {
+        CliLayer {
+            scene: None,
+            presenter: None,
+            overlay: false,
+            perf_mode: false,
+            demo_bpm: None,
+            chrome: None,
+            device: None,
+        }
+    }
+
+    #[test]
+    fn no_cli_no_config_scene_defaults_to_spectra() {
+        // The headline change: a bare `scia` lands in the default scene, so the
+        // scene engine — not the legacy bars — is what a first run sees.
+        let resolved = resolve(empty_cli(), &FileDefaults::default());
+        assert_eq!(resolved.scene.as_deref(), Some("spectra"));
+        assert_eq!(resolved.scene.as_deref(), Some(DEFAULT_SCENE));
+    }
+
+    #[test]
+    fn config_scene_beats_the_default() {
+        let file = FileDefaults {
+            scene: Some("aurora".to_string()),
+            ..FileDefaults::default()
+        };
+        let resolved = resolve(empty_cli(), &file);
+        assert_eq!(
+            resolved.scene.as_deref(),
+            Some("aurora"),
+            "a config scene wins over the built-in default"
+        );
+    }
+
+    #[test]
+    fn cli_scene_beats_config_and_default() {
+        let file = FileDefaults {
+            scene: Some("aurora".to_string()),
+            ..FileDefaults::default()
+        };
+        let resolved = resolve(
+            CliLayer {
+                scene: Some("starfall".to_string()),
+                ..empty_cli()
+            },
+            &file,
+        );
+        assert_eq!(resolved.scene.as_deref(), Some("starfall"));
+    }
+
+    #[test]
+    fn reserved_bars_name_survives_resolution_from_cli_and_config() {
+        // `main` maps the reserved name to the legacy path; `resolve` must pass
+        // it through unchanged from either layer.
+        let from_cli = resolve(
+            CliLayer {
+                scene: Some("bars".to_string()),
+                ..empty_cli()
+            },
+            &FileDefaults::default(),
+        );
+        assert_eq!(from_cli.scene.as_deref(), Some("bars"));
+
+        let from_config = resolve(
+            empty_cli(),
+            &FileDefaults {
+                scene: Some("bars".to_string()),
+                ..FileDefaults::default()
+            },
+        );
+        assert_eq!(from_config.scene.as_deref(), Some("bars"));
+    }
+
+    #[test]
+    fn no_builtin_scene_is_named_bars() {
+        // The escape hatch relies on `bars` never colliding with a registered
+        // scene id; guard against a future scene claiming the reserved name.
+        assert!(
+            scia_scenes::builtin_scenes()
+                .iter()
+                .all(|info| info.id != "bars"),
+            "the reserved name `bars` must not be a registered scene id"
+        );
     }
 
     #[test]

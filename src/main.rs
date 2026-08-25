@@ -43,7 +43,9 @@ CONFIG:
     Unix:     $XDG_CONFIG_HOME/scia/config.toml  (else ~/.config/scia/config.toml)
     Windows:  %APPDATA%\\scia\\config.toml
   [defaults]  scene, presenter, overlay, perf_mode, demo_bpm, chrome, device
-              (presenter = octant | sextant | quadrant | half | kitty | sixel;
+              (scene = spectra (default) | any --list-scenes name | bars for the
+              legacy spectrum-bars renderer;
+              presenter = octant | sextant | quadrant | half | kitty | sixel;
               chrome = invisible | instrument | playful | utilitarian;
               device = exact capture device name; all overridden by their flags)
   [keys]      rebind actions scene_next, scene_prev, browser, overlay, pause,
@@ -71,6 +73,27 @@ EXIT CODES:
 /// Per-query timeout for capability probing; the four queries stay well under
 /// ~600 ms total.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// The reserved scene name that selects the legacy direct spectrum-bars
+/// renderer. It is deliberately *not* a registered scene id (see
+/// [`scene_for_tui`]): asking for it maps to the TUI's internal none/direct
+/// path, the escape hatch from the default scene engine.
+const LEGACY_BARS_SCENE: &str = "bars";
+
+/// Translate the resolved scene name into the value the TUI consumes.
+///
+/// The TUI treats `TuiOptions.scene == None` as the legacy direct-bars renderer
+/// and `Some(name)` as a scene it must build (validating the name). Since the
+/// scene now always resolves to a name (defaulting to `spectra`), the only way
+/// to reach the legacy path is the reserved name [`LEGACY_BARS_SCENE`], which
+/// this maps to `None`. Every other name passes through for the TUI to validate.
+/// Pure, so the seam is unit-tested directly.
+fn scene_for_tui(resolved: Option<&str>) -> Option<String> {
+    match resolved {
+        Some(name) if name == LEGACY_BARS_SCENE => None,
+        other => other.map(str::to_owned),
+    }
+}
 
 /// A live, terminal audio spectrum.
 #[derive(Parser, Debug)]
@@ -153,9 +176,10 @@ struct Cli {
     #[arg(long)]
     overlay: bool,
 
-    /// Render a built-in scene preset (from --list-scenes) instead of the plain
-    /// spectrum bars. Invalid names exit 2 listing the available presets. Not
-    /// valid with --headless.
+    /// Which scene to render (from --list-scenes). Defaults to `spectra` when
+    /// unset. The reserved name `bars` selects the legacy direct spectrum-bars
+    /// renderer instead of a scene. Invalid names exit 2 listing the available
+    /// presets. Not valid with --headless.
     #[arg(long, value_name = "NAME")]
     scene: Option<String>,
 
@@ -339,6 +363,11 @@ fn print_scene_list() -> ExitCode {
     for (name, _) in scia_scenes::builtin_presets() {
         println!("  {name}");
     }
+    println!(
+        "\nBare `scia` opens the {} scene; pass `--scene {}` for the legacy spectrum-bars renderer.",
+        config::DEFAULT_SCENE,
+        LEGACY_BARS_SCENE
+    );
     ExitCode::SUCCESS
 }
 
@@ -473,7 +502,7 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         frames: cli.frames,
         debug: cli.debug,
         overlay: resolved.overlay,
-        scene: resolved.scene.clone(),
+        scene: scene_for_tui(resolved.scene.as_deref()),
         preset,
         presenter_mode,
         initial_notice,
@@ -595,7 +624,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         frames: cli.frames,
         debug: cli.debug,
         overlay: resolved.overlay,
-        scene: resolved.scene.clone(),
+        scene: scene_for_tui(resolved.scene.as_deref()),
         preset,
         presenter_mode,
         initial_notice,
@@ -827,6 +856,38 @@ fn loudest_bar(spectrum: &[f32]) -> (usize, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_for_tui_maps_bars_to_the_legacy_none_path() {
+        // The reserved name reaches the TUI as `None`, which the TUI renders as
+        // the legacy direct-bars presenter.
+        assert_eq!(scene_for_tui(Some(LEGACY_BARS_SCENE)), None);
+        assert_eq!(scene_for_tui(Some("bars")), None);
+    }
+
+    #[test]
+    fn scene_for_tui_passes_real_scene_names_through() {
+        // The default and every other name pass through for the TUI to build and
+        // validate.
+        assert_eq!(
+            scene_for_tui(Some(config::DEFAULT_SCENE)),
+            Some("spectra".to_string())
+        );
+        assert_eq!(scene_for_tui(Some("aurora")), Some("aurora".to_string()));
+        assert_eq!(scene_for_tui(None), None);
+    }
+
+    #[test]
+    fn reserved_bars_name_is_not_a_registered_scene() {
+        // The escape hatch depends on `bars` never colliding with a real scene
+        // id, so the mapping in `scene_for_tui` can own the name unambiguously.
+        assert!(
+            scia_scenes::builtin_scenes()
+                .iter()
+                .all(|info| info.id != LEGACY_BARS_SCENE),
+            "no builtin scene may be named `{LEGACY_BARS_SCENE}`"
+        );
+    }
 
     #[test]
     fn presenter_kitty_flag_parses() {
