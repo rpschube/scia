@@ -167,6 +167,16 @@ pub struct SampleSink {
     /// `cumulative_frames` matches the frame stream the DSP consumes even when the
     /// ring drops on overflow.
     delivery_cum: u64,
+    /// Diagnostic-only (P7 forensic dual-tap): the most recent capture callback's
+    /// driver capture timestamp (ns on the backend's own clock — e.g. WASAPI QPC,
+    /// from cpal's `InputCallbackInfo::timestamp().capture`), stamped by the backend
+    /// via [`stamp_driver_capture`](SampleSink::stamp_driver_capture) just before it
+    /// pushes. `0` when the backend reports none (the synthetic source) and on every
+    /// production path (nothing reads it there). The dual-tap tee logs it alongside
+    /// each push so the forensic probe can compare the driver's own capture instant
+    /// against the wall-clock delivery time (`last_push_ns`) every other clock model
+    /// is derived from — the discriminator for a constant wall-vs-driver skew.
+    pending_driver_capture_ns: u64,
 }
 
 impl SampleSink {
@@ -244,7 +254,12 @@ impl SampleSink {
         // production path, so this is a never-taken branch there.
         if let Some(tee) = &mut self.tee {
             let whole = (interleaved.len() / channels) * channels;
-            tee.record(&interleaved[..whole], channels, now);
+            tee.record(
+                &interleaved[..whole],
+                channels,
+                now,
+                self.pending_driver_capture_ns,
+            );
         }
 
         let pushed = (to_write / channels) as u64;
@@ -266,6 +281,18 @@ impl SampleSink {
     #[must_use]
     pub fn free_samples(&self) -> usize {
         self.producer.slots()
+    }
+
+    /// Record the driver's capture timestamp for the next [`push`](SampleSink::push)
+    /// — the P7 forensic dual-tap seam. A capture backend that can read its driver's
+    /// capture-time clock (cpal's `InputCallbackInfo::timestamp().capture`) calls this
+    /// at the top of its callback, before it pushes; the value is carried into the
+    /// dual-tap tee's per-push log and surfaced only by the forensic probe. Inert on
+    /// every production path (the DSP never reads it) at a cost of one field store, so
+    /// the push hot path is otherwise unchanged. A backend with no usable driver
+    /// timestamp simply never calls this and the logged value stays `0`.
+    pub fn stamp_driver_capture(&mut self, driver_capture_ns: u64) {
+        self.pending_driver_capture_ns = driver_capture_ns;
     }
 
     /// Shared statistics for this sink.
@@ -388,6 +415,7 @@ pub(crate) fn sample_ring_with_stats(stats: Arc<SinkStats>) -> (SampleSink, Samp
             tee: None,
             delivery: Arc::clone(&delivery),
             delivery_cum: 0,
+            pending_driver_capture_ns: 0,
         },
         SampleConsumer {
             consumer,
@@ -751,9 +779,28 @@ pub fn drain_into_timeline(
 /// probe to treat it as found. Kept low on purpose: a synthetic click is a
 /// single-frame impulse, whose normalized correlation against a rectangular
 /// template of `L` frames plateaus at `1/√L` (≈0.14 for a 1 ms / 48 kHz
-/// template), while a real full-width click and a matching-width burst score
-/// near 1.0 and silence / a never-arrived click score ≈ 0.
+/// template), while a matching-width rectangular burst scores 1.0 and a real
+/// **shaped** click (attack + decay, not a perfect rectangle) scores high but
+/// plausibly *below* 1.0 — comfortably above this floor, so the floor still
+/// admits it. It is emphatically **not** an `NCC ≥ 1` test: the flat-window
+/// degeneracy (see [`rect_xcorr_peak`]) is excluded by the energy floor there,
+/// not by demanding a perfect score here, so a shaped click's sub-1.0 peak is a
+/// match, not a failure. Silence / a never-arrived click score ≈ 0 and fall
+/// below it.
 pub const RAW_CORR_ACCEPT: f32 = 0.1;
+
+/// Fraction of the strongest scanned window's energy that a candidate window
+/// must reach to be eligible for the correlation peak — equivalently, a window
+/// RMS floor of `√FRAC` (0.5×) the strongest window's RMS. This is the fix for
+/// the **flat-window degeneracy** (see [`rect_xcorr_peak`]): it is a *ratio* of
+/// energies, so it carries **no user knob** and is invariant under any overall
+/// gain (scaling every sample by `k` scales both the candidate's energy and the
+/// reference by `k²`, leaving the decision unchanged — robust across capture
+/// volumes). 0.25 (RMS 0.5×) brackets a click's energetic core — its attack and
+/// peak — while excluding both the silence/DC floor around it and its own
+/// low-energy decay tail, so the reported leading edge lands on the click's
+/// arrival, not a downstream flat region.
+const RAW_CORR_ENERGY_FLOOR_FRAC: f64 = 0.25;
 
 /// Peak normalized cross-correlation of a rectangular (all-ones) template of
 /// `template_len` samples against `signal`, scanned over correlation offsets
@@ -762,19 +809,57 @@ pub const RAW_CORR_ACCEPT: f32 = 0.1;
 /// that NCC)`.
 ///
 /// This is the matched filter the P7 raw-ring probe uses to place a click's
-/// leading edge in the captured stream. An emitted click is a rectangular burst
-/// of known width, so the template is all-ones of that width and the NCC peaks
+/// leading edge in the captured stream. An emitted click is a positive burst of
+/// known width, so the template is all-ones of that width and the NCC peaks
 /// where the burst begins. Using NCC rather than a raw dot product makes the
-/// score amplitude-independent — 1.0 for a perfectly matching positive burst,
-/// near 0 for silence or zero-mean noise — so one acceptance floor
-/// ([`RAW_CORR_ACCEPT`]) separates "click found" from "click never arrived".
+/// score amplitude-independent, so one acceptance floor ([`RAW_CORR_ACCEPT`])
+/// separates "click found" from "click never arrived".
 ///
-/// Ties are resolved to the *latest* offset. For a rectangular-matched burst
-/// that is its unique strict peak, so the choice never bites there; for a pulse
-/// narrower than the template (a synthetic single-frame impulse), the tie runs
-/// over the plateau of offsets whose window still contains the pulse, and the
-/// latest of them is the offset whose template *start* aligns with the pulse —
-/// i.e. the leading-edge frame in both cases.
+/// ## The flat-window degeneracy, and how it is excluded
+///
+/// `NCC(o) = Σ window / (√(Σ window²) · √L)` equals **exactly ±1.0 for any
+/// *constant* window**, independent of its amplitude: a window of `L` copies of
+/// `c` has `Σ = L·c` and `Σ² = L·c²`, so `NCC = L·c / (√(L·c²)·√L) = 1`. Digital
+/// silence's DC floor, or any flat region, is therefore a *perfect* match — while
+/// a real click, shaped by the render/capture chain into an attack + decay, is
+/// **not** constant and scores strictly below 1. Left unguarded the correlation
+/// locks onto the first perfectly-flat region after the click's decay settles and
+/// reports the click's arrival there — the round-7 field artifact: `ncc = 1.000`
+/// on a silent stretch ~1458 frames (~30 ms) past the true click, which itself
+/// scored below 1.0 and lost. (Mean-subtracting the *template* does **not** fix
+/// this — an all-ones template minus its mean is the zero vector, and the score
+/// is undefined/zero everywhere. The fix is an energy gate on the *window*.)
+///
+/// Two energy gates, both pure ratios (no knob, gain-invariant — see
+/// [`RAW_CORR_ENERGY_FLOOR_FRAC`]), make a degenerate window ineligible so it
+/// scores **0, never 1**:
+///
+/// 1. **Excursion gate (whole search).** A click is a *localized* energy
+///    excursion above a quieter baseline, so `E_max` (the strongest window's
+///    energy) must exceed the search's baseline `E_min` by at least
+///    `FRAC · E_max`. A globally flat search — pure silence, or constant DC at
+///    *any* amplitude, or steady wideband noise — has `E_max ≈ E_min` and no
+///    excursion, so nothing localizes a click and **every** offset scores 0. This
+///    is what makes a constant-DC window score 0 even though its raw NCC is 1.0,
+///    without rejecting a constant *burst* (which stands above silence and is the
+///    synthetic click's exact shape).
+/// 2. **Per-window floor.** Given an excursion, only windows whose energy reaches
+///    `FRAC · E_max` are eligible; the low-energy flat regions (silence, DC floor,
+///    the click's own decay tail) fall below it and score 0. The click's
+///    energetic core clears it and wins.
+///
+/// ## Tie-break — the leading edge
+///
+/// Among the eligible windows at the maximum NCC, ties resolve to the window
+/// whose **first sample is largest in magnitude**, then to the **earliest**
+/// offset. This places the template's start on the signal's rising edge in both
+/// degenerate-plateau cases: for a burst *wider* than the template the interior
+/// windows tie at NCC 1.0 with equal first samples, so the earliest — the burst's
+/// leading edge — wins (no late drift into a sustained region); for a pulse
+/// *narrower* than the template (a synthetic single-frame impulse) the tie runs
+/// over the offsets whose window merely contains the pulse, and the one whose
+/// first sample lands *on* the pulse has the largest leading magnitude and wins —
+/// the leading-edge frame in both cases.
 ///
 /// Returns `None` when `template_len` is zero, longer than `signal`, or the
 /// clamped search range is empty.
@@ -796,9 +881,6 @@ pub fn rect_xcorr_peak(
         return None;
     }
 
-    // Template energy is L (all ones), so ‖template‖ = √L; NCC(o) =
-    // Σ window / (√(Σ window²) · √L).
-    //
     // Each offset's `sum` (Σ window) and `sq` (Σ window²) are computed fresh over
     // the window's `template_len` samples — deliberately not carried across
     // offsets. A running window sum is O(1) per offset but the sum-of-squares
@@ -807,37 +889,64 @@ pub fn rect_xcorr_peak(
     // and in a later low-energy window that residual can dwarf the window's true
     // Σ window². Cauchy–Schwarz bounds `Σ window ≤ √L · √(Σ window²)` only for a
     // *consistent* sum/energy pair, so an independently-drifted denominator lets
-    // NCC exceed 1 and win the peak, planting a spurious late arrival. Recomputing
-    // both from the same samples keeps the pair consistent, so NCC ≤ 1 by
-    // construction; the final `.min(1.0)` on the magnitude is a last-ulp guard.
-    // The cost is O(template_len) per offset — fine for this probe/test helper.
+    // NCC exceed 1. Recomputing both from the same samples keeps the pair
+    // consistent, so NCC ≤ 1 by construction; the `.clamp` on the magnitude is a
+    // last-ulp guard. The cost is O(template_len) per offset — fine for this
+    // probe/test helper, which the doc notes.
+    let window_sq = |o: usize| -> f64 {
+        signal[o..o + template_len]
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum()
+    };
+
+    // Pass 1 — the energy scale of the search. `e_max` is the strongest window's
+    // energy (the click, when one is present); `e_min` is the quietest (the
+    // baseline the click stands above). Both feed the gates below.
+    let mut e_max = 0.0f64;
+    let mut e_min = f64::INFINITY;
+    for o in start..end {
+        let sq = window_sq(o);
+        e_max = e_max.max(sq);
+        e_min = e_min.min(sq);
+    }
+
+    // Excursion gate: a click is a localized energy peak above a quieter
+    // baseline. With no excursion — a globally flat search (silence, or constant
+    // DC at any amplitude, whose raw NCC would otherwise be a degenerate 1.0) —
+    // no offset can carry a click, so every window scores 0. `e_max <= 0` is pure
+    // silence (also caught by `sq > 0` below).
+    let has_excursion = e_max > 0.0 && (e_max - e_min) >= RAW_CORR_ENERGY_FLOOR_FRAC * e_max;
+    let energy_floor = RAW_CORR_ENERGY_FLOOR_FRAC * e_max;
+
     let norm = (template_len as f64).sqrt();
-    let mut best: Option<(usize, f32)> = None;
+    // Track the best as (ncc, first-sample magnitude, offset). Higher ncc wins;
+    // on an exact NCC tie the larger leading magnitude wins; on a further tie the
+    // earlier offset wins (we scan ascending and only replace on strict
+    // improvement of a key). See the tie-break note above.
+    let mut best: Option<(f32, f32, usize)> = None;
     for o in start..end {
         let window = &signal[o..o + template_len];
-        let mut sum = 0.0f64;
-        let mut sq = 0.0f64;
-        for &v in window {
-            let v = f64::from(v);
-            sum += v;
-            sq += v * v;
-        }
-        let ncc = if sq > 0.0 {
-            // Clamp the magnitude to Cauchy–Schwarz's ceiling of 1: exact
-            // recomputation already guarantees |NCC| ≤ 1 up to rounding, and this
-            // makes a >1 unrepresentable rather than merely unlikely.
-            let raw = sum / (sq.sqrt() * norm);
-            raw.clamp(-1.0, 1.0) as f32
+        let sum: f64 = window.iter().map(|&v| f64::from(v)).sum();
+        let sq: f64 = window.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+        // A window is eligible only if the search has a real excursion and this
+        // window reaches the energy floor. An ineligible (degenerate/near-silent)
+        // window scores 0 — never the spurious 1.0 a flat region would earn.
+        let ncc = if has_excursion && sq >= energy_floor && sq > 0.0 {
+            (sum / (sq.sqrt() * norm)).clamp(-1.0, 1.0) as f32
         } else {
             0.0
         };
-        // `>=` keeps the latest max (see the tie-break note above).
-        match best {
-            Some((_, b)) if ncc < b => {}
-            _ => best = Some((o, ncc)),
+        let first_mag = window[0].abs();
+        let better = match best {
+            None => true,
+            Some((bncc, bmag, _)) => ncc > bncc || (ncc == bncc && first_mag > bmag),
+        };
+        if better {
+            best = Some((ncc, first_mag, o));
         }
     }
-    best
+    best.map(|(ncc, _, o)| (o, ncc))
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +1066,12 @@ impl PushLog {
 struct TeeProducer {
     samples: rtrb::Producer<f32>,
     log: Arc<PushLog>,
+    /// Parallel wait-free log of per-push driver capture timestamps (P7 forensic),
+    /// pushed one-for-one with each logged [`PushRecord`], in the same order, so the
+    /// forensic drain reads them in lockstep. `0` per entry when the backend never
+    /// stamped one. Only [`tee_drain_forensic`] reads it; the normal
+    /// [`tee_drain_into_timeline`] ignores it entirely.
+    driver: Arc<DriverLog>,
     /// Producer-owned running count of teed frames (only frames actually written
     /// to the sample ring; a dropped push does not advance it, so the count always
     /// matches the teed sample stream).
@@ -967,12 +1082,21 @@ struct TeeProducer {
 }
 
 impl TeeProducer {
-    /// Tee one whole-frame packet delivered at `delivery_ns`. All-or-nothing: if
+    /// Tee one whole-frame packet delivered at `delivery_ns`, carrying the driver's
+    /// capture timestamp `driver_capture_ns` (`0` when unknown). All-or-nothing: if
     /// the whole packet fits it is copied and logged; otherwise the packet is
     /// dropped and counted, so a logged record's samples are always present and
-    /// its newest frame is genuinely the packet's newest (the delivery anchor).
-    /// Wait-free and allocation-free.
-    fn record(&mut self, interleaved: &[f32], channels: usize, delivery_ns: u64) {
+    /// its newest frame is genuinely the packet's newest (the delivery anchor). The
+    /// driver stamp is pushed only when the record is (after a successful copy), so
+    /// the driver log and the record log stay one-for-one aligned. Wait-free and
+    /// allocation-free.
+    fn record(
+        &mut self,
+        interleaved: &[f32],
+        channels: usize,
+        delivery_ns: u64,
+        driver_capture_ns: u64,
+    ) {
         let frames = interleaved.len() / channels;
         if frames == 0 {
             return;
@@ -997,6 +1121,49 @@ impl TeeProducer {
             delivery_ns,
             cumulative_frames: self.cumulative_frames,
         });
+        self.driver.push(driver_capture_ns);
+    }
+}
+
+/// A wait-free single-producer / single-consumer log of per-push driver capture
+/// timestamps (ns on the backend's driver clock), the P7-forensic parallel to
+/// [`PushLog`]. One `u64` per teed push, pushed in lockstep with the [`PushRecord`]
+/// so [`tee_drain_forensic`] can read the two side by side. Overwrite-oldest past
+/// [`PUSH_LOG_SLOTS`] (never reached in a drained run). Shared as an [`Arc`].
+struct DriverLog {
+    slots: Box<[AtomicU64]>,
+    write: AtomicU64,
+    read: AtomicU64,
+}
+
+impl DriverLog {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(PUSH_LOG_SLOTS);
+        slots.resize_with(PUSH_LOG_SLOTS, || AtomicU64::new(0));
+        Self {
+            slots: slots.into_boxed_slice(),
+            write: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one driver timestamp. Wait-free; single producer only.
+    fn push(&self, driver_capture_ns: u64) {
+        let w = self.write.load(Ordering::Relaxed);
+        self.slots[(w as usize) % PUSH_LOG_SLOTS].store(driver_capture_ns, Ordering::Relaxed);
+        self.write.store(w.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Append every timestamp logged since the last drain to `out`, in push order.
+    /// Single consumer only.
+    fn drain(&self, out: &mut Vec<u64>) {
+        let w = self.write.load(Ordering::Acquire);
+        let mut r = self.read.load(Ordering::Relaxed);
+        while r < w {
+            out.push(self.slots[(r as usize) % PUSH_LOG_SLOTS].load(Ordering::Relaxed));
+            r += 1;
+        }
+        self.read.store(r, Ordering::Relaxed);
     }
 }
 
@@ -1007,9 +1174,14 @@ impl TeeProducer {
 pub struct TeeConsumer {
     samples: rtrb::Consumer<f32>,
     log: Arc<PushLog>,
+    /// Read half of the parallel driver-capture-timestamp log (P7 forensic). Drained
+    /// in lockstep with `log` by [`tee_drain_forensic`]; unused by the normal drain.
+    driver: Arc<DriverLog>,
     dropped_pushes: Arc<AtomicU64>,
     /// Reused record buffer, pre-reserved so a drain never allocates.
     records: Vec<PushRecord>,
+    /// Reused driver-stamp buffer for the forensic drain, pre-reserved likewise.
+    driver_scratch: Vec<u64>,
 }
 
 impl TeeConsumer {
@@ -1029,22 +1201,27 @@ impl TeeConsumer {
 fn new_tee() -> (TeeProducer, TeeConsumer) {
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(TEE_RING_SLOTS);
     let log = Arc::new(PushLog::new());
+    let driver = Arc::new(DriverLog::new());
     let dropped_pushes = Arc::new(AtomicU64::new(0));
     // A single 1 ms drain sees only a handful of pushes; reserve well above that
-    // so the reused buffer never grows on the drain path.
+    // so the reused buffers never grow on the drain path.
     let records = Vec::with_capacity(1024);
+    let driver_scratch = Vec::with_capacity(1024);
     (
         TeeProducer {
             samples: producer,
             log: Arc::clone(&log),
+            driver: Arc::clone(&driver),
             cumulative_frames: 0,
             dropped_pushes: Arc::clone(&dropped_pushes),
         },
         TeeConsumer {
             samples: consumer,
             log,
+            driver,
             dropped_pushes,
             records,
+            driver_scratch,
         },
     )
 }
@@ -1112,6 +1289,150 @@ pub fn tee_drain_into_timeline(
     }
     tee.records = records;
     appended
+}
+
+/// One teed push, surfaced for the P7 **forensic** dump: the push's own delivery
+/// record joined with the driver capture timestamp logged for it. All frame times
+/// are on the same absolute coordinate the tee's [`DrainTimeline`] uses — global
+/// teed frame index = cumulative frames since the stream started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForensicPush {
+    /// Cumulative teed frames through the end of this push (its newest frame is
+    /// global index `cumulative_frames − 1`).
+    pub cumulative_frames: u64,
+    /// Frames this push delivered.
+    pub frames: u32,
+    /// Wall-clock delivery time (`last_push_ns`, ns on the engine/ring epoch).
+    pub delivery_ns: u64,
+    /// Driver capture timestamp for this push (ns on the backend's driver clock),
+    /// `0` when the backend reported none.
+    pub driver_capture_ns: u64,
+}
+
+/// The forensic sibling of [`tee_drain_into_timeline`]: it drains the teed samples
+/// and per-push records into `mono` / `timeline` exactly as that function does, and
+/// **additionally** drains the parallel driver-capture log in lockstep, appending one
+/// [`ForensicPush`] per push to `pushes`. Returns the frames appended this call.
+///
+/// Kept a separate function so the shipped dual-tap path ([`tee_drain_into_timeline`])
+/// is byte-for-byte unchanged; this one is used only by the `--forensic` probe mode.
+/// The record log and the driver log are pushed one-for-one, so index `i` of the
+/// drained records aligns with index `i` of the drained driver stamps.
+pub fn tee_drain_forensic(
+    tee: &mut TeeConsumer,
+    scratch: &mut Vec<f32>,
+    mono: &mut Vec<f32>,
+    timeline: &mut DrainTimeline,
+    channels: usize,
+    pushes: &mut Vec<ForensicPush>,
+) -> usize {
+    let channels = channels.max(1);
+    // Move the reusable buffers out so the sample consumer and these buffers are not
+    // both borrowed through `tee` at once; restored at the end.
+    let mut records = std::mem::take(&mut tee.records);
+    let mut drivers = std::mem::take(&mut tee.driver_scratch);
+    records.clear();
+    drivers.clear();
+    tee.log.drain(&mut records);
+    tee.driver.drain(&mut drivers);
+    let mut appended = 0usize;
+    for (i, rec) in records.iter().enumerate() {
+        let need = rec.frames as usize * channels;
+        if need == 0 {
+            continue;
+        }
+        if tee.samples.slots() < need {
+            break;
+        }
+        scratch.clear();
+        if let Ok(chunk) = tee.samples.read_chunk(need) {
+            let (first, second) = chunk.as_slices();
+            scratch.extend_from_slice(first);
+            scratch.extend_from_slice(second);
+            chunk.commit_all();
+        } else {
+            break;
+        }
+        for f in 0..rec.frames as usize {
+            let base = f * channels;
+            let mut acc = 0.0f32;
+            for c in 0..channels {
+                acc += scratch[base + c];
+            }
+            mono.push(acc / channels as f32);
+        }
+        timeline.record_drain(rec.delivery_ns, u64::from(rec.frames));
+        pushes.push(ForensicPush {
+            cumulative_frames: rec.cumulative_frames,
+            frames: rec.frames,
+            delivery_ns: rec.delivery_ns,
+            driver_capture_ns: drivers.get(i).copied().unwrap_or(0),
+        });
+        appended += rec.frames as usize;
+    }
+    tee.records = records;
+    tee.driver_scratch = drivers;
+    appended
+}
+
+/// Index and value of the largest-magnitude sample in `signal[lo..=hi]`
+/// (inclusive), for the P7 forensic "in-hop peak sample" locator. The range is
+/// clamped to the signal; an empty or out-of-range range yields `(lo, 0.0)`.
+/// Ties resolve to the earliest index. Pure helper; unit-tested.
+#[must_use]
+pub fn peak_abs_in_range(signal: &[f32], lo: usize, hi: usize) -> (usize, f32) {
+    if signal.is_empty() {
+        return (lo, 0.0);
+    }
+    let start = lo.min(signal.len() - 1);
+    let end = hi.min(signal.len() - 1);
+    if start > end {
+        return (start, 0.0);
+    }
+    let mut best_idx = start;
+    let mut best_val = signal[start].abs();
+    for (off, &v) in signal[start..=end].iter().enumerate() {
+        let a = v.abs();
+        if a > best_val {
+            best_val = a;
+            best_idx = start + off;
+        }
+    }
+    (best_idx, best_val)
+}
+
+/// Per-millisecond peak-magnitude profile over a window for the P7 forensic energy
+/// dump. Bucket `k` covers global frames
+/// `start_frame + k*frames_per_bucket .. start_frame + (k+1)*frames_per_bucket` and
+/// holds the largest `|sample|` in that span (`0.0` for frames outside `signal`, so
+/// a window reaching before frame 0 or past the capture simply reads as silence
+/// there). `start_frame` is an `i64` so a window can legitimately begin before the
+/// stream start. Returns `n_buckets` values. Pure helper; unit-tested.
+#[must_use]
+pub fn bucket_peaks(
+    signal: &[f32],
+    start_frame: i64,
+    frames_per_bucket: usize,
+    n_buckets: usize,
+) -> Vec<f32> {
+    let fpb = frames_per_bucket.max(1) as i64;
+    let mut out = Vec::with_capacity(n_buckets);
+    for k in 0..n_buckets as i64 {
+        let lo = start_frame + k * fpb;
+        let hi = lo + fpb; // exclusive
+        let mut peak = 0.0f32;
+        // Clamp the bucket's frame span to the signal indices [0, len).
+        let a = lo.max(0);
+        let b = hi.min(signal.len() as i64);
+        for f in a..b {
+            let v = signal[f as usize].abs();
+            if v > peak {
+                peak = v;
+            }
+        }
+        out.push(peak);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1350,6 +1671,135 @@ mod tests {
         );
     }
 
+    /// The pre-round-7 scorer, preserved verbatim as the *degenerate-permissive*
+    /// baseline: no energy gate, ties to the latest offset. It scores any constant
+    /// window an exact 1.0 — the flat-window degeneracy round 7 removed — so it is
+    /// used only to prove the fix bites: the shipped `rect_xcorr_peak` must diverge
+    /// from it on the shaped-click-in-silence case below.
+    fn rect_xcorr_peak_prefix(
+        signal: &[f32],
+        template_len: usize,
+        search_start: usize,
+        search_end: usize,
+    ) -> Option<(usize, f32)> {
+        if template_len == 0 || template_len > signal.len() {
+            return None;
+        }
+        let offset_bound = signal.len() - template_len + 1;
+        let start = search_start.min(offset_bound);
+        let end = search_end.min(offset_bound);
+        if start >= end {
+            return None;
+        }
+        let norm = (template_len as f64).sqrt();
+        let mut best: Option<(usize, f32)> = None;
+        for o in start..end {
+            let window = &signal[o..o + template_len];
+            let mut sum = 0.0f64;
+            let mut sq = 0.0f64;
+            for &v in window {
+                let v = f64::from(v);
+                sum += v;
+                sq += v * v;
+            }
+            let ncc = if sq > 0.0 {
+                (sum / (sq.sqrt() * norm)).clamp(-1.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            // `>=` keeps the latest max — the pre-round-7 tie rule.
+            match best {
+                Some((_, b)) if ncc < b => {}
+                _ => best = Some((o, ncc)),
+            }
+        }
+        best
+    }
+
+    /// A shaped click — a flat attack plateau exactly `template_len` frames wide,
+    /// then a ~15 ms exponential decay — sitting on a constant nonzero DC floor,
+    /// with that same flat floor as the head and a long flat tail. This mirrors the
+    /// field capture: an attack + decay click surrounded by a perfectly flat region
+    /// (the digital-silence DC floor, not exact zeros).
+    fn shaped_click_on_dc_floor(len: usize, click_at: usize, template_len: usize) -> Vec<f32> {
+        let dc = 1.0e-3f32; // constant nonzero floor — the degenerate flat region
+        let amp = 0.5f32;
+        let mut sig = vec![dc; len];
+        for s in &mut sig[click_at..click_at + template_len] {
+            *s = amp + dc;
+        }
+        let decay = 720usize; // ~15 ms at 48 kHz
+        for k in 0..decay {
+            let t = k as f32 / decay as f32;
+            sig[click_at + template_len + k] = amp * (-6.0 * t).exp() + dc;
+        }
+        sig
+    }
+
+    #[test]
+    fn xcorr_shaped_click_beats_flat_tail_where_the_old_scorer_lost() {
+        // A shaped click near the front, then thousands of frames of flat DC floor.
+        // The OLD (degenerate-permissive) scorer scores every flat window an exact
+        // 1.0 and, tying to the latest, reports the click's arrival far downstream
+        // in the silent tail — the round-7 field artifact reproduced by
+        // construction. The shipped scorer's energy gates make the flat tail
+        // ineligible, so it lands on the click's leading edge instead.
+        let l = 48usize;
+        let click_at = 1_000usize;
+        let len = 12_000usize;
+        let sig = shaped_click_on_dc_floor(len, click_at, l);
+        let (start, end) = (0usize, len - l + 1);
+
+        // Bite: the old scorer locks onto the flat tail, nowhere near the click.
+        let (old_off, old_ncc) = rect_xcorr_peak_prefix(&sig, l, start, end).expect("old peak");
+        assert!(
+            (old_ncc - 1.0).abs() < 1e-6,
+            "old scorer should score the flat region a degenerate 1.0, got {old_ncc}"
+        );
+        assert!(
+            old_off > click_at + l + 720 + 100,
+            "old scorer should drift into the flat tail (offset {old_off}), \
+             far past the click at {click_at}"
+        );
+
+        // Fix: the shipped scorer places the leading edge at the plateau start.
+        let (new_off, new_ncc) = rect_xcorr_peak(&sig, l, start, end).expect("new peak");
+        assert_eq!(
+            new_off, click_at,
+            "new scorer should place the leading edge at the plateau start \
+             {click_at}, got {new_off}"
+        );
+        assert!(
+            new_ncc >= RAW_CORR_ACCEPT,
+            "the shaped click's peak {new_ncc} should clear the acceptance floor"
+        );
+        // The gate genuinely changed the outcome: the two scorers disagree.
+        assert!(
+            new_off < old_off,
+            "the energy gate must move the pick earlier: new {new_off} vs old {old_off}"
+        );
+    }
+
+    #[test]
+    fn xcorr_flat_windows_score_zero() {
+        let l = 48usize;
+        let n = 4_000usize;
+
+        // Pure digital silence: no energy anywhere.
+        let silence = vec![0.0f32; n];
+        let (_, peak) = rect_xcorr_peak(&silence, l, 0, n - l + 1).expect("a peak");
+        assert_eq!(peak, 0.0, "pure silence must score 0, got {peak}");
+        assert!(peak < RAW_CORR_ACCEPT);
+
+        // Constant DC at a substantial amplitude: the raw NCC is a degenerate 1.0
+        // for every window, but with no energy excursion the scorer must still
+        // return 0 — the guard that is not amplitude-dependent.
+        let dc = vec![0.5f32; n];
+        let (_, peak) = rect_xcorr_peak(&dc, l, 0, n - l + 1).expect("a peak");
+        assert_eq!(peak, 0.0, "a constant-DC window must score 0, got {peak}");
+        assert!(peak < RAW_CORR_ACCEPT);
+    }
+
     #[test]
     fn push_log_roundtrip_preserves_order_and_monotonicity() {
         let log = PushLog::new();
@@ -1506,5 +1956,82 @@ mod tests {
         // A second drain with nothing buffered yields nothing.
         assert_eq!(consumer.drain_all(&mut out), 0);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn peak_abs_in_range_locates_the_extremum() {
+        let sig = [0.1f32, -0.9, 0.3, 0.8, -0.2];
+        // Whole-signal: the -0.9 at index 1 has the largest magnitude.
+        assert_eq!(peak_abs_in_range(&sig, 0, 4), (1, 0.9));
+        // Sub-range [2..=4]: the 0.8 at index 3.
+        assert_eq!(peak_abs_in_range(&sig, 2, 4), (3, 0.8));
+        // Range clamps to the signal; hi past the end still works.
+        assert_eq!(peak_abs_in_range(&sig, 3, 99), (3, 0.8));
+        // Empty signal is graceful.
+        assert_eq!(peak_abs_in_range(&[], 5, 9), (5, 0.0));
+        // Inverted range yields the floor.
+        assert_eq!(peak_abs_in_range(&sig, 4, 2), (4, 0.0));
+    }
+
+    #[test]
+    fn bucket_peaks_windows_by_frames_and_pads_out_of_range() {
+        // 12 samples, 4 frames per bucket. Put a spike in bucket 1 and bucket 2.
+        let mut sig = vec![0.0f32; 12];
+        sig[5] = 0.5; // bucket 1 (frames 4..8)
+        sig[9] = -0.7; // bucket 2 (frames 8..12)
+        let b = bucket_peaks(&sig, 0, 4, 3);
+        assert_eq!(b, vec![0.0, 0.5, 0.7]);
+
+        // A window that starts before frame 0 pads the leading buckets with 0 and
+        // still lands the spike in the correct (shifted) bucket. start=-4 => bucket
+        // 0 covers frames [-4,0) (all silence), bucket 1 covers [0,4), bucket 2
+        // covers [4,8) (the 0.5 spike).
+        let b = bucket_peaks(&sig, -4, 4, 4);
+        assert_eq!(b, vec![0.0, 0.0, 0.5, 0.7]);
+
+        // Reaching past the end pads trailing buckets with 0.
+        let b = bucket_peaks(&sig, 8, 4, 3);
+        assert_eq!(b, vec![0.7, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn tee_drain_forensic_surfaces_aligned_driver_stamps() {
+        let epoch = Instant::now();
+        let (mut sink, _primary, mut tee) = sample_ring_with_tee(epoch);
+        sink.stats().set_channels(1);
+
+        // Three pushes, each stamped with a distinct driver capture time before it.
+        let drivers = [111_000u64, 222_000, 333_000];
+        let sizes = [64usize, 32, 80];
+        for (&d, &n) in drivers.iter().zip(sizes.iter()) {
+            sink.stamp_driver_capture(d);
+            sink.push(&vec![0.25f32; n]);
+        }
+
+        let mut scratch: Vec<f32> = Vec::new();
+        let mut mono: Vec<f32> = Vec::new();
+        let mut timeline = DrainTimeline::new(48_000);
+        let mut pushes: Vec<ForensicPush> = Vec::new();
+        let appended = tee_drain_forensic(
+            &mut tee,
+            &mut scratch,
+            &mut mono,
+            &mut timeline,
+            1,
+            &mut pushes,
+        );
+
+        assert_eq!(appended, sizes.iter().sum::<usize>());
+        assert_eq!(pushes.len(), 3);
+        // Driver stamps come back in push order, aligned one-for-one with frames and
+        // the running cumulative frame count.
+        let mut cum = 0u64;
+        for (i, pf) in pushes.iter().enumerate() {
+            cum += sizes[i] as u64;
+            assert_eq!(pf.driver_capture_ns, drivers[i]);
+            assert_eq!(pf.frames as usize, sizes[i]);
+            assert_eq!(pf.cumulative_frames, cum);
+            assert!(pf.delivery_ns > 0);
+        }
     }
 }
