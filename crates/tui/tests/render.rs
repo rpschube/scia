@@ -113,6 +113,35 @@ fn header_shows_label_and_activity() {
 }
 
 #[test]
+fn header_shows_fullscreen_paused_marker() {
+    // When rendering is paused for a foreground fullscreen app, the header leads
+    // the activity indicator with a `fullscreen paused` marker (US-PERF-3).
+    let snap = snapshot_with(&[0.5; 8]);
+    let ui = UiState {
+        fullscreen_paused: true,
+        ..ui_with_activity(Activity::Idle)
+    };
+    let buf = render(70, 10, &snap, &ui);
+    let header = row(&buf, 0, 70);
+    assert!(
+        header.contains("fullscreen paused"),
+        "header missing the fullscreen-paused marker: {header:?}"
+    );
+}
+
+#[test]
+fn header_has_no_fullscreen_marker_when_not_paused() {
+    let snap = snapshot_with(&[0.5; 8]);
+    let ui = ui_with_activity(Activity::Active);
+    let buf = render(70, 10, &snap, &ui);
+    let header = row(&buf, 0, 70);
+    assert!(
+        !header.contains("fullscreen"),
+        "header should not mention fullscreen when not paused: {header:?}"
+    );
+}
+
+#[test]
 fn header_shows_live_and_format_without_label() {
     let snap = snapshot_with(&[0.5; 8]);
     let ui = UiState {

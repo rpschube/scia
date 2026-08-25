@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["capture-cpal", "perf-mode", "route-notify"]
+default = ["capture-cpal", "perf-mode", "route-notify", "fullscreen"]
 # The cpal-based capture backend (Windows WASAPI loopback, Linux ALSA/PipeWire,
 # macOS Core Audio input). On by default.
 capture-cpal = ["dep:cpal"]
@@ -29,6 +29,13 @@ perf-mode = ["capture-cpal", "dep:windows"]
 # the engine falls back to polling. Shares the same `cfg(windows)` `windows`
 # dependency perf mode links (never entering a non-Windows build).
 route-notify = ["dep:windows", "dep:windows-core"]
+# Automatic pause while a fullscreen-exclusive app (a game) is foreground
+# (US-PERF-3). On by default, but it ONLY affects Windows: the detector queries
+# the shell via `SHQueryUserNotificationState`, while every other platform uses
+# a no-op detector that reports not-fullscreen and links nothing. The `windows`
+# crate it pulls on Windows is the same `cfg(windows)` optional dependency
+# perf-mode/route-notify already link, so it never enters a non-Windows build.
+fullscreen = ["dep:windows"]
 # Enable cpal's native PipeWire host so Linux can capture the system output mix
 # (a sink monitor). OFF by default: it links libpipewire development libraries
 # that are not present on every build host, so it must not ride in an
@@ -81,6 +88,8 @@ features = [
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_UI_Shell_PropertiesSystem",
+    # SHQueryUserNotificationState for the fullscreen-app detector (US-PERF-3).
+    "Win32_UI_Shell",
     "Win32_Devices_FunctionDiscovery",
 ]
 

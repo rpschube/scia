@@ -23,6 +23,8 @@ mod stream;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 use std::thread::sleep;
 use std::time::Duration;
@@ -32,8 +34,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use scia_core::engine::EngineHealth;
 use scia_core::{
     Activity, CaptureError, CpalBackend, DeviceKind, DeviceSelector, Encoding, Engine,
-    EngineConfig, EngineError, EngineStats, FeatureReader, Pacing, PerfModeState, Signal,
-    StreamHealth, SyntheticBackend, list_devices,
+    EngineConfig, EngineError, EngineStats, FeatureReader, FullscreenWatch, Pacing, PerfModeState,
+    Signal, StreamHealth, SyntheticBackend, list_devices,
 };
 use scia_scenes::{Preset, PresetWatcher, ReloadEvent, load_preset};
 use scia_tui::{ChromeMode, Keymap, PresenterMode, RunError, Tier, TuiOptions, run};
@@ -161,6 +163,19 @@ struct Cli {
     /// off Windows.
     #[arg(long)]
     perf_mode: bool,
+
+    /// Automatically pause rendering while a fullscreen-exclusive app (a game) is
+    /// foreground, resuming when it exits (US-PERF-3). On by default; this flag
+    /// forces it on over a config `[defaults] fullscreen_pause = false`. Windows
+    /// only — every other platform reports no fullscreen app in v1.
+    #[arg(long, overrides_with = "no_fullscreen_pause")]
+    fullscreen_pause: bool,
+
+    /// Disable the automatic fullscreen-app pause (US-PERF-3): keep rendering
+    /// even while a fullscreen game is foreground. Overrides the config
+    /// `[defaults] fullscreen_pause`.
+    #[arg(long, overrides_with = "fullscreen_pause")]
+    no_fullscreen_pause: bool,
 
     /// With --headless, exit after N seconds. `0` (the default) runs until the
     /// process is killed.
@@ -397,12 +412,24 @@ fn main() -> ExitCode {
     for warning in &cfg.warnings {
         eprintln!("{warning}");
     }
+    // The two fullscreen-pause flags fold into one tri-state for the config
+    // layer: force-off wins over force-on (both cannot be set — `overrides_with`
+    // makes the later flag win — but force-off is the safe reading if that ever
+    // changed), and neither set falls through to config, then the default.
+    let cli_fullscreen_pause = if cli.no_fullscreen_pause {
+        Some(false)
+    } else if cli.fullscreen_pause {
+        Some(true)
+    } else {
+        None
+    };
     let resolved = config::resolve(
         config::CliLayer {
             scene: cli.scene.clone(),
             presenter: cli.presenter,
             overlay: cli.overlay,
             perf_mode: cli.perf_mode,
+            fullscreen_pause: cli_fullscreen_pause,
             demo_bpm: cli.demo_bpm,
             chrome: cli.chrome.map(ChromeArg::mode),
             device: cli.device.clone(),
@@ -523,6 +550,12 @@ fn run_input_mode(cli: &Cli, resolved: &Resolved, addr: String, keymap: Keymap) 
         }
     };
 
+    // No local capture engine in `--input` mode, so the pause only stops the
+    // render loop; the remote producer downshifts its own idle path. The watch
+    // drives a standalone flag; `_fs_watch` must outlive `run`.
+    let (fullscreen_pause, _fs_watch) =
+        fullscreen_pause_setup(resolved.fullscreen_pause, Arc::new(AtomicBool::new(false)));
+
     let (presenter_mode, initial_notice) = select_presenter(resolved);
     let opts = TuiOptions {
         fps: cli.fps,
@@ -543,6 +576,7 @@ fn run_input_mode(cli: &Cli, resolved: &Resolved, addr: String, keymap: Keymap) 
         prefer_pipewire: true,
         // A remote stream is not a local WSL capture; the WSL notice never applies.
         wsl: false,
+        fullscreen_pause,
     };
 
     let stats = handle.stats_fn();
@@ -708,6 +742,11 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         }
     };
 
+    // The pause forces the engine's DSP idle downshift and stops the render loop
+    // on one shared flag; `_fs_watch` must outlive `run`.
+    let (fullscreen_pause, _fs_watch) =
+        fullscreen_pause_setup(resolved.fullscreen_pause, engine.pause_flag());
+
     let (presenter_mode, initial_notice) = select_presenter(resolved);
     let opts = TuiOptions {
         fps: cli.fps,
@@ -728,6 +767,7 @@ fn run_demo(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         prefer_pipewire: true,
         // The demo feed needs no audio hardware, so the WSL notice never applies.
         wsl: false,
+        fullscreen_pause,
     };
 
     let outcome = run(
@@ -853,6 +893,11 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
     if matches!(perf_state, PerfModeState::Active { .. }) {
         source.push_str(" · perf");
     }
+    // The pause forces the engine's DSP idle downshift and stops the render loop
+    // on one shared flag; `_fs_watch` must outlive `run`.
+    let (fullscreen_pause, _fs_watch) =
+        fullscreen_pause_setup(resolved.fullscreen_pause, engine.pause_flag());
+
     let (presenter_mode, initial_notice) = select_presenter(resolved);
     let opts = TuiOptions {
         fps: cli.fps,
@@ -873,6 +918,7 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         prefer_pipewire,
         // Opens the WSL guidance overlay at startup when detected above.
         wsl,
+        fullscreen_pause,
     };
 
     let outcome = run(
@@ -898,6 +944,30 @@ fn run_live(cli: &Cli, resolved: &Resolved, keymap: Keymap) -> ExitCode {
         }
     }
     report_tui_outcome(outcome)
+}
+
+/// Wire up the fullscreen-app pause (US-PERF-3) for a TUI run.
+///
+/// When `enabled`, spawns the platform [`FullscreenWatch`] driving `flag` (the
+/// same `Arc` the render loop reads to stop drawing and — for a local engine —
+/// the DSP thread reads to force its idle downshift), and returns the flag to
+/// hand the TUI plus the watch guard, which must outlive `run` to keep polling.
+/// When disabled, returns `(None, None)` so the loop never pauses and no thread
+/// is started.
+fn fullscreen_pause_setup(
+    enabled: bool,
+    flag: Arc<AtomicBool>,
+) -> (Option<Arc<AtomicBool>>, Option<FullscreenWatch>) {
+    if enabled {
+        let watch = FullscreenWatch::spawn(
+            scia_core::fullscreen_detector(),
+            scia_core::FULLSCREEN_POLL,
+            Arc::clone(&flag),
+        );
+        (Some(flag), Some(watch))
+    } else {
+        (None, None)
+    }
 }
 
 /// Load a `--scene-file` preset and start its live-reload watcher.

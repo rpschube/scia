@@ -37,6 +37,8 @@ mod wsl;
 use std::fmt;
 use std::io::{self, Stdout, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -158,6 +160,15 @@ pub struct TuiOptions {
     /// two supported paths; capture still proceeds underneath. Defaults to
     /// `false` (not WSL, or a mode where the notice does not apply).
     pub wsl: bool,
+    /// The fullscreen-pause flag (US-PERF-3): while it reads `true` the render
+    /// loop stops drawing frames (the covered window content does not matter) and
+    /// drops to a slow input-poll cadence, resuming full rendering within one
+    /// poll interval once it clears. Shared with the engine's DSP downshift via
+    /// the same `Arc` (see
+    /// [`Engine::pause_flag`](scia_core::Engine::pause_flag)) and driven by a
+    /// [`FullscreenWatch`](scia_core::FullscreenWatch). `None` disables the
+    /// behaviour entirely — the loop always draws.
+    pub fullscreen_pause: Option<Arc<AtomicBool>>,
 }
 
 impl Default for TuiOptions {
@@ -180,6 +191,7 @@ impl Default for TuiOptions {
             device: DeviceSelector::Default,
             prefer_pipewire: true,
             wsl: false,
+            fullscreen_pause: None,
         }
     }
 }
@@ -346,6 +358,14 @@ fn install_panic_hook() {
     }));
 }
 
+/// Read the fullscreen-pause flag (US-PERF-3): `true` only when the feature is
+/// enabled (the flag is present) *and* a fullscreen app is currently foreground.
+/// A `None` flag means the feature is disabled — it never pauses. Pure, so the
+/// pause policy is unit-tested without a terminal.
+fn fullscreen_paused(flag: Option<&AtomicBool>) -> bool {
+    flag.is_some_and(|f| f.load(Ordering::Acquire))
+}
+
 /// The render loop: pace, read, draw, handle input, repeat.
 ///
 /// The parameter list mirrors the seams `run` exposes (engine closures, the
@@ -436,6 +456,11 @@ fn run_loop(
     // Whether the loop is currently showing the "reconnecting audio…" degraded
     // notice, so recovery can clear it once with "capture restored".
     let mut reconnecting = false;
+
+    // The previous frame's fullscreen-pause state (US-PERF-3), so the transition
+    // into a pause draws exactly one frame (surfacing the paused status line) and
+    // every held frame after it leaves the terminal untouched.
+    let mut was_paused = false;
 
     // Kitty graphics state: the frame encoder, its reusable output buffer, and
     // the scene-body rect captured inside the draw closure so the image can be
@@ -752,9 +777,19 @@ fn run_loop(
         let starved_for = starved_since
             .map(|since| frame_start.duration_since(since))
             .unwrap_or_default();
+        // Fullscreen pause (US-PERF-3): while a fullscreen-exclusive app is
+        // foreground, stop drawing and drop to a slow input-poll cadence. The
+        // capture side downshifts through the engine's own idle path on the same
+        // shared flag, so nothing here needs a second throttle.
+        let fs_paused = fullscreen_paused(opts.fullscreen_pause.as_deref());
+        ui.fullscreen_paused = fs_paused;
+
         // Downshift to the idle rate once the engine reports `Idle`, or after the
-        // starved-for-2-s rule trips — whichever comes first.
-        let interval = if ui.stats.activity == Activity::Idle {
+        // starved-for-2-s rule trips — whichever comes first. A fullscreen pause
+        // overrides both with the slow pause poll.
+        let interval = if fs_paused {
+            pacing::pause_interval()
+        } else if ui.stats.activity == Activity::Idle {
             pacing::active_interval(pacing::IDLE_FPS)
         } else {
             pacing::target_interval(opts.fps, starved_for)
@@ -763,153 +798,167 @@ fn run_loop(
         ui.p50_frame_ms = p50;
         ui.p99_frame_ms = p99;
 
-        // Draw inside a synchronized-update bracket. Terminals without support
-        // ignore the sequences.
-        let render_start = Instant::now();
-        {
-            let mut out = io::stdout();
-            let _ = execute!(out, BeginSynchronizedUpdate);
-        }
-        match presenter.as_mut() {
-            // Scene path: draw the header/debug chrome, then rasterize the scene
-            // into the body area the chrome left free.
-            Some(p) => {
-                // The scene-body rect, captured inside the draw closure so a
-                // graphics image can be placed at its origin after the draw.
-                let mut image_body: Option<Rect> = None;
-                terminal.draw(|frame| {
-                    if let Some(body) = render::draw_chrome(frame, &snap, &ui) {
-                        p.resize(body.width, body.height);
-                        // Push the tuning strip's working values into the layer-0
-                        // bag before the frame advances, so an unmapped
-                        // adjustment takes effect on this very frame.
-                        if ui.tuning.is_open() {
-                            for tp in ui.tuning.params() {
-                                p.set_param(tp.key, tp.value);
+        // Draw this frame unless a fullscreen pause is holding: the transition
+        // frame into the pause still draws (so the status line shows the paused
+        // state), then the terminal is left untouched until the pause lifts.
+        let draw_this_frame = pacing::should_draw(fs_paused, was_paused);
+        was_paused = fs_paused;
+
+        if draw_this_frame {
+            // Draw inside a synchronized-update bracket. Terminals without support
+            // ignore the sequences.
+            let render_start = Instant::now();
+            {
+                let mut out = io::stdout();
+                let _ = execute!(out, BeginSynchronizedUpdate);
+            }
+            match presenter.as_mut() {
+                // Scene path: draw the header/debug chrome, then rasterize the scene
+                // into the body area the chrome left free.
+                Some(p) => {
+                    // The scene-body rect, captured inside the draw closure so a
+                    // graphics image can be placed at its origin after the draw.
+                    let mut image_body: Option<Rect> = None;
+                    terminal.draw(|frame| {
+                        if let Some(body) = render::draw_chrome(frame, &snap, &ui) {
+                            p.resize(body.width, body.height);
+                            // Push the tuning strip's working values into the layer-0
+                            // bag before the frame advances, so an unmapped
+                            // adjustment takes effect on this very frame.
+                            if ui.tuning.is_open() {
+                                for tp in ui.tuning.params() {
+                                    p.set_param(tp.key, tp.value);
+                                }
+                            }
+                            // Feed the mapping overlay's sparklines from this frame's
+                            // features and swap in any edited mapping before the frame
+                            // advances, so a valid draft previews on this very frame.
+                            if ui.mapping.is_open() {
+                                ui.mapping.sample(&snap);
+                                if let Some(entry) = ui.mapping.drain_apply() {
+                                    p.replace_layer0_mapping(entry);
+                                }
+                            }
+                            p.frame(&snap, scene_dt);
+                            // In a pixel mode `draw` paints only the text runs; the
+                            // image is written as a graphics-protocol frame, placed at
+                            // the body origin captured here.
+                            image_body = Some(body);
+                            p.draw(frame.buffer_mut(), body);
+                            // The chrome personality paints over the scene, before
+                            // the debug and help overlays layered above it.
+                            chrome::render(frame.buffer_mut(), body, &snap, &ui);
+                            // The overlay is drawn last, over the rasterized scene.
+                            if ui.overlay {
+                                render::render_overlay(frame.buffer_mut(), body, &snap, &ui);
+                            }
+                            // The browser panel and cycle toast paint over the live
+                            // scene, like the meter bridge, so they draw after it.
+                            render::draw_scene_nav(frame.buffer_mut(), body, &ui.scene_nav);
+                            // The now-playing panel paints over the scene, like the
+                            // meter bridge.
+                            if ui.show_now_playing {
+                                nowplaying::draw_now_playing(
+                                    frame.buffer_mut(),
+                                    body,
+                                    &ui.now_playing,
+                                    ui.palette_applied,
+                                );
+                            }
+                            // The tuning strip paints over the body bottom, above the
+                            // scene and now-playing panel; help still layers on top.
+                            if ui.tuning.is_open() {
+                                tuning::draw_tuning(frame.buffer_mut(), body, &ui.tuning);
+                            }
+                            // The expression-mapping overlay paints over the body
+                            // bottom, the sibling of the tuning strip; help layers on
+                            // top of it too.
+                            if ui.mapping.is_open() {
+                                mapping_ui::draw_mapping(frame.buffer_mut(), body, &ui.mapping);
+                            }
+                            // Scene-author mode: the source pane plus the reused meter
+                            // bridge, split over the body. Drawn above the scene, below
+                            // the help overlay.
+                            if ui.author.is_open() {
+                                author::draw_author(
+                                    frame.buffer_mut(),
+                                    body,
+                                    &ui.author,
+                                    &snap,
+                                    &ui,
+                                );
+                            }
+                            // The help overlay is the topmost body layer.
+                            render::draw_help(frame.buffer_mut(), body, &ui);
+                            // The device picker is a modal overlay drawn above the
+                            // rest, like the help panel.
+                            devicepick::draw_devices(frame.buffer_mut(), body, &ui.devices);
+                            // The WSL guidance overlay is a modal above the rest,
+                            // the sibling of the device picker.
+                            wsl::draw_wsl(frame.buffer_mut(), body, &ui.wsl);
+                        }
+                        // The reload notice lands on top of the scene body, so it
+                        // draws after the presenter rather than inside the chrome.
+                        let area = frame.area();
+                        render::draw_notice(frame.buffer_mut(), area, &ui);
+                    })?;
+                    // Kitty mode: after ratatui has painted the cells (text + chrome
+                    // above the image), write the image as a graphics-protocol frame
+                    // at the body origin — still inside the synchronized-update
+                    // bracket so a supporting terminal shows image and text together.
+                    if kitty_mode {
+                        if let Some(body) = image_body {
+                            let (iw, ih) = p.image_px();
+                            if iw > 0 && ih > 0 {
+                                kitty_encoder.encode(
+                                    p.image_rgb8(),
+                                    p.image_px(),
+                                    p.image_cells(),
+                                    &mut kitty_out,
+                                );
+                                let mut out = io::stdout();
+                                let _ = execute!(out, MoveTo(body.x, body.y));
+                                let _ = out.write_all(&kitty_out);
+                                let _ = out.flush();
                             }
                         }
-                        // Feed the mapping overlay's sparklines from this frame's
-                        // features and swap in any edited mapping before the frame
-                        // advances, so a valid draft previews on this very frame.
-                        if ui.mapping.is_open() {
-                            ui.mapping.sample(&snap);
-                            if let Some(entry) = ui.mapping.drain_apply() {
-                                p.replace_layer0_mapping(entry);
-                            }
-                        }
-                        p.frame(&snap, scene_dt);
-                        // In a pixel mode `draw` paints only the text runs; the
-                        // image is written as a graphics-protocol frame, placed at
-                        // the body origin captured here.
-                        image_body = Some(body);
-                        p.draw(frame.buffer_mut(), body);
-                        // The chrome personality paints over the scene, before
-                        // the debug and help overlays layered above it.
-                        chrome::render(frame.buffer_mut(), body, &snap, &ui);
-                        // The overlay is drawn last, over the rasterized scene.
-                        if ui.overlay {
-                            render::render_overlay(frame.buffer_mut(), body, &snap, &ui);
-                        }
-                        // The browser panel and cycle toast paint over the live
-                        // scene, like the meter bridge, so they draw after it.
-                        render::draw_scene_nav(frame.buffer_mut(), body, &ui.scene_nav);
-                        // The now-playing panel paints over the scene, like the
-                        // meter bridge.
-                        if ui.show_now_playing {
-                            nowplaying::draw_now_playing(
-                                frame.buffer_mut(),
-                                body,
-                                &ui.now_playing,
-                                ui.palette_applied,
-                            );
-                        }
-                        // The tuning strip paints over the body bottom, above the
-                        // scene and now-playing panel; help still layers on top.
-                        if ui.tuning.is_open() {
-                            tuning::draw_tuning(frame.buffer_mut(), body, &ui.tuning);
-                        }
-                        // The expression-mapping overlay paints over the body
-                        // bottom, the sibling of the tuning strip; help layers on
-                        // top of it too.
-                        if ui.mapping.is_open() {
-                            mapping_ui::draw_mapping(frame.buffer_mut(), body, &ui.mapping);
-                        }
-                        // Scene-author mode: the source pane plus the reused meter
-                        // bridge, split over the body. Drawn above the scene, below
-                        // the help overlay.
-                        if ui.author.is_open() {
-                            author::draw_author(frame.buffer_mut(), body, &ui.author, &snap, &ui);
-                        }
-                        // The help overlay is the topmost body layer.
-                        render::draw_help(frame.buffer_mut(), body, &ui);
-                        // The device picker is a modal overlay drawn above the
-                        // rest, like the help panel.
-                        devicepick::draw_devices(frame.buffer_mut(), body, &ui.devices);
-                        // The WSL guidance overlay is a modal above the rest,
-                        // the sibling of the device picker.
-                        wsl::draw_wsl(frame.buffer_mut(), body, &ui.wsl);
                     }
-                    // The reload notice lands on top of the scene body, so it
-                    // draws after the presenter rather than inside the chrome.
-                    let area = frame.area();
-                    render::draw_notice(frame.buffer_mut(), area, &ui);
-                })?;
-                // Kitty mode: after ratatui has painted the cells (text + chrome
-                // above the image), write the image as a graphics-protocol frame
-                // at the body origin — still inside the synchronized-update
-                // bracket so a supporting terminal shows image and text together.
-                if kitty_mode {
-                    if let Some(body) = image_body {
-                        let (iw, ih) = p.image_px();
-                        if iw > 0 && ih > 0 {
-                            kitty_encoder.encode(
-                                p.image_rgb8(),
-                                p.image_px(),
-                                p.image_cells(),
-                                &mut kitty_out,
-                            );
-                            let mut out = io::stdout();
-                            let _ = execute!(out, MoveTo(body.x, body.y));
-                            let _ = out.write_all(&kitty_out);
-                            let _ = out.flush();
+                    // Sixel mode: same seam as kitty, but the sixel bitmap paints
+                    // over the body cells (there is no z-index). The cursor is moved
+                    // to the body origin and the DCS stream is written there, still
+                    // inside the synchronized-update bracket. A full-body overlay that
+                    // ratatui drew this frame is covered until the next frame redraws
+                    // its cells on top — at 60 fps that is a single frame.
+                    if sixel_mode {
+                        if let Some(body) = image_body {
+                            let (iw, ih) = p.image_px();
+                            if iw > 0 && ih > 0 {
+                                sixel_encoder.encode(
+                                    p.image_rgb8(),
+                                    p.image_px(),
+                                    p.image_k(),
+                                    &mut sixel_out,
+                                );
+                                let mut out = io::stdout();
+                                let _ = execute!(out, MoveTo(body.x, body.y));
+                                let _ = out.write_all(&sixel_out);
+                                let _ = out.flush();
+                            }
                         }
                     }
                 }
-                // Sixel mode: same seam as kitty, but the sixel bitmap paints
-                // over the body cells (there is no z-index). The cursor is moved
-                // to the body origin and the DCS stream is written there, still
-                // inside the synchronized-update bracket. A full-body overlay that
-                // ratatui drew this frame is covered until the next frame redraws
-                // its cells on top — at 60 fps that is a single frame.
-                if sixel_mode {
-                    if let Some(body) = image_body {
-                        let (iw, ih) = p.image_px();
-                        if iw > 0 && ih > 0 {
-                            sixel_encoder.encode(
-                                p.image_rgb8(),
-                                p.image_px(),
-                                p.image_k(),
-                                &mut sixel_out,
-                            );
-                            let mut out = io::stdout();
-                            let _ = execute!(out, MoveTo(body.x, body.y));
-                            let _ = out.write_all(&sixel_out);
-                            let _ = out.flush();
-                        }
-                    }
+                // Direct-bars path: byte-identical to before, plus the notice.
+                None => {
+                    terminal.draw(|frame| draw(frame, &snap, &ui))?;
                 }
             }
-            // Direct-bars path: byte-identical to before, plus the notice.
-            None => {
-                terminal.draw(|frame| draw(frame, &snap, &ui))?;
+            {
+                let mut out = io::stdout();
+                let _ = execute!(out, EndSynchronizedUpdate);
             }
+            frame_times.push(render_start.elapsed().as_secs_f32() * 1000.0);
+            frames += 1;
         }
-        {
-            let mut out = io::stdout();
-            let _ = execute!(out, EndSynchronizedUpdate);
-        }
-        frame_times.push(render_start.elapsed().as_secs_f32() * 1000.0);
-        frames += 1;
 
         if let Some(limit) = opts.frames {
             if frames >= limit {
@@ -2770,6 +2819,20 @@ mod tests {
         );
         assert_eq!(r, HealthReaction::Failed("device gone".to_string()));
         assert!(!reconnecting, "failing clears the reconnecting flag");
+    }
+
+    #[test]
+    fn fullscreen_pause_flag_policy() {
+        // Disabled (no flag): never paused, whatever the world is doing.
+        assert!(!fullscreen_paused(None));
+
+        // Enabled: the loop pauses iff the shared flag reads true.
+        let flag = AtomicBool::new(false);
+        assert!(!fullscreen_paused(Some(&flag)));
+        flag.store(true, Ordering::Release);
+        assert!(fullscreen_paused(Some(&flag)));
+        flag.store(false, Ordering::Release);
+        assert!(!fullscreen_paused(Some(&flag)));
     }
 
     /// A scripted input source for [`pump_input`]: `poll` reports whether an

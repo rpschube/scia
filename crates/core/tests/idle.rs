@@ -514,6 +514,69 @@ fn resume_within_100ms() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 7: the fullscreen-pause flag forces the idle downshift even while a loud
+// signal plays, and clearing it resumes full rate — US-PERF-3 reusing the same
+// idle seam the silence machine uses (no second throttle).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fullscreen_pause_forces_idle_while_loud_then_resumes() {
+    // A continuous tone for the whole test: audio never goes quiet on its own,
+    // so any downshift to Idle is the pause flag's doing, not the silence machine.
+    let script = vec![tone(12.0)];
+    let (engine, mut reader, feeder, _marks) = start_scripted(EngineConfig::default(), script);
+
+    // Confirm the tone drives the pipeline Active first.
+    assert!(
+        wait_until(&mut reader, Duration::from_secs(2), |s| s.activity
+            == Activity::Active)
+        .is_some(),
+        "never reached Active while the tone played"
+    );
+
+    // Raise the pause flag: the DSP must downshift to Idle within a poll or two
+    // despite the loud tone still flowing.
+    let pause = engine.pause_flag();
+    pause.store(true, Ordering::Release);
+    assert!(
+        wait_until(&mut reader, Duration::from_secs(1), |s| s.activity
+            == Activity::Idle)
+        .is_some(),
+        "fullscreen pause did not force Idle while the tone was loud"
+    );
+
+    // And it must stay cheap: the wake rate collapses to the idle cadence even
+    // though a full-rate signal is arriving — the whole point of the downshift.
+    sleep(Duration::from_millis(100));
+    let idle_start = engine.stats().dsp_wakes;
+    sleep(Duration::from_secs(1));
+    let idle_wakes = engine.stats().dsp_wakes - idle_start;
+    assert!(
+        idle_wakes <= 30,
+        "paused wake rate too high: {idle_wakes} in 1 s (want <= 30) — the pause \
+         did not reuse the cheap idle path"
+    );
+
+    // Clear the flag: full-rate rendering resumes promptly (well within one idle
+    // poll interval plus scheduler slack), because the loud hop the idle drain
+    // reads is treated as a resume again.
+    pause.store(false, Ordering::Release);
+    let resume_at = Instant::now();
+    let (t_active, _) = wait_until(&mut reader, Duration::from_millis(500), |s| {
+        s.activity == Activity::Active
+    })
+    .expect("never resumed to Active after the pause flag cleared");
+    let resume_ms = t_active.saturating_duration_since(resume_at).as_secs_f32() * 1000.0;
+    assert!(
+        resume_ms <= 250.0,
+        "resume after clearing the pause took {resume_ms:.1} ms (want <= 250)"
+    );
+
+    engine.stop();
+    let _ = feeder.join();
+}
+
+// ---------------------------------------------------------------------------
 // Test 6: the cheap idle path honours the same release time constants.
 // ---------------------------------------------------------------------------
 

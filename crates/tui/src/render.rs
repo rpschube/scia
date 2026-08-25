@@ -85,6 +85,11 @@ pub struct UiState {
     /// Whether the scene is frozen. When set, the header shows a paused marker;
     /// the render loop feeds the presenter a frozen snapshot and `dt = 0`.
     pub paused: bool,
+    /// Whether rendering is paused because a fullscreen-exclusive app (a game) is
+    /// foreground (US-PERF-3). The render loop stops drawing while it holds; the
+    /// one transition frame it does draw shows a `fullscreen paused` marker in the
+    /// header so the state is legible if the terminal is ever visible.
+    pub fullscreen_paused: bool,
     /// Whether the in-app key help overlay is shown (toggled with `?`).
     pub help: bool,
     /// Whether the now-playing panel is shown (toggled with the now-playing key).
@@ -806,9 +811,16 @@ fn render_header(buf: &mut Buffer, rect: Rect, snap: &FeatureSnapshot, ui: &UiSt
 
     // Right indicator reflects the engine's activity state, not the raw
     // starved bit, so `quiet` and `idle` are distinguishable at a glance. A
-    // `paused` marker leads it while the scene is frozen.
+    // pause marker leads it: `fullscreen paused` while a foreground game has
+    // suspended rendering (US-PERF-3), else `paused` while the scene is frozen.
     let activity = ui.stats.activity;
-    let paused = if ui.paused { "paused · " } else { "" };
+    let paused = if ui.fullscreen_paused {
+        "fullscreen paused · "
+    } else if ui.paused {
+        "paused · "
+    } else {
+        ""
+    };
     let right = format!(
         "{}{}  gen {}",
         paused,
