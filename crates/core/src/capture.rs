@@ -439,6 +439,17 @@ pub trait CaptureBackend: Send {
 /// quantum is `1e9 / sample_rate` ns — ~20.8 µs at 48 kHz, far below the
 /// millisecond effects being measured — and the only real error is up to one
 /// push interval of jitter on `anchor_ns`.
+///
+/// `anchor_ns` above is the delivery time of the newest frame *this drain
+/// actually ended on*. That equals [`SinkStats::last_push_ns`] only when the
+/// drain has caught up to the writer; when a steady backlog of undrained frames
+/// remains, the drain's newest frame is `backlog` frames older than the writer's
+/// newest, so the anchor is `last_push_ns − backlog × ns_per_frame` (see
+/// [`record_drain_with_backlog`]). Without that occupancy term a lagging drain
+/// mis-anchors every reconstructed time late by exactly the backlog — a constant
+/// bias that survives the per-poll-jitter fix.
+///
+/// [`record_drain_with_backlog`]: DrainTimeline::record_drain_with_backlog
 pub struct DrainTimeline {
     ns_per_frame: f64,
     total_frames: u64,
@@ -485,14 +496,48 @@ impl DrainTimeline {
         self.total_frames
     }
 
-    /// Record one drain of `frames` frames anchored at `anchor_ns` (ns on the
-    /// ring epoch) — the capture-delivery time of the drain's newest frame (one
-    /// frame-period after that frame), i.e. [`SinkStats::last_push_ns`] at the
+    /// Record one drain of `frames` frames whose newest frame was delivered at
+    /// `anchor_ns` (ns on the ring epoch) — [`SinkStats::last_push_ns`] at the
     /// drain, not the poll's own read time. A zero-frame drain is ignored.
+    ///
+    /// This is the caught-up form: it assumes the newest frame this drain popped
+    /// is the newest frame the writer has delivered. When a steady backlog can
+    /// remain in the ring after a drain (a bounded or coalesced drain that does
+    /// not keep up with the writer), use [`record_drain_with_backlog`] instead,
+    /// which subtracts the residual occupancy so the anchor names the frame the
+    /// drain actually ended on.
+    ///
+    /// [`record_drain_with_backlog`]: DrainTimeline::record_drain_with_backlog
     pub fn record_drain(&mut self, anchor_ns: u64, frames: u64) {
+        self.record_drain_with_backlog(anchor_ns, frames, 0);
+    }
+
+    /// Record one drain, correcting the anchor for a residual ring backlog.
+    ///
+    /// `last_push_ns` is [`SinkStats::last_push_ns`] at the drain — the delivery
+    /// time of the writer's *newest* frame. `backlog_frames` is how many frames
+    /// the writer had delivered that this drain did **not** pop (the occupancy
+    /// left in the ring after the drain, plus any push not yet drained). The
+    /// newest frame this drain actually ended on is therefore `backlog_frames`
+    /// older than the writer's newest, so its true delivery time is
+    /// `last_push_ns − backlog_frames × ns_per_frame`. Anchoring there keeps the
+    /// reconstruction pinned to capture delivery even when the drain runs a
+    /// constant distance behind the writer — the case a plain
+    /// [`record_drain`](DrainTimeline::record_drain) mis-anchors late by exactly
+    /// the backlog. With no backlog it is identical to `record_drain`.
+    ///
+    /// A zero-frame drain is ignored.
+    pub fn record_drain_with_backlog(
+        &mut self,
+        last_push_ns: u64,
+        frames: u64,
+        backlog_frames: u64,
+    ) {
         if frames == 0 {
             return;
         }
+        let backlog_ns = (backlog_frames as f64 * self.ns_per_frame).round() as u64;
+        let anchor_ns = last_push_ns.saturating_sub(backlog_ns);
         let span_ns = (frames as f64 * self.ns_per_frame).round() as u64;
         let base_ns = anchor_ns.saturating_sub(span_ns);
         self.segments.push(DrainSegment {
@@ -556,6 +601,24 @@ impl DrainTimeline {
 /// window between the anchor read and [`SampleConsumer::drain_all`] only shifts
 /// the newest few frames sub-millisecond and self-corrects on the next poll.
 ///
+/// The anchor is corrected for the ring occupancy the drain leaves behind. A
+/// plain `last_push_ns` anchor is only right when the drain has caught up to the
+/// writer; if it runs a constant distance behind (a steady backlog of undrained
+/// frames), the newest frame this drain ended on is older than `last_push_ns` by
+/// exactly `backlog × ns_per_frame`, and anchoring on `last_push_ns` shifts every
+/// reconstructed time late by that constant. We read the writer's cumulative
+/// `pushed_frames` alongside `last_push_ns` and, after draining, subtract the
+/// frames the writer delivered that this drain did not pop — see
+/// [`DrainTimeline::record_drain_with_backlog`]. With the unbounded
+/// [`SampleConsumer::drain_all`] the ring empties each poll and the backlog is
+/// ~0, so the correction is a no-op there; it keeps the reconstruction exact if
+/// the drain ever falls behind (a bounded chunk, correlation work between wakes,
+/// or a push landing mid-drain).
+///
+/// Returns the residual backlog (frames still owed to the writer after this
+/// drain) so the caller can surface the observed steady-state backlog — the
+/// direct read the next hardware run needs to see whether the drain keeps up.
+///
 /// `scratch` is reused as the interleaved drain buffer (cleared each call);
 /// pre-sizing it and `mono` to the ring capacity keeps the drain allocation-free.
 pub fn drain_into_timeline(
@@ -564,11 +627,19 @@ pub fn drain_into_timeline(
     mono: &mut Vec<f32>,
     timeline: &mut DrainTimeline,
     channels: usize,
-) {
-    let anchor_ns = consumer.stats().last_push_ns.load(Ordering::Acquire);
+) -> u64 {
+    // Read the writer's cumulative frame count before its delivery clock, so the
+    // pair can only under-count the writer relative to `last_push_ns` (push
+    // increments `pushed_frames` after it stamps `last_push_ns`); that biases the
+    // backlog toward zero, never negative, and the `saturating_sub` below floors
+    // it at zero regardless.
+    let pushed_frames = consumer.stats().pushed_frames.load(Ordering::Acquire);
+    let last_push_ns = consumer.stats().last_push_ns.load(Ordering::Acquire);
     let n = consumer.drain_all(scratch);
     if n == 0 {
-        return;
+        // Nothing drained: whatever the writer has delivered but we have not yet
+        // taken is the current backlog.
+        return pushed_frames.saturating_sub(timeline.total_frames());
     }
     let channels = channels.max(1);
     let frames = n / channels;
@@ -580,7 +651,13 @@ pub fn drain_into_timeline(
         }
         mono.push(acc / channels as f32);
     }
-    timeline.record_drain(anchor_ns, frames as u64);
+    // Frames the writer had delivered (as of `pushed_frames`) that this drain did
+    // not pop. `drain_all` pops everything committed, so under a keeping-up drain
+    // this is ~0; under a lagging drain it is the steady backlog.
+    let drained_total = timeline.total_frames() + frames as u64;
+    let backlog = pushed_frames.saturating_sub(drained_total);
+    timeline.record_drain_with_backlog(last_push_ns, frames as u64, backlog);
+    backlog
 }
 
 /// Acceptance floor a click's cross-correlation peak must clear for the raw-ring
@@ -633,21 +710,37 @@ pub fn rect_xcorr_peak(
     }
 
     // Template energy is L (all ones), so ‖template‖ = √L; NCC(o) =
-    // Σ window / (√(Σ window²) · √L). Maintain the window's running sum and
-    // sum-of-squares so each offset costs O(1).
+    // Σ window / (√(Σ window²) · √L).
+    //
+    // Each offset's `sum` (Σ window) and `sq` (Σ window²) are computed fresh over
+    // the window's `template_len` samples — deliberately not carried across
+    // offsets. A running window sum is O(1) per offset but the sum-of-squares
+    // accumulates rounding error: once the window has slid over a loud burst, the
+    // running `sq` retains an absolute error on the order of `eps × peak energy`,
+    // and in a later low-energy window that residual can dwarf the window's true
+    // Σ window². Cauchy–Schwarz bounds `Σ window ≤ √L · √(Σ window²)` only for a
+    // *consistent* sum/energy pair, so an independently-drifted denominator lets
+    // NCC exceed 1 and win the peak, planting a spurious late arrival. Recomputing
+    // both from the same samples keeps the pair consistent, so NCC ≤ 1 by
+    // construction; the final `.min(1.0)` on the magnitude is a last-ulp guard.
+    // The cost is O(template_len) per offset — fine for this probe/test helper.
     let norm = (template_len as f64).sqrt();
-    let mut sum = 0.0f64;
-    let mut sq = 0.0f64;
-    for &v in &signal[start..start + template_len] {
-        let v = f64::from(v);
-        sum += v;
-        sq += v * v;
-    }
-
     let mut best: Option<(usize, f32)> = None;
     for o in start..end {
+        let window = &signal[o..o + template_len];
+        let mut sum = 0.0f64;
+        let mut sq = 0.0f64;
+        for &v in window {
+            let v = f64::from(v);
+            sum += v;
+            sq += v * v;
+        }
         let ncc = if sq > 0.0 {
-            (sum / (sq.sqrt() * norm)) as f32
+            // Clamp the magnitude to Cauchy–Schwarz's ceiling of 1: exact
+            // recomputation already guarantees |NCC| ≤ 1 up to rounding, and this
+            // makes a >1 unrepresentable rather than merely unlikely.
+            let raw = sum / (sq.sqrt() * norm);
+            raw.clamp(-1.0, 1.0) as f32
         } else {
             0.0
         };
@@ -655,13 +748,6 @@ pub fn rect_xcorr_peak(
         match best {
             Some((_, b)) if ncc < b => {}
             _ => best = Some((o, ncc)),
-        }
-        // Slide the window one sample right for the next offset.
-        if o + 1 < end {
-            let leaving = f64::from(signal[o]);
-            let entering = f64::from(signal[o + template_len]);
-            sum += entering - leaving;
-            sq += entering * entering - leaving * leaving;
         }
     }
     best
@@ -816,6 +902,90 @@ mod tests {
             poll_ns >= newest + 15_000_000,
             "the late poll read {poll_ns} must not be folded into the newest \
              reconstructed time {newest}"
+        );
+    }
+
+    #[test]
+    fn backlog_anchor_pins_a_lagging_drain_to_delivery() {
+        // A drain that keeps up and one that leaves a steady backlog must place
+        // the SAME physical frame at the SAME reconstructed time. Model a writer
+        // pushing 480-frame packets every 10 ms at 48 kHz.
+        let rate = 48_000u32;
+        let npf = 1.0e9 / f64::from(rate);
+        let fpp = 480u64; // frames per push
+        let period_ns = (fpp as f64 * npf) as u64; // ~10 ms
+
+        // Caught-up timeline: one drain per push, no backlog.
+        let mut caught = DrainTimeline::new(rate);
+        // Lagging timeline: the writer got three packets ahead before this drain,
+        // so 3×480 frames remain owed after it pops one packet's worth.
+        let mut lag = DrainTimeline::new(rate);
+
+        // Uncorrected lagging drain: anchors on last_push_ns as if caught up.
+        // This is the pre-fix behaviour and must land late by ~the backlog.
+        let mut lag_uncorrected = DrainTimeline::new(rate);
+
+        const LAG_PACKETS: u64 = 3; // writer runs three packets ahead of the drain
+        for k in 0..8u64 {
+            let last_push_ns = (k + 1) * period_ns;
+            caught.record_drain_with_backlog(last_push_ns, fpp, 0);
+            // The lagging drain pops the same 480 frames, but by the time it reads
+            // last_push_ns the writer is LAG_PACKETS ahead — so that many frames
+            // remain owed after it pops this packet's worth.
+            let lag_push_ns = last_push_ns + LAG_PACKETS * period_ns;
+            let backlog = LAG_PACKETS * fpp;
+            lag.record_drain_with_backlog(lag_push_ns, fpp, backlog);
+            lag_uncorrected.record_drain(lag_push_ns, fpp);
+        }
+
+        // Every reconstructed frame time must agree within a frame period: the
+        // backlog correction cancels the writer's head-start exactly.
+        for frame in 0..caught.total_frames() {
+            let a = caught.sample_time_ns(frame).expect("caught time");
+            let b = lag.sample_time_ns(frame).expect("lag time");
+            assert!(
+                (a as i64 - b as i64).unsigned_abs() <= npf.ceil() as u64,
+                "frame {frame}: caught-up {a} vs backlog-corrected lagging {b} differ by \
+                 more than one frame period"
+            );
+            // And the uncorrected anchor drifts late by exactly the backlog span
+            // — the constant bias this fix removes. (Guards against a vacuous
+            // pass: the correction is doing real work.)
+            let c = lag_uncorrected
+                .sample_time_ns(frame)
+                .expect("uncorrected time");
+            let expected_late = (LAG_PACKETS * fpp) as f64 * npf;
+            let drift = c as i64 - a as i64;
+            assert!(
+                (drift as f64 - expected_late).abs() <= npf.ceil(),
+                "frame {frame}: uncorrected drift {drift} ns should be the backlog span \
+                 {expected_late} ns"
+            );
+        }
+    }
+
+    #[test]
+    fn ncc_never_exceeds_one_after_a_loud_burst() {
+        // The failure the field hit: a loud burst, then a long low-energy tail.
+        // The old incremental sum-of-squares retained the burst's rounding error
+        // and reported NCC ≫ 1 in a later quiet window. Exact per-window energy
+        // keeps every NCC ≤ 1.
+        let n = 40_000usize;
+        let l = 48usize;
+        let mut sig = vec![0.0f32; n];
+        // A very loud rectangular burst up front to load the energy scale.
+        for s in &mut sig[0..l] {
+            *s = 1.0e6;
+        }
+        // A tiny structured floor for the rest — orders of magnitude below the
+        // burst, where a drifted denominator would blow the ratio up.
+        for (i, s) in sig.iter_mut().enumerate().skip(l) {
+            *s = 1.0e-5 * noise(i as u64 + 12345);
+        }
+        let (_, peak) = rect_xcorr_peak(&sig, l, 0, n - l + 1).expect("a peak");
+        assert!(
+            peak <= 1.0,
+            "NCC {peak} exceeded 1.0 — normalization denominator drifted"
         );
     }
 
