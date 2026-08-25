@@ -6,6 +6,11 @@
 //! `--headless`, a once-a-second status line on stderr. `--list-devices` prints
 //! the device table and exits.
 //!
+//! Two machine-readable modes (US-UX-2) bypass the TUI: `--output json|binary`
+//! serialises the live feature bus to stdout or a `--listen` socket (see
+//! [`mod@stream`] and `docs/feature-stream.md`), and `--input <addr>` renders
+//! the full TUI from a remote feature stream instead of a local capture engine.
+//!
 //! An optional config file supplies defaults and rebindable keys (see
 //! [`mod@config`]); precedence is built-in defaults < config < CLI flags.
 //!
@@ -13,6 +18,7 @@
 //! capture device.
 
 mod config;
+mod stream;
 
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -25,9 +31,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use scia_core::engine::EngineHealth;
 use scia_core::{
-    Activity, CaptureError, CpalBackend, DeviceKind, DeviceSelector, Engine, EngineConfig,
-    EngineError, EngineStats, FeatureReader, Pacing, PerfModeState, Signal, StreamHealth,
-    SyntheticBackend, list_devices,
+    Activity, CaptureError, CpalBackend, DeviceKind, DeviceSelector, Encoding, Engine,
+    EngineConfig, EngineError, EngineStats, FeatureReader, Pacing, PerfModeState, Signal,
+    StreamHealth, SyntheticBackend, list_devices,
 };
 use scia_scenes::{Preset, PresetWatcher, ReloadEvent, load_preset};
 use scia_tui::{ChromeMode, Keymap, PresenterMode, RunError, Tier, TuiOptions, run};
@@ -205,9 +211,65 @@ struct Cli {
     #[arg(long, value_enum, value_name = "MODE")]
     chrome: Option<ChromeArg>,
 
+    /// Headless machine-readable output: emit versioned per-frame feature
+    /// frames (the FeatureSnapshot contract) instead of running the TUI. `json`
+    /// writes NDJSON (one frame object per line); `binary` writes a
+    /// length-prefixed little-endian stream. Frames go to stdout, or to a socket
+    /// with --listen, paced at --rate. See docs/feature-stream.md for the
+    /// schema. Works with --demo (needs no audio hardware).
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        conflicts_with_all = ["input", "headless", "scene", "scene_file", "presenter", "chrome", "overlay", "debug"]
+    )]
+    output: Option<OutputFormat>,
+
+    /// Serve the feature stream on a TCP address (e.g. 127.0.0.1:9000) instead
+    /// of stdout; every connected client receives the stream. Only valid with
+    /// --output.
+    #[arg(long, value_name = "ADDR", requires = "output")]
+    listen: Option<String>,
+
+    /// Feature frames per second for --output (1..=1000, default 60). While the
+    /// engine is idle the stream drops to a slower keepalive cadence regardless.
+    /// Only valid with --output.
+    #[arg(long, value_name = "N", requires = "output")]
+    rate: Option<u32>,
+
+    /// Render the full TUI from a remote feature stream at this TCP address
+    /// (e.g. 127.0.0.1:9000) served by another scia running `--output --listen`,
+    /// instead of capturing local audio. Reconnects automatically if the stream
+    /// drops. Mutually exclusive with the local-capture flags.
+    #[arg(
+        long,
+        value_name = "ADDR",
+        conflicts_with_all = ["demo", "demo_signal", "demo_bpm", "device", "pipewire", "no_pipewire", "perf_mode", "no_route_watch", "headless", "seconds", "list_devices"]
+    )]
+    input: Option<String>,
+
     /// List every registered scene and built-in preset, then exit.
     #[arg(long)]
     list_scenes: bool,
+}
+
+/// The machine-readable output encodings selectable with `--output`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    /// NDJSON: one feature-frame object per line.
+    Json,
+    /// Length-prefixed little-endian binary with a one-time stream header.
+    Binary,
+}
+
+impl OutputFormat {
+    /// The [`Encoding`] this flag value selects.
+    fn encoding(self) -> Encoding {
+        match self {
+            OutputFormat::Json => Encoding::Json,
+            OutputFormat::Binary => Encoding::Binary,
+        }
+    }
 }
 
 /// The subcommands. Kept minimal: `list-scenes` is a subcommand alias for the
@@ -348,11 +410,146 @@ fn main() -> ExitCode {
         &cfg.defaults,
     );
 
+    // Headless machine-readable output: no TUI. Drives the same engine (demo or
+    // live capture) and serialises its feature bus to stdout or a socket.
+    if let Some(format) = cli.output {
+        return run_output_mode(&cli, &resolved, format.encoding());
+    }
+
+    // Thin frontend: render the full TUI from a remote feature stream instead of
+    // a local capture engine.
+    if let Some(addr) = cli.input.clone() {
+        return run_input_mode(&cli, &resolved, addr, cfg.keymap);
+    }
+
     if cli.demo {
         run_demo(&cli, &resolved, cfg.keymap)
     } else {
         run_live(&cli, &resolved, cfg.keymap)
     }
+}
+
+/// Start the engine for a headless `--output` run: the synthetic feed under
+/// `--demo`, otherwise live capture (mirroring [`run_live`]'s backend and
+/// config). Capture info and any perf-mode note go to stderr so stdout carries
+/// only the data stream.
+fn start_stream_engine(
+    cli: &Cli,
+    resolved: &Resolved,
+) -> Result<(Engine, FeatureReader), ExitCode> {
+    if cli.demo {
+        let bpm = resolved.demo_bpm.clamp(40.0, 220.0);
+        let backend = SyntheticBackend {
+            signal: cli.demo_signal.signal(bpm),
+            pacing: Pacing::Realtime,
+            ..SyntheticBackend::default()
+        };
+        return Engine::start(Box::new(backend), EngineConfig::default()).map_err(|err| {
+            eprintln!("failed to start engine: {err}");
+            ExitCode::from(1)
+        });
+    }
+
+    let selector = match &resolved.device {
+        Some(name) => DeviceSelector::Named(name.clone()),
+        None => DeviceSelector::Default,
+    };
+    let prefer_pipewire = cli.pipewire || !cli.no_pipewire;
+    let backend = CpalBackend {
+        device: selector,
+        prefer_pipewire,
+    };
+    let config = EngineConfig {
+        route_watch: !cli.no_route_watch,
+        perf_mode: resolved.perf_mode,
+        ..EngineConfig::default()
+    };
+    match Engine::start(Box::new(backend), config) {
+        Ok((engine, reader)) => {
+            let format = engine.format();
+            eprintln!("capture: {} Hz, {} ch", format.sample_rate, format.channels);
+            if let StreamHealth::Errored(msg) = engine.health() {
+                eprintln!("capture stream error: {msg}");
+                engine.stop();
+                return Err(ExitCode::from(1));
+            }
+            Ok((engine, reader))
+        }
+        Err(EngineError::Capture(CaptureError::NoDevice)) => {
+            eprintln!("no capture device available; try --list-devices, or --demo");
+            Err(ExitCode::from(3))
+        }
+        Err(err) => {
+            eprintln!("failed to start capture: {err}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// Headless `--output` mode: start the engine and stream its feature bus, no
+/// TUI. The rate is clamped to `1..=1000`.
+fn run_output_mode(cli: &Cli, resolved: &Resolved, encoding: Encoding) -> ExitCode {
+    let rate = cli
+        .rate
+        .unwrap_or(stream::DEFAULT_STREAM_RATE)
+        .clamp(1, 1000);
+    let (engine, reader) = match start_stream_engine(cli, resolved) {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
+    stream::run_output(
+        encoding,
+        cli.listen.clone(),
+        rate,
+        cli.frames,
+        engine,
+        reader,
+    )
+}
+
+/// `--input` mode: render the full TUI from a remote feature stream. The local
+/// feature bus is fed by a background producer that connects to `addr`; the TUI
+/// polls the producer's connection state for its health/quiet display.
+fn run_input_mode(cli: &Cli, resolved: &Resolved, addr: String, keymap: Keymap) -> ExitCode {
+    let (reader, handle) = stream::start_input(addr.clone());
+
+    // A `--scene-file` preset (if any) is loaded before the TUI takes the
+    // terminal; `_watcher` must outlive `run` to keep the watch alive.
+    let (preset, reload, _watcher) = match scene_file_setup(cli) {
+        Ok(parts) => parts,
+        Err(code) => {
+            handle.stop();
+            return code;
+        }
+    };
+
+    let (presenter_mode, initial_notice) = select_presenter(resolved);
+    let opts = TuiOptions {
+        fps: cli.fps,
+        label: Some(format!("INPUT — {addr}")),
+        source: addr,
+        frames: cli.frames,
+        debug: cli.debug,
+        overlay: resolved.overlay,
+        scene: scene_for_tui(resolved.scene.as_deref()),
+        preset,
+        presenter_mode,
+        initial_notice,
+        keymap,
+        chrome: resolved.chrome,
+        scene_file: cli.scene_file.clone(),
+        config_dir: config::config_dir(),
+        device: DeviceSelector::Default,
+        prefer_pipewire: true,
+    };
+
+    let stats = handle.stats_fn();
+    let health = handle.health_fn();
+    let clock = handle.clock_fn();
+    // A remote stream has no local device to switch; the picker is inert.
+    let outcome = run(reader, stats, health, clock, |_sel| {}, reload, opts);
+    handle.stop();
+    report_tui_outcome(outcome)
 }
 
 /// Print every scene (built-in and Luau) and the built-in preset names, then
@@ -932,6 +1129,52 @@ mod tests {
     #[test]
     fn unknown_presenter_flag_is_rejected() {
         assert!(Cli::try_parse_from(["scia", "--presenter", "megatier"]).is_err());
+    }
+
+    #[test]
+    fn output_flag_parses_both_formats() {
+        let json = Cli::try_parse_from(["scia", "--output", "json"]).expect("parses");
+        assert_eq!(json.output, Some(OutputFormat::Json));
+        assert_eq!(json.output.unwrap().encoding(), Encoding::Json);
+        let binary = Cli::try_parse_from(["scia", "--output", "binary"]).expect("parses");
+        assert_eq!(binary.output.unwrap().encoding(), Encoding::Binary);
+    }
+
+    #[test]
+    fn output_conflicts_with_input() {
+        assert!(
+            Cli::try_parse_from(["scia", "--output", "json", "--input", "127.0.0.1:9000"]).is_err()
+        );
+    }
+
+    #[test]
+    fn output_conflicts_with_ui_only_flags() {
+        // A UI-only flag has no meaning under headless output.
+        assert!(Cli::try_parse_from(["scia", "--output", "json", "--overlay"]).is_err());
+        assert!(Cli::try_parse_from(["scia", "--output", "json", "--scene", "aurora"]).is_err());
+    }
+
+    #[test]
+    fn listen_and_rate_require_output() {
+        // `--listen` / `--rate` are meaningless without `--output`.
+        assert!(Cli::try_parse_from(["scia", "--listen", "127.0.0.1:9000"]).is_err());
+        assert!(Cli::try_parse_from(["scia", "--rate", "30"]).is_err());
+        // ...and valid alongside it.
+        assert!(
+            Cli::try_parse_from(["scia", "--output", "json", "--listen", "127.0.0.1:9000"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["scia", "--output", "json", "--rate", "30"]).is_ok());
+    }
+
+    #[test]
+    fn input_conflicts_with_local_capture_flags() {
+        // `--input` renders from a remote stream, so local-capture flags conflict.
+        assert!(Cli::try_parse_from(["scia", "--input", "127.0.0.1:9000", "--demo"]).is_err());
+        assert!(
+            Cli::try_parse_from(["scia", "--input", "127.0.0.1:9000", "--device", "x"]).is_err()
+        );
+        // A bare `--input` with a TUI option is fine.
+        assert!(Cli::try_parse_from(["scia", "--input", "127.0.0.1:9000", "--overlay"]).is_ok());
     }
 
     #[test]

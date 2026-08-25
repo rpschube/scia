@@ -34,6 +34,7 @@ pub mod features;
 pub mod latency;
 pub mod onset;
 pub mod spectrum;
+pub mod stream;
 pub mod synthetic;
 
 #[cfg(feature = "capture-cpal")]
@@ -60,6 +61,11 @@ pub use latency::{
 };
 pub use onset::{OnsetConfig, OnsetDetector};
 pub use spectrum::{SpectrumAnalyzer, SpectrumConfig};
+pub use stream::{
+    Encoding, FeatureFrame, FrameStreamReader, STREAM_MAGIC, STREAM_SCHEMA_VERSION, StreamError,
+    decode_binary_payload, encode_binary_payload, from_json_line, read_binary_frame,
+    read_binary_header, to_json_line, write_binary_frame, write_binary_header,
+};
 pub use synthetic::{Pacing, Signal, SyntheticBackend};
 
 /// The crate name, resolved at compile time from Cargo metadata.
