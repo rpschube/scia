@@ -779,9 +779,28 @@ pub fn drain_into_timeline(
 /// probe to treat it as found. Kept low on purpose: a synthetic click is a
 /// single-frame impulse, whose normalized correlation against a rectangular
 /// template of `L` frames plateaus at `1/√L` (≈0.14 for a 1 ms / 48 kHz
-/// template), while a real full-width click and a matching-width burst score
-/// near 1.0 and silence / a never-arrived click score ≈ 0.
+/// template), while a matching-width rectangular burst scores 1.0 and a real
+/// **shaped** click (attack + decay, not a perfect rectangle) scores high but
+/// plausibly *below* 1.0 — comfortably above this floor, so the floor still
+/// admits it. It is emphatically **not** an `NCC ≥ 1` test: the flat-window
+/// degeneracy (see [`rect_xcorr_peak`]) is excluded by the energy floor there,
+/// not by demanding a perfect score here, so a shaped click's sub-1.0 peak is a
+/// match, not a failure. Silence / a never-arrived click score ≈ 0 and fall
+/// below it.
 pub const RAW_CORR_ACCEPT: f32 = 0.1;
+
+/// Fraction of the strongest scanned window's energy that a candidate window
+/// must reach to be eligible for the correlation peak — equivalently, a window
+/// RMS floor of `√FRAC` (0.5×) the strongest window's RMS. This is the fix for
+/// the **flat-window degeneracy** (see [`rect_xcorr_peak`]): it is a *ratio* of
+/// energies, so it carries **no user knob** and is invariant under any overall
+/// gain (scaling every sample by `k` scales both the candidate's energy and the
+/// reference by `k²`, leaving the decision unchanged — robust across capture
+/// volumes). 0.25 (RMS 0.5×) brackets a click's energetic core — its attack and
+/// peak — while excluding both the silence/DC floor around it and its own
+/// low-energy decay tail, so the reported leading edge lands on the click's
+/// arrival, not a downstream flat region.
+const RAW_CORR_ENERGY_FLOOR_FRAC: f64 = 0.25;
 
 /// Peak normalized cross-correlation of a rectangular (all-ones) template of
 /// `template_len` samples against `signal`, scanned over correlation offsets
@@ -790,19 +809,57 @@ pub const RAW_CORR_ACCEPT: f32 = 0.1;
 /// that NCC)`.
 ///
 /// This is the matched filter the P7 raw-ring probe uses to place a click's
-/// leading edge in the captured stream. An emitted click is a rectangular burst
-/// of known width, so the template is all-ones of that width and the NCC peaks
+/// leading edge in the captured stream. An emitted click is a positive burst of
+/// known width, so the template is all-ones of that width and the NCC peaks
 /// where the burst begins. Using NCC rather than a raw dot product makes the
-/// score amplitude-independent — 1.0 for a perfectly matching positive burst,
-/// near 0 for silence or zero-mean noise — so one acceptance floor
-/// ([`RAW_CORR_ACCEPT`]) separates "click found" from "click never arrived".
+/// score amplitude-independent, so one acceptance floor ([`RAW_CORR_ACCEPT`])
+/// separates "click found" from "click never arrived".
 ///
-/// Ties are resolved to the *latest* offset. For a rectangular-matched burst
-/// that is its unique strict peak, so the choice never bites there; for a pulse
-/// narrower than the template (a synthetic single-frame impulse), the tie runs
-/// over the plateau of offsets whose window still contains the pulse, and the
-/// latest of them is the offset whose template *start* aligns with the pulse —
-/// i.e. the leading-edge frame in both cases.
+/// ## The flat-window degeneracy, and how it is excluded
+///
+/// `NCC(o) = Σ window / (√(Σ window²) · √L)` equals **exactly ±1.0 for any
+/// *constant* window**, independent of its amplitude: a window of `L` copies of
+/// `c` has `Σ = L·c` and `Σ² = L·c²`, so `NCC = L·c / (√(L·c²)·√L) = 1`. Digital
+/// silence's DC floor, or any flat region, is therefore a *perfect* match — while
+/// a real click, shaped by the render/capture chain into an attack + decay, is
+/// **not** constant and scores strictly below 1. Left unguarded the correlation
+/// locks onto the first perfectly-flat region after the click's decay settles and
+/// reports the click's arrival there — the round-7 field artifact: `ncc = 1.000`
+/// on a silent stretch ~1458 frames (~30 ms) past the true click, which itself
+/// scored below 1.0 and lost. (Mean-subtracting the *template* does **not** fix
+/// this — an all-ones template minus its mean is the zero vector, and the score
+/// is undefined/zero everywhere. The fix is an energy gate on the *window*.)
+///
+/// Two energy gates, both pure ratios (no knob, gain-invariant — see
+/// [`RAW_CORR_ENERGY_FLOOR_FRAC`]), make a degenerate window ineligible so it
+/// scores **0, never 1**:
+///
+/// 1. **Excursion gate (whole search).** A click is a *localized* energy
+///    excursion above a quieter baseline, so `E_max` (the strongest window's
+///    energy) must exceed the search's baseline `E_min` by at least
+///    `FRAC · E_max`. A globally flat search — pure silence, or constant DC at
+///    *any* amplitude, or steady wideband noise — has `E_max ≈ E_min` and no
+///    excursion, so nothing localizes a click and **every** offset scores 0. This
+///    is what makes a constant-DC window score 0 even though its raw NCC is 1.0,
+///    without rejecting a constant *burst* (which stands above silence and is the
+///    synthetic click's exact shape).
+/// 2. **Per-window floor.** Given an excursion, only windows whose energy reaches
+///    `FRAC · E_max` are eligible; the low-energy flat regions (silence, DC floor,
+///    the click's own decay tail) fall below it and score 0. The click's
+///    energetic core clears it and wins.
+///
+/// ## Tie-break — the leading edge
+///
+/// Among the eligible windows at the maximum NCC, ties resolve to the window
+/// whose **first sample is largest in magnitude**, then to the **earliest**
+/// offset. This places the template's start on the signal's rising edge in both
+/// degenerate-plateau cases: for a burst *wider* than the template the interior
+/// windows tie at NCC 1.0 with equal first samples, so the earliest — the burst's
+/// leading edge — wins (no late drift into a sustained region); for a pulse
+/// *narrower* than the template (a synthetic single-frame impulse) the tie runs
+/// over the offsets whose window merely contains the pulse, and the one whose
+/// first sample lands *on* the pulse has the largest leading magnitude and wins —
+/// the leading-edge frame in both cases.
 ///
 /// Returns `None` when `template_len` is zero, longer than `signal`, or the
 /// clamped search range is empty.
@@ -824,9 +881,6 @@ pub fn rect_xcorr_peak(
         return None;
     }
 
-    // Template energy is L (all ones), so ‖template‖ = √L; NCC(o) =
-    // Σ window / (√(Σ window²) · √L).
-    //
     // Each offset's `sum` (Σ window) and `sq` (Σ window²) are computed fresh over
     // the window's `template_len` samples — deliberately not carried across
     // offsets. A running window sum is O(1) per offset but the sum-of-squares
@@ -835,37 +889,64 @@ pub fn rect_xcorr_peak(
     // and in a later low-energy window that residual can dwarf the window's true
     // Σ window². Cauchy–Schwarz bounds `Σ window ≤ √L · √(Σ window²)` only for a
     // *consistent* sum/energy pair, so an independently-drifted denominator lets
-    // NCC exceed 1 and win the peak, planting a spurious late arrival. Recomputing
-    // both from the same samples keeps the pair consistent, so NCC ≤ 1 by
-    // construction; the final `.min(1.0)` on the magnitude is a last-ulp guard.
-    // The cost is O(template_len) per offset — fine for this probe/test helper.
+    // NCC exceed 1. Recomputing both from the same samples keeps the pair
+    // consistent, so NCC ≤ 1 by construction; the `.clamp` on the magnitude is a
+    // last-ulp guard. The cost is O(template_len) per offset — fine for this
+    // probe/test helper, which the doc notes.
+    let window_sq = |o: usize| -> f64 {
+        signal[o..o + template_len]
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum()
+    };
+
+    // Pass 1 — the energy scale of the search. `e_max` is the strongest window's
+    // energy (the click, when one is present); `e_min` is the quietest (the
+    // baseline the click stands above). Both feed the gates below.
+    let mut e_max = 0.0f64;
+    let mut e_min = f64::INFINITY;
+    for o in start..end {
+        let sq = window_sq(o);
+        e_max = e_max.max(sq);
+        e_min = e_min.min(sq);
+    }
+
+    // Excursion gate: a click is a localized energy peak above a quieter
+    // baseline. With no excursion — a globally flat search (silence, or constant
+    // DC at any amplitude, whose raw NCC would otherwise be a degenerate 1.0) —
+    // no offset can carry a click, so every window scores 0. `e_max <= 0` is pure
+    // silence (also caught by `sq > 0` below).
+    let has_excursion = e_max > 0.0 && (e_max - e_min) >= RAW_CORR_ENERGY_FLOOR_FRAC * e_max;
+    let energy_floor = RAW_CORR_ENERGY_FLOOR_FRAC * e_max;
+
     let norm = (template_len as f64).sqrt();
-    let mut best: Option<(usize, f32)> = None;
+    // Track the best as (ncc, first-sample magnitude, offset). Higher ncc wins;
+    // on an exact NCC tie the larger leading magnitude wins; on a further tie the
+    // earlier offset wins (we scan ascending and only replace on strict
+    // improvement of a key). See the tie-break note above.
+    let mut best: Option<(f32, f32, usize)> = None;
     for o in start..end {
         let window = &signal[o..o + template_len];
-        let mut sum = 0.0f64;
-        let mut sq = 0.0f64;
-        for &v in window {
-            let v = f64::from(v);
-            sum += v;
-            sq += v * v;
-        }
-        let ncc = if sq > 0.0 {
-            // Clamp the magnitude to Cauchy–Schwarz's ceiling of 1: exact
-            // recomputation already guarantees |NCC| ≤ 1 up to rounding, and this
-            // makes a >1 unrepresentable rather than merely unlikely.
-            let raw = sum / (sq.sqrt() * norm);
-            raw.clamp(-1.0, 1.0) as f32
+        let sum: f64 = window.iter().map(|&v| f64::from(v)).sum();
+        let sq: f64 = window.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+        // A window is eligible only if the search has a real excursion and this
+        // window reaches the energy floor. An ineligible (degenerate/near-silent)
+        // window scores 0 — never the spurious 1.0 a flat region would earn.
+        let ncc = if has_excursion && sq >= energy_floor && sq > 0.0 {
+            (sum / (sq.sqrt() * norm)).clamp(-1.0, 1.0) as f32
         } else {
             0.0
         };
-        // `>=` keeps the latest max (see the tie-break note above).
-        match best {
-            Some((_, b)) if ncc < b => {}
-            _ => best = Some((o, ncc)),
+        let first_mag = window[0].abs();
+        let better = match best {
+            None => true,
+            Some((bncc, bmag, _)) => ncc > bncc || (ncc == bncc && first_mag > bmag),
+        };
+        if better {
+            best = Some((ncc, first_mag, o));
         }
     }
-    best
+    best.map(|(ncc, _, o)| (o, ncc))
 }
 
 // ---------------------------------------------------------------------------
@@ -1588,6 +1669,135 @@ mod tests {
             peak <= 1.0,
             "NCC {peak} exceeded 1.0 — normalization denominator drifted"
         );
+    }
+
+    /// The pre-round-7 scorer, preserved verbatim as the *degenerate-permissive*
+    /// baseline: no energy gate, ties to the latest offset. It scores any constant
+    /// window an exact 1.0 — the flat-window degeneracy round 7 removed — so it is
+    /// used only to prove the fix bites: the shipped `rect_xcorr_peak` must diverge
+    /// from it on the shaped-click-in-silence case below.
+    fn rect_xcorr_peak_prefix(
+        signal: &[f32],
+        template_len: usize,
+        search_start: usize,
+        search_end: usize,
+    ) -> Option<(usize, f32)> {
+        if template_len == 0 || template_len > signal.len() {
+            return None;
+        }
+        let offset_bound = signal.len() - template_len + 1;
+        let start = search_start.min(offset_bound);
+        let end = search_end.min(offset_bound);
+        if start >= end {
+            return None;
+        }
+        let norm = (template_len as f64).sqrt();
+        let mut best: Option<(usize, f32)> = None;
+        for o in start..end {
+            let window = &signal[o..o + template_len];
+            let mut sum = 0.0f64;
+            let mut sq = 0.0f64;
+            for &v in window {
+                let v = f64::from(v);
+                sum += v;
+                sq += v * v;
+            }
+            let ncc = if sq > 0.0 {
+                (sum / (sq.sqrt() * norm)).clamp(-1.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            // `>=` keeps the latest max — the pre-round-7 tie rule.
+            match best {
+                Some((_, b)) if ncc < b => {}
+                _ => best = Some((o, ncc)),
+            }
+        }
+        best
+    }
+
+    /// A shaped click — a flat attack plateau exactly `template_len` frames wide,
+    /// then a ~15 ms exponential decay — sitting on a constant nonzero DC floor,
+    /// with that same flat floor as the head and a long flat tail. This mirrors the
+    /// field capture: an attack + decay click surrounded by a perfectly flat region
+    /// (the digital-silence DC floor, not exact zeros).
+    fn shaped_click_on_dc_floor(len: usize, click_at: usize, template_len: usize) -> Vec<f32> {
+        let dc = 1.0e-3f32; // constant nonzero floor — the degenerate flat region
+        let amp = 0.5f32;
+        let mut sig = vec![dc; len];
+        for s in &mut sig[click_at..click_at + template_len] {
+            *s = amp + dc;
+        }
+        let decay = 720usize; // ~15 ms at 48 kHz
+        for k in 0..decay {
+            let t = k as f32 / decay as f32;
+            sig[click_at + template_len + k] = amp * (-6.0 * t).exp() + dc;
+        }
+        sig
+    }
+
+    #[test]
+    fn xcorr_shaped_click_beats_flat_tail_where_the_old_scorer_lost() {
+        // A shaped click near the front, then thousands of frames of flat DC floor.
+        // The OLD (degenerate-permissive) scorer scores every flat window an exact
+        // 1.0 and, tying to the latest, reports the click's arrival far downstream
+        // in the silent tail — the round-7 field artifact reproduced by
+        // construction. The shipped scorer's energy gates make the flat tail
+        // ineligible, so it lands on the click's leading edge instead.
+        let l = 48usize;
+        let click_at = 1_000usize;
+        let len = 12_000usize;
+        let sig = shaped_click_on_dc_floor(len, click_at, l);
+        let (start, end) = (0usize, len - l + 1);
+
+        // Bite: the old scorer locks onto the flat tail, nowhere near the click.
+        let (old_off, old_ncc) = rect_xcorr_peak_prefix(&sig, l, start, end).expect("old peak");
+        assert!(
+            (old_ncc - 1.0).abs() < 1e-6,
+            "old scorer should score the flat region a degenerate 1.0, got {old_ncc}"
+        );
+        assert!(
+            old_off > click_at + l + 720 + 100,
+            "old scorer should drift into the flat tail (offset {old_off}), \
+             far past the click at {click_at}"
+        );
+
+        // Fix: the shipped scorer places the leading edge at the plateau start.
+        let (new_off, new_ncc) = rect_xcorr_peak(&sig, l, start, end).expect("new peak");
+        assert_eq!(
+            new_off, click_at,
+            "new scorer should place the leading edge at the plateau start \
+             {click_at}, got {new_off}"
+        );
+        assert!(
+            new_ncc >= RAW_CORR_ACCEPT,
+            "the shaped click's peak {new_ncc} should clear the acceptance floor"
+        );
+        // The gate genuinely changed the outcome: the two scorers disagree.
+        assert!(
+            new_off < old_off,
+            "the energy gate must move the pick earlier: new {new_off} vs old {old_off}"
+        );
+    }
+
+    #[test]
+    fn xcorr_flat_windows_score_zero() {
+        let l = 48usize;
+        let n = 4_000usize;
+
+        // Pure digital silence: no energy anywhere.
+        let silence = vec![0.0f32; n];
+        let (_, peak) = rect_xcorr_peak(&silence, l, 0, n - l + 1).expect("a peak");
+        assert_eq!(peak, 0.0, "pure silence must score 0, got {peak}");
+        assert!(peak < RAW_CORR_ACCEPT);
+
+        // Constant DC at a substantial amplitude: the raw NCC is a degenerate 1.0
+        // for every window, but with no energy excursion the scorer must still
+        // return 0 — the guard that is not amplitude-dependent.
+        let dc = vec![0.5f32; n];
+        let (_, peak) = rect_xcorr_peak(&dc, l, 0, n - l + 1).expect("a peak");
+        assert_eq!(peak, 0.0, "a constant-DC window must score 0, got {peak}");
+        assert!(peak < RAW_CORR_ACCEPT);
     }
 
     #[test]
