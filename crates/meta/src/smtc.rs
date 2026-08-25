@@ -67,13 +67,23 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionManager as Manager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as WinStatus,
 };
-use windows::Storage::Streams::{DataReader, IRandomAccessStreamReference};
+use windows::Storage::Streams::{
+    DataReader, IRandomAccessStreamReference, IRandomAccessStreamWithContentType,
+};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
-use windows::core::{HSTRING, Result as WinResult};
+use windows::core::{Error as WinError, HSTRING, Result as WinResult};
 
-use crate::artwork::{ArtworkDriver, ArtworkStep, RetryPolicy};
+use crate::artwork::{
+    ArtAction, ArtCampaignTracker, ArtworkDriver, ArtworkStep, CampaignOutcome, FetchStage,
+    RetryPolicy,
+};
 use crate::select::{SessionSnapshot, select_winner};
 use crate::types::{MetaEvent, MetaHandle, NowPlaying, PlaybackStatus};
+
+/// A diagnostic trace sink used by the `meta_probe` example. Production
+/// ([`start`]) installs none; the probe installs one that writes timestamped
+/// lines to stderr. The hot path only formats a message when a sink is present.
+pub type TraceFn = dyn Fn(&str) + Send;
 
 /// The safety-net re-check interval. The backend is event-driven; this only
 /// fires when the internal channel has been idle this long, catching any
@@ -100,6 +110,27 @@ pub fn start(out: Sender<MetaEvent>) -> MetaHandle {
 /// production uses [`RetryPolicy::default`] via [`start`]).
 #[must_use]
 pub fn start_with_policy(out: Sender<MetaEvent>, policy: RetryPolicy) -> MetaHandle {
+    start_inner(out, policy, None)
+}
+
+/// Start with a diagnostic trace sink installed. Used by the `meta_probe`
+/// example to log session changes, properties events and per-attempt artwork
+/// fetch outcomes (including the exact failing WinRT stage and `HRESULT`).
+/// Production never calls this.
+#[must_use]
+pub fn start_traced(
+    out: Sender<MetaEvent>,
+    policy: RetryPolicy,
+    tracer: Box<TraceFn>,
+) -> MetaHandle {
+    start_inner(out, policy, Some(tracer))
+}
+
+fn start_inner(
+    out: Sender<MetaEvent>,
+    policy: RetryPolicy,
+    tracer: Option<Box<TraceFn>>,
+) -> MetaHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let join = thread::Builder::new()
@@ -108,7 +139,9 @@ pub fn start_with_policy(out: Sender<MetaEvent>, policy: RetryPolicy) -> MetaHan
             // The internal channel the WinRT callbacks push markers onto lives
             // and dies with this thread; both ends stay on it.
             let (tx, rx) = mpsc::channel::<Internal>();
-            run(&out, &thread_stop, &tx, &rx, policy);
+            // Downgrade the owned box to a plain `&dyn Fn` borrow for the run.
+            let tracer_ref = tracer.as_deref();
+            run(&out, &thread_stop, &tx, &rx, policy, tracer_ref);
         })
         .expect("spawn scia-smtc thread");
     // No shutdown waker: the backend loop already polls the stop flag every
@@ -124,10 +157,62 @@ pub fn start_with_policy(out: Sender<MetaEvent>, policy: RetryPolicy) -> MetaHan
 enum Internal {
     /// The manager's session set changed: re-enumerate and re-subscribe.
     SessionsChanged,
-    /// A specific session signalled a metadata/playback change.
-    SessionChanged(String),
+    /// A session's `MediaPropertiesChanged` fired (title/artist/album/thumbnail
+    /// — the signal a late thumbnail swap arrives on). Carries its app id.
+    SessionProperties(String),
+    /// A session's `PlaybackInfoChanged` fired (play/pause/stop). Carries its
+    /// app id. Never itself a reason to refetch art.
+    SessionPlayback(String),
     /// The safety-net timer elapsed: re-evaluate defensively.
     Recheck,
+}
+
+/// Why [`evaluate`] was invoked, so it can tell a late thumbnail swap (a
+/// `MediaPropertiesChanged` for the winner) apart from a play/pause or a
+/// structural re-check when deciding whether to re-run an artwork campaign.
+#[derive(Debug, Clone)]
+enum EvalTrigger {
+    /// Startup, `SessionsChanged`, or the safety-net re-check.
+    Structural,
+    /// A `MediaPropertiesChanged` for the named app.
+    Properties(String),
+    /// A `PlaybackInfoChanged` for the named app.
+    Playback(String),
+}
+
+/// The invariant per-evaluation context: where to send events, how to know when
+/// to stop, the internal channel to drain mid-campaign, the retry policy, and an
+/// optional diagnostic trace sink. Bundled so the hot-path functions stay under
+/// the argument-count limit.
+struct Ctx<'a> {
+    out: &'a Sender<MetaEvent>,
+    stop: &'a AtomicBool,
+    rx: &'a Receiver<Internal>,
+    policy: RetryPolicy,
+    tracer: Option<&'a TraceFn>,
+}
+
+impl Ctx<'_> {
+    /// Emit a diagnostic line, formatting the message only when a sink exists.
+    fn trace(&self, args: std::fmt::Arguments) {
+        if let Some(t) = self.tracer {
+            t(&args.to_string());
+        }
+    }
+}
+
+/// The result of one [`fetch_artwork_once`] attempt, with the failing WinRT
+/// stage tagged so a probe can report exactly which step broke.
+enum FetchResult {
+    /// The thumbnail bytes were read (the driver still judges usability).
+    Bytes(Vec<u8>),
+    /// The thumbnail stream was empty (size 0) — a normal "not yet" miss.
+    Empty,
+    /// A WinRT stage failed with this error. A track that simply has no art
+    /// surfaces here as a [`FetchStage::Thumbnail`] failure — indistinguishable
+    /// at the API from a genuine error, but its `HRESULT` tells them apart in a
+    /// probe log; either way the campaign retries then gives up.
+    Failed(FetchStage, WinError),
 }
 
 /// One session's live subscriptions, kept so they can be removed when the
@@ -157,6 +242,9 @@ struct BackendState {
     last_track: Option<NowPlaying>,
     /// Whether the last emission was [`MetaEvent::Cleared`], for de-duplication.
     cleared: bool,
+    /// Per-track artwork-campaign bookkeeping: enables exactly one follow-up
+    /// campaign when a player swaps its thumbnail after the first gave up.
+    art: ArtCampaignTracker,
 }
 
 impl BackendState {
@@ -166,6 +254,7 @@ impl BackendState {
             activity: HashMap::new(),
             last_track: None,
             cleared: false,
+            art: ArtCampaignTracker::new(),
         }
     }
 
@@ -193,6 +282,7 @@ fn run(
     tx: &Sender<Internal>,
     rx: &Receiver<Internal>,
     policy: RetryPolicy,
+    tracer: Option<&TraceFn>,
 ) {
     // SMTC is delivered on the WinRT threadpool (MTA). Initialise COM in the
     // multithreaded apartment on this thread so async `.join()` calls and event
@@ -203,7 +293,14 @@ fn run(
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    let result = run_inner(out, stop, tx, rx, policy);
+    let ctx = Ctx {
+        out,
+        stop,
+        rx,
+        policy,
+        tracer,
+    };
+    let result = run_inner(&ctx, tx);
 
     // SAFETY: pairs with the `CoInitializeEx` above on the same thread.
     unsafe {
@@ -218,13 +315,7 @@ fn run(
 }
 
 /// The fallible body; any WinRT error unwinds to a quiet `Cleared` in [`run`].
-fn run_inner(
-    out: &Sender<MetaEvent>,
-    stop: &AtomicBool,
-    tx: &Sender<Internal>,
-    rx: &Receiver<Internal>,
-    policy: RetryPolicy,
-) -> WinResult<()> {
+fn run_inner(ctx: &Ctx, tx: &Sender<Internal>) -> WinResult<()> {
     let manager = Manager::RequestAsync()?.join()?;
 
     // Manager-level: the session set changed.
@@ -239,11 +330,12 @@ fn run_inner(
 
     // Initial subscription + evaluation.
     resubscribe(&manager, tx, &mut subs);
-    let mut pending = evaluate(&manager, out, &mut state, stop, rx, policy);
+    ctx.trace(format_args!("startup: initial evaluation"));
+    let mut pending = evaluate(&manager, &mut state, ctx, &EvalTrigger::Structural);
     let mut last_eval = Instant::now();
 
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if ctx.stop.load(Ordering::Relaxed) {
             break;
         }
 
@@ -254,7 +346,7 @@ fn run_inner(
                 // POLL_CAP so the stop flag is observed promptly; only after a
                 // full SAFETY_NET of quiet does the timeout mean "re-check".
                 let wait = SAFETY_NET.saturating_sub(last_eval.elapsed()).min(POLL_CAP);
-                match rx.recv_timeout(wait) {
+                match ctx.rx.recv_timeout(wait) {
                     Ok(m) => Some(m),
                     Err(RecvTimeoutError::Timeout) => {
                         if last_eval.elapsed() >= SAFETY_NET {
@@ -274,15 +366,23 @@ fn run_inner(
 
         match msg {
             Internal::SessionsChanged => {
+                ctx.trace(format_args!("event: sessions-changed"));
                 resubscribe(&manager, tx, &mut subs);
-                pending = evaluate(&manager, out, &mut state, stop, rx, policy);
+                pending = evaluate(&manager, &mut state, ctx, &EvalTrigger::Structural);
             }
-            Internal::SessionChanged(app_id) => {
+            Internal::SessionProperties(app_id) => {
+                ctx.trace(format_args!("event: properties-changed app={app_id}"));
                 state.bump(&app_id);
-                pending = evaluate(&manager, out, &mut state, stop, rx, policy);
+                pending = evaluate(&manager, &mut state, ctx, &EvalTrigger::Properties(app_id));
+            }
+            Internal::SessionPlayback(app_id) => {
+                ctx.trace(format_args!("event: playback-changed app={app_id}"));
+                state.bump(&app_id);
+                pending = evaluate(&manager, &mut state, ctx, &EvalTrigger::Playback(app_id));
             }
             Internal::Recheck => {
-                pending = evaluate(&manager, out, &mut state, stop, rx, policy);
+                ctx.trace(format_args!("event: safety-net recheck"));
+                pending = evaluate(&manager, &mut state, ctx, &EvalTrigger::Structural);
             }
         }
         last_eval = Instant::now();
@@ -316,14 +416,14 @@ fn resubscribe(manager: &Manager, tx: &Sender<Internal>, subs: &mut Vec<SessionS
         let tx_media = tx.clone();
         let app_media = app_id.clone();
         let media_token = session.MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx_media.send(Internal::SessionChanged(app_media.clone()));
+            let _ = tx_media.send(Internal::SessionProperties(app_media.clone()));
             Ok(())
         }));
 
         let tx_pb = tx.clone();
         let app_pb = app_id.clone();
         let playback_token = session.PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx_pb.send(Internal::SessionChanged(app_pb.clone()));
+            let _ = tx_pb.send(Internal::SessionPlayback(app_pb.clone()));
             Ok(())
         }));
 
@@ -345,16 +445,14 @@ fn resubscribe(manager: &Manager, tx: &Sender<Internal>, subs: &mut Vec<SessionS
 /// not lost while album art is being fetched.
 fn evaluate(
     manager: &Manager,
-    out: &Sender<MetaEvent>,
     state: &mut BackendState,
-    stop: &AtomicBool,
-    rx: &Receiver<Internal>,
-    policy: RetryPolicy,
+    ctx: &Ctx,
+    trigger: &EvalTrigger,
 ) -> Option<Internal> {
     let sessions = match manager.GetSessions() {
         Ok(s) => s,
         Err(_) => {
-            emit_cleared(out, state);
+            emit_cleared(ctx.out, state);
             return None;
         }
     };
@@ -381,7 +479,7 @@ fn evaluate(
     state.activity.retain(|k, _| live.contains(k.as_str()));
 
     let Some(winner_idx) = select_winner(&snaps) else {
-        emit_cleared(out, state);
+        emit_cleared(ctx.out, state);
         return None;
     };
 
@@ -392,34 +490,43 @@ fn evaluate(
     // Read the winner's textual metadata + status into a NowPlaying.
     let now = read_now_playing(winner_session, &winner_app, winner_status);
 
-    // Art is (re)fetched only when the track identity or the winning app
-    // changed — a bare play/pause updates the snapshot but keeps the same art.
+    // Art is (re)fetched when the track identity or the winning app changed — a
+    // bare play/pause updates the snapshot but keeps the same art.
     let prev = state.last_track.as_ref();
     let track_changed = prev.map(|p| p.track_key.as_str()) != Some(now.track_key.as_str());
     let app_changed = prev.and_then(|p| p.source_app.as_deref()) != now.source_app.as_deref();
-    let art_needed = track_changed || app_changed;
+    let changed = track_changed || app_changed;
     let track_key = now.track_key.clone();
+
+    // A `MediaPropertiesChanged` for the *winning* session is the signal a late
+    // thumbnail swap rides in on; the tracker turns it into one follow-up
+    // campaign when the previous one gave up art-less.
+    let props_for_winner = matches!(trigger, EvalTrigger::Properties(app) if *app == winner_app);
 
     // Emit whenever the snapshot differs from what we last sent (or we were
     // cleared): this covers a new track, a status flip, or a new winner.
     if prev != Some(&now) || state.cleared {
-        let _ = out.send(MetaEvent::TrackChanged(now.clone()));
+        let _ = ctx.out.send(MetaEvent::TrackChanged(now.clone()));
         state.cleared = false;
     }
     state.last_track = Some(now);
 
-    if art_needed {
-        return run_artwork_campaign(
-            winner_session,
-            &winner_app,
-            &track_key,
-            out,
-            stop,
-            rx,
-            policy,
-        );
+    let action = state.art.decide(&track_key, changed, props_for_winner);
+    if action == ArtAction::Skip {
+        return None;
     }
-    None
+    ctx.trace(format_args!(
+        "artwork: {} campaign app={winner_app} track_key={track_key}",
+        match action {
+            ArtAction::Fresh => "fresh",
+            ArtAction::Recampaign => "re-",
+            ArtAction::Skip => "skip",
+        }
+    ));
+    state.art.begin(&track_key, action);
+    let (outcome, pending) = run_artwork_campaign(winner_session, &winner_app, &track_key, ctx);
+    state.art.finish(outcome);
+    pending
 }
 
 /// Emit [`MetaEvent::Cleared`] unless it was already the last thing emitted.
@@ -436,41 +543,79 @@ fn emit_cleared(out: &Sender<MetaEvent>, state: &mut BackendState) {
 /// the internal channel; if a message arrives it abandons the campaign and
 /// returns that message so the caller processes it next (a new track supersedes
 /// a stale artwork fetch). It also bails if the stop flag is set.
+///
+/// Returns the campaign's [`CampaignOutcome`] (so the caller's
+/// [`ArtCampaignTracker`] knows whether art was obtained) and any [`Internal`]
+/// message that superseded it.
 fn run_artwork_campaign(
     session: &Session,
     app_id: &str,
     track_key: &str,
-    out: &Sender<MetaEvent>,
-    stop: &AtomicBool,
-    rx: &Receiver<Internal>,
-    policy: RetryPolicy,
-) -> Option<Internal> {
-    let mut driver = ArtworkDriver::new(policy);
+    ctx: &Ctx,
+) -> (CampaignOutcome, Option<Internal>) {
+    let mut driver = ArtworkDriver::new(ctx.policy);
+    let mut attempt: u32 = 0;
     loop {
-        if stop.load(Ordering::Relaxed) {
-            return None;
+        if ctx.stop.load(Ordering::Relaxed) {
+            return (CampaignOutcome::Abandoned, None);
         }
         match driver.next_step() {
             ArtworkStep::Emit(bytes) => {
-                let _ = out.send(MetaEvent::Artwork {
+                ctx.trace(format_args!(
+                    "artwork: emit track_key={track_key} bytes={}",
+                    bytes.len()
+                ));
+                let _ = ctx.out.send(MetaEvent::Artwork {
                     track_key: track_key.to_string(),
                     bytes,
                     source_app: Some(app_id.to_string()),
                 });
-                return None;
+                return (CampaignOutcome::Emitted, None);
             }
-            ArtworkStep::GiveUp => return None,
+            ArtworkStep::GiveUp => {
+                ctx.trace(format_args!(
+                    "artwork: give-up track_key={track_key} after {attempt} attempt(s)"
+                ));
+                return (CampaignOutcome::GaveUp, None);
+            }
             ArtworkStep::Fetch { delay } => {
                 // Wait the debounce/backoff, but bail out early if a new marker
                 // arrives — the callbacks never block, so this is the only place
                 // a fresh change is observed mid-campaign.
-                match rx.recv_timeout(delay) {
-                    Ok(msg) => return Some(msg),
-                    Err(RecvTimeoutError::Disconnected) => return None,
+                match ctx.rx.recv_timeout(delay) {
+                    Ok(msg) => return (CampaignOutcome::Abandoned, Some(msg)),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return (CampaignOutcome::Abandoned, None);
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                 }
-                let bytes = fetch_artwork_once(session).ok().flatten();
-                driver.record(bytes.as_deref());
+                attempt += 1;
+                let result = fetch_artwork_once(session);
+                let bytes: Option<&[u8]> = match &result {
+                    FetchResult::Bytes(b) => {
+                        ctx.trace(format_args!(
+                            "fetch attempt={attempt} stage=read-bytes ok bytes={}",
+                            b.len()
+                        ));
+                        Some(b.as_slice())
+                    }
+                    FetchResult::Empty => {
+                        ctx.trace(format_args!(
+                            "fetch attempt={attempt} stage=size miss=empty-stream"
+                        ));
+                        None
+                    }
+                    FetchResult::Failed(stage, err) => {
+                        ctx.trace(format_args!(
+                            "fetch attempt={attempt} stage={} FAILED hresult={} msg={}",
+                            stage.label(),
+                            err.code(),
+                            err.message()
+                        ));
+                        None
+                    }
+                };
+                driver.record(bytes);
             }
         }
     }
@@ -495,31 +640,91 @@ fn read_now_playing(session: &Session, app_id: &str, status: PlaybackStatus) -> 
     NowPlaying::new(title, artist, album, status, None, Some(app_id.to_string()))
 }
 
-/// Perform one artwork fetch: re-query the session's media properties, open the
-/// thumbnail stream and read all its bytes. `Ok(None)` means "no thumbnail yet"
-/// (drives a retry); `Err` is a transient WinRT failure, also treated as a miss.
-fn fetch_artwork_once(session: &Session) -> WinResult<Option<Vec<u8>>> {
-    let props = session.TryGetMediaPropertiesAsync()?.join()?;
+/// Perform one artwork fetch: re-query the session's media properties, take the
+/// thumbnail reference, open its stream and read every byte. Each WinRT stage's
+/// failure is tagged with its [`FetchStage`] so a probe can report exactly which
+/// step broke; a missing thumbnail or an empty stream are the ordinary
+/// not-ready-yet misses that drive a retry.
+fn fetch_artwork_once(session: &Session) -> FetchResult {
+    let props = match session
+        .TryGetMediaPropertiesAsync()
+        .and_then(|op| op.join())
+    {
+        Ok(p) => p,
+        Err(e) => return FetchResult::Failed(FetchStage::Props, e),
+    };
     let thumb: IRandomAccessStreamReference = match props.Thumbnail() {
         Ok(t) => t,
-        Err(_) => return Ok(None),
+        // No thumbnail published (or the getter erred): a miss that drives a
+        // retry. Tagged with the stage so a probe sees the exact HRESULT.
+        Err(e) => return FetchResult::Failed(FetchStage::Thumbnail, e),
     };
     read_stream_ref(&thumb)
 }
 
-/// Read every byte of an [`IRandomAccessStreamReference`], or `Ok(None)` if the
-/// stream is empty.
-fn read_stream_ref(reference: &IRandomAccessStreamReference) -> WinResult<Option<Vec<u8>>> {
-    let stream = reference.OpenReadAsync()?.join()?;
-    let size = stream.Size()?;
-    if size == 0 {
-        return Ok(None);
+/// RAII guard closing an [`IRandomAccessStreamWithContentType`] on every path
+/// out of [`read_stream_ref`]. Dropping the windows-rs wrapper only releases the
+/// COM reference; the underlying OS stream handle is released by
+/// `IClosable::Close`. Without this, each attempt (up to five per track) leaks a
+/// platform stream handle, which is what starves the thumbnail path after a
+/// few tracks until the process is restarted.
+struct StreamGuard<'a>(&'a IRandomAccessStreamWithContentType);
+impl Drop for StreamGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.Close();
     }
-    let reader = DataReader::CreateDataReader(&stream)?;
-    reader.LoadAsync(size as u32)?.join()?;
+}
+
+/// RAII guard closing a [`DataReader`]. `DetachStream` first so closing the
+/// reader releases only the reader's own resources and does **not** also close
+/// the stream the [`StreamGuard`] owns (a `DataReader` otherwise closes its
+/// underlying stream on `Close`); the stream is then closed exactly once by its
+/// own guard. Detaching after `Close` would be invalid, so the order is
+/// detach-then-close, and this guard (declared last) drops before the stream
+/// guard, i.e. the dependent reader is torn down before the stream it used.
+struct ReaderGuard<'a>(&'a DataReader);
+impl Drop for ReaderGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.DetachStream();
+        let _ = self.0.Close();
+    }
+}
+
+/// Read every byte of an [`IRandomAccessStreamReference`], closing the stream and
+/// reader on every path out. Returns [`FetchResult::Empty`] for a zero-length
+/// stream and tags any WinRT failure with the stage it happened at.
+fn read_stream_ref(reference: &IRandomAccessStreamReference) -> FetchResult {
+    let stream = match reference.OpenReadAsync().and_then(|op| op.join()) {
+        Ok(s) => s,
+        Err(e) => return FetchResult::Failed(FetchStage::OpenRead, e),
+    };
+    // Declared first, dropped last: the stream is closed after the reader.
+    let _stream_guard = StreamGuard(&stream);
+
+    let size = match stream.Size() {
+        Ok(s) => s,
+        Err(e) => return FetchResult::Failed(FetchStage::Size, e),
+    };
+    if size == 0 {
+        return FetchResult::Empty;
+    }
+
+    let reader = match DataReader::CreateDataReader(&stream) {
+        Ok(r) => r,
+        Err(e) => return FetchResult::Failed(FetchStage::CreateReader, e),
+    };
+    // Declared last, dropped first: the reader is detached + closed before the
+    // stream guard closes the stream.
+    let _reader_guard = ReaderGuard(&reader);
+
+    if let Err(e) = reader.LoadAsync(size as u32).and_then(|op| op.join()) {
+        return FetchResult::Failed(FetchStage::Load, e);
+    }
     let mut buf = vec![0u8; size as usize];
-    reader.ReadBytes(&mut buf)?;
-    Ok(Some(buf))
+    if let Err(e) = reader.ReadBytes(&mut buf) {
+        return FetchResult::Failed(FetchStage::ReadBytes, e);
+    }
+    FetchResult::Bytes(buf)
 }
 
 /// The session's `AppUserModelId`, or an empty string if it cannot be read.

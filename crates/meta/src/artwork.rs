@@ -234,6 +234,162 @@ pub fn is_usable_artwork(bytes: &[u8]) -> bool {
     bytes.len() >= MIN_ARTWORK_BYTES && sniff_image_format(bytes).is_some()
 }
 
+/// The distinct stages of one SMTC artwork fetch, in the order they run.
+///
+/// A fetch walks: re-read the session's media properties, take the thumbnail
+/// reference off them, open a read stream, read its size, create a reader, load
+/// the bytes, then copy them out. Any stage can fail with its own WinRT
+/// `HRESULT`; the SMTC backend tags the failing stage with this enum so a probe
+/// can report *which* step broke and distinguish, say, a `Thumbnail()` error
+/// from an `OpenReadAsync` error. Platform-neutral so the label mapping is
+/// unit-tested off Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStage {
+    /// `TryGetMediaPropertiesAsync` — re-read the winner's media properties.
+    Props,
+    /// `props.Thumbnail()` — take the thumbnail stream reference.
+    Thumbnail,
+    /// `OpenReadAsync` — open a read stream over the thumbnail.
+    OpenRead,
+    /// `stream.Size()` — read the stream length.
+    Size,
+    /// `DataReader::CreateDataReader` — wrap the stream in a reader.
+    CreateReader,
+    /// `LoadAsync` — pull the bytes into the reader's buffer.
+    Load,
+    /// `ReadBytes` — copy the loaded bytes out.
+    ReadBytes,
+}
+
+impl FetchStage {
+    /// A short, stable, log-safe label for the stage.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            FetchStage::Props => "props",
+            FetchStage::Thumbnail => "thumbnail",
+            FetchStage::OpenRead => "open-read",
+            FetchStage::Size => "size",
+            FetchStage::CreateReader => "create-reader",
+            FetchStage::Load => "load",
+            FetchStage::ReadBytes => "read-bytes",
+        }
+    }
+}
+
+/// What an artwork campaign should do next, decided by [`ArtCampaignTracker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtAction {
+    /// Do not run a campaign this evaluation.
+    Skip,
+    /// The track identity or winning app changed: run a fresh campaign.
+    Fresh,
+    /// Same track, its previous campaign produced no art, and a properties
+    /// event for the winning session arrived: run the one allowed follow-up
+    /// campaign (covers a player that swaps its thumbnail late).
+    Recampaign,
+}
+
+/// The terminal outcome of one artwork campaign, fed back to the tracker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CampaignOutcome {
+    /// Usable artwork was obtained and emitted.
+    Emitted,
+    /// Every bounded attempt was exhausted with no usable artwork.
+    GaveUp,
+    /// A newer change superseded the campaign before it finished; nothing was
+    /// concluded about this track's artwork.
+    Abandoned,
+}
+
+/// Per-track artwork-campaign bookkeeping that makes late thumbnails recoverable
+/// without ever looping.
+///
+/// The SMTC contract fetches art only when the track (or winning app) changes.
+/// But some players — Spotify notably — publish the new title first and swap the
+/// thumbnail a beat later, sometimes *after* the bounded campaign has already
+/// given up. When that happens the player emits a `MediaPropertiesChanged` for
+/// the same track; without this tracker that event does nothing and the track is
+/// stuck art-less until an app restart.
+///
+/// The tracker grants **exactly one** follow-up campaign per track: it remembers
+/// the track a campaign last ran for, whether that campaign obtained art, and
+/// whether the single re-campaign has already been spent. A properties event for
+/// the current art-less track triggers the re-campaign once; any further
+/// properties events are ignored until the track changes, so a chatty player
+/// cannot spin the backend.
+#[derive(Debug, Default, Clone)]
+pub struct ArtCampaignTracker {
+    /// The track key the most recent campaign ran for.
+    track: Option<String>,
+    /// Whether that campaign obtained usable art.
+    obtained: bool,
+    /// Whether the one allowed follow-up campaign for `track` has been spent.
+    recampaigned: bool,
+}
+
+impl ArtCampaignTracker {
+    /// A fresh tracker that has seen no campaign yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decide what campaign, if any, to run this evaluation.
+    ///
+    /// * `track_key` — the current winning track's key.
+    /// * `changed` — the track identity or winning app changed since the last
+    ///   emit (the existing "art needed" condition).
+    /// * `props_for_winner` — this evaluation was triggered by a
+    ///   `MediaPropertiesChanged` for the *winning* session (a bare play/pause,
+    ///   a `SessionsChanged`, or the safety-net re-check are all `false`).
+    #[must_use]
+    pub fn decide(&self, track_key: &str, changed: bool, props_for_winner: bool) -> ArtAction {
+        if changed {
+            return ArtAction::Fresh;
+        }
+        if props_for_winner
+            && self.track.as_deref() == Some(track_key)
+            && !self.obtained
+            && !self.recampaigned
+        {
+            return ArtAction::Recampaign;
+        }
+        ArtAction::Skip
+    }
+
+    /// Record that a campaign of `action` is about to start for `track_key`. A
+    /// [`ArtAction::Fresh`] resets all state for the new track; a
+    /// [`ArtAction::Recampaign`] spends the single follow-up; [`ArtAction::Skip`]
+    /// is a no-op.
+    pub fn begin(&mut self, track_key: &str, action: ArtAction) {
+        match action {
+            ArtAction::Fresh => {
+                self.track = Some(track_key.to_string());
+                self.obtained = false;
+                self.recampaigned = false;
+            }
+            ArtAction::Recampaign => {
+                self.recampaigned = true;
+            }
+            ArtAction::Skip => {}
+        }
+    }
+
+    /// Record the [`CampaignOutcome`] of the campaign started by [`begin`]. An
+    /// [`CampaignOutcome::Abandoned`] leaves the flags untouched: nothing was
+    /// concluded, so a follow-up is still allowed once things settle.
+    ///
+    /// [`begin`]: ArtCampaignTracker::begin
+    pub fn finish(&mut self, outcome: CampaignOutcome) {
+        match outcome {
+            CampaignOutcome::Emitted => self.obtained = true,
+            CampaignOutcome::GaveUp => self.obtained = false,
+            CampaignOutcome::Abandoned => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +504,93 @@ mod tests {
         assert!(!is_usable_artwork(&png(8))); // right magic, too small
         assert!(!is_usable_artwork(&vec![0u8; 1024])); // big enough, not an image
         assert!(is_usable_artwork(&png(256)));
+    }
+
+    #[test]
+    fn fetch_stage_labels_are_distinct_and_stable() {
+        let all = [
+            FetchStage::Props,
+            FetchStage::Thumbnail,
+            FetchStage::OpenRead,
+            FetchStage::Size,
+            FetchStage::CreateReader,
+            FetchStage::Load,
+            FetchStage::ReadBytes,
+        ];
+        // Every stage maps to a unique label (a probe reader must be able to
+        // tell the failing step apart).
+        let mut labels: Vec<&str> = all.iter().map(|s| s.label()).collect();
+        let count = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "stage labels must be unique");
+        // Spot-check the exact wording the probe log documents.
+        assert_eq!(FetchStage::OpenRead.label(), "open-read");
+        assert_eq!(FetchStage::ReadBytes.label(), "read-bytes");
+    }
+
+    #[test]
+    fn tracker_fresh_campaign_on_change() {
+        let t = ArtCampaignTracker::new();
+        // A track/app change always runs a fresh campaign, regardless of trigger.
+        assert_eq!(t.decide("a", true, false), ArtAction::Fresh);
+        assert_eq!(t.decide("a", true, true), ArtAction::Fresh);
+    }
+
+    #[test]
+    fn tracker_no_recampaign_without_a_properties_event() {
+        let mut t = ArtCampaignTracker::new();
+        t.begin("a", ArtAction::Fresh);
+        t.finish(CampaignOutcome::GaveUp);
+        // Same track, no art, but not a winner properties event (e.g. a bare
+        // play/pause, a safety-net re-check): stay put.
+        assert_eq!(t.decide("a", false, false), ArtAction::Skip);
+    }
+
+    #[test]
+    fn tracker_recampaigns_once_on_late_properties_event() {
+        let mut t = ArtCampaignTracker::new();
+        t.begin("a", ArtAction::Fresh);
+        t.finish(CampaignOutcome::GaveUp);
+        // The late thumbnail swap arrives as a winner properties event.
+        assert_eq!(t.decide("a", false, true), ArtAction::Recampaign);
+        t.begin("a", ArtAction::Recampaign);
+        t.finish(CampaignOutcome::GaveUp);
+        // The single follow-up is spent; further properties events do nothing.
+        assert_eq!(t.decide("a", false, true), ArtAction::Skip);
+    }
+
+    #[test]
+    fn tracker_no_recampaign_after_success() {
+        let mut t = ArtCampaignTracker::new();
+        t.begin("a", ArtAction::Fresh);
+        t.finish(CampaignOutcome::Emitted);
+        // Art already obtained: a later properties event is not a retry trigger.
+        assert_eq!(t.decide("a", false, true), ArtAction::Skip);
+    }
+
+    #[test]
+    fn tracker_recampaign_budget_resets_on_new_track() {
+        let mut t = ArtCampaignTracker::new();
+        t.begin("a", ArtAction::Fresh);
+        t.finish(CampaignOutcome::GaveUp);
+        t.begin("a", ArtAction::Recampaign);
+        t.finish(CampaignOutcome::GaveUp);
+        assert_eq!(t.decide("a", false, true), ArtAction::Skip);
+        // A new track gets its own fresh campaign and its own follow-up budget.
+        assert_eq!(t.decide("b", true, false), ArtAction::Fresh);
+        t.begin("b", ArtAction::Fresh);
+        t.finish(CampaignOutcome::GaveUp);
+        assert_eq!(t.decide("b", false, true), ArtAction::Recampaign);
+    }
+
+    #[test]
+    fn tracker_abandoned_keeps_follow_up_available() {
+        let mut t = ArtCampaignTracker::new();
+        t.begin("a", ArtAction::Fresh);
+        // Superseded before concluding — nothing decided about this track's art.
+        t.finish(CampaignOutcome::Abandoned);
+        // A properties event for the still-art-less track may still retry once.
+        assert_eq!(t.decide("a", false, true), ArtAction::Recampaign);
     }
 }
