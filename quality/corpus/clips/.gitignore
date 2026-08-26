@@ -1,5 +1,11 @@
-# Generated synthetic clips are regenerated on demand (manifest `generated =
-# true`) and hash-verified by `scia-harness corpus verify`, so they are not
-# committed. Real recorded genre clips (committed fixtures, `generated = false`)
-# are added explicitly by the maintainer and are not matched here.
-/synth-music.ndjson
+# Clip files are LOCAL artifacts, never committed. Synthetic clips are
+# regenerated on demand (`scia-harness corpus synth`); clips rendered offline
+# from downloaded source audio are re-rendered from their source. The committed
+# record is `../manifest.toml`: each entry's provenance (source_url +
+# audio_sha256 + segment + gain_db + render_cmd) plus the feature-clip `sha256`
+# is enough to reproduce the exact bytes and verify them
+# (`scia-harness corpus verify`).
+#
+# Ignore every clip file in this directory; keep only this .gitignore.
+*
+!.gitignore

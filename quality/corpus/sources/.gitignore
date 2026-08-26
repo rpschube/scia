@@ -1,0 +1,10 @@
+# Downloaded source audio (the freely-licensed files a rendered clip is cut
+# from) are LOCAL artifacts, never committed — they can be large and are
+# re-fetched from their `source_url`. The committed record is
+# `../manifest.toml`: each entry's provenance (source_url + audio_sha256 +
+# segment + gain_db + render_cmd) identifies the exact source file and how the
+# clip was reproduced.
+#
+# Ignore every source file in this directory; keep only this .gitignore.
+*
+!.gitignore

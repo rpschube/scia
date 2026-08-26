@@ -119,6 +119,7 @@ fn corpus_verify_passes_for_a_committed_fixture() {
         sha256: sha,
         notes: "e2e fixture".to_string(),
         generated: false,
+        ..ClipEntry::default()
     });
     manifest.save(&corpus_root.join("manifest.toml")).unwrap();
 
