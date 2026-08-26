@@ -13,10 +13,13 @@ fn tide() -> Box<dyn Scene> {
     create_builtin("tide").expect("tide exists")
 }
 
-/// A snapshot with a given loudness and low band; nothing else is set.
-fn snap(rms: f32, bass: f32) -> FeatureSnapshot {
+/// A snapshot with a given loudness and low band; nothing else is set. The
+/// first argument is the engine-normalized `loudness` the scene drives from
+/// (mirrored into `rms` so the snapshot stays internally plausible).
+fn snap(loudness: f32, bass: f32) -> FeatureSnapshot {
     let mut f = FeatureSnapshot {
-        rms,
+        rms: loudness,
+        loudness,
         ..FeatureSnapshot::default()
     };
     f.bands = [bass, 1.0, 1.0];

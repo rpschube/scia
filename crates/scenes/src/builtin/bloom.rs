@@ -282,9 +282,10 @@ impl Scene for Bloom {
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
 
         // Loudness follower eases the overall radius; the mid follower drives the
-        // petal breath. Bands are normalized to 1.0 = recent average, so halve to
-        // land the average near the middle of the 0..1 breath range.
-        let loud = f.rms.clamp(0.0, 1.0);
+        // petal breath. Reads the engine-normalized loudness (0..1), not the raw
+        // rms. Bands are normalized to 1.0 = recent average, so halve to land the
+        // average near the middle of the 0..1 breath range.
+        let loud = f.loudness.clamp(0.0, 1.0);
         self.loud_env += (loud - self.loud_env) * (1.0 - decay(dt, LOUD_TAU));
         let mid = (f.bands[1] * 0.5).clamp(0.0, 1.0);
         self.mid_env += (mid - self.mid_env) * (1.0 - decay(dt, MID_TAU));
@@ -444,10 +445,12 @@ mod tests {
         s
     }
 
-    /// An active snapshot with loudness, a mid level and an optional onset.
-    fn snap(rms: f32, mid: f32, onset: bool) -> FeatureSnapshot {
+    /// An active snapshot with loudness, a mid level and an optional onset. The
+    /// first argument is the engine-normalized `loudness` the scene drives from.
+    fn snap(loudness: f32, mid: f32, onset: bool) -> FeatureSnapshot {
         let mut f = FeatureSnapshot {
-            rms,
+            rms: loudness,
+            loudness,
             onset,
             onset_age_ms: if onset { 0.0 } else { 60_000.0 },
             activity: Activity::Active,

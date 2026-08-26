@@ -280,9 +280,9 @@ impl Scene for Phosphor {
         self.a_cur += (a_target - self.a_cur) * ke;
         self.b_cur += (b_target - self.b_cur) * ke;
 
-        // Loudness follower: momentary LUFS is reserved (0) in schema 1, so ride
-        // the base amplitude on the mono RMS, smoothed toward its target.
-        let loud = f.rms.clamp(0.0, 1.0);
+        // Loudness follower: ride the base amplitude on the engine-normalized
+        // loudness (0..1), not the raw rms, smoothed toward its target.
+        let loud = f.loudness.clamp(0.0, 1.0);
         let kl = 1.0 - decay(dt, LOUD_TAU);
         self.loud_env += (loud - self.loud_env) * kl;
 
@@ -459,9 +459,12 @@ mod tests {
     use crate::canvas::Primitive;
     use scia_core::{Activity, FeatureSnapshot};
 
-    fn snap(rms: f32, onset: bool, onset_age_ms: f32) -> FeatureSnapshot {
+    /// The first argument is the engine-normalized `loudness` the scene drives
+    /// from (mirrored into `rms` so the snapshot stays plausible).
+    fn snap(loudness: f32, onset: bool, onset_age_ms: f32) -> FeatureSnapshot {
         FeatureSnapshot {
-            rms,
+            rms: loudness,
+            loudness,
             onset,
             onset_age_ms,
             ..FeatureSnapshot::default()

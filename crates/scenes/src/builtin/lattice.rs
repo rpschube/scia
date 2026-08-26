@@ -274,9 +274,9 @@ impl Scene for Lattice {
     }
 
     fn update(&mut self, f: &scia_core::FeatureSnapshot, dt: f32) {
-        // Loudness glow: momentary LUFS is reserved (0) in schema 1, so drive
-        // the base glow from the mono RMS, smoothed toward its target.
-        let loud = f.rms.clamp(0.0, 1.0);
+        // Loudness glow: drive the base glow from the engine-normalized loudness
+        // (0..1), not the raw rms, smoothed toward its target.
+        let loud = f.loudness.clamp(0.0, 1.0);
         let k = 1.0 - decay(dt, LOUD_TAU);
         self.loud_env += (loud - self.loud_env) * k;
 
@@ -422,12 +422,15 @@ mod tests {
     use crate::canvas::Primitive;
     use scia_core::FeatureSnapshot;
 
-    /// A snapshot carrying an onset flag, an `onset_age_ms`, an rms and a bass band.
-    fn snap(onset: bool, onset_age_ms: f32, rms: f32, bass: f32) -> FeatureSnapshot {
+    /// A snapshot carrying an onset flag, an `onset_age_ms`, a loudness and a bass
+    /// band. The `loudness` argument is the engine-normalized level the scene
+    /// drives from (mirrored into `rms` so the snapshot stays plausible).
+    fn snap(onset: bool, onset_age_ms: f32, loudness: f32, bass: f32) -> FeatureSnapshot {
         let mut f = FeatureSnapshot {
             onset,
             onset_age_ms,
-            rms,
+            rms: loudness,
+            loudness,
             ..FeatureSnapshot::default()
         };
         f.bands = [bass, 1.0, 1.0];

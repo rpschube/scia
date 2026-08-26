@@ -16,6 +16,57 @@ use crate::features::{Activity, FEATURE_SCHEMA_VERSION, FeatureSnapshot};
 use crate::onset::{OnsetConfig, OnsetDetector};
 use crate::spectrum::{SpectrumAnalyzer, SpectrumConfig};
 
+// ---------------------------------------------------------------------------
+// Loudness normalizer
+// ---------------------------------------------------------------------------
+//
+// `FeatureSnapshot::rms` is the raw hop level; real program material runs only
+// ~0.03..=0.15, so a scene that reads it as if it were a 0..1 loudness barely
+// responds. `loudness` fixes that once, on the DSP thread, for every consumer:
+// the raw rms divided by a slow auto-reference that calibrates to the material's
+// own loud passages, so the value is independent of the listener's absolute
+// level. The reference is a peak-follower — a fast attack so a sustained passage
+// lifts it within about a second, a very slow release so it remembers the
+// loudest recent passage — floored so silence and noise can never divide the
+// ratio up toward one. The whole computation is a compare, two fused
+// multiply-adds and a divide per hop (the follow coefficients are precomputed
+// from the fixed hop period), so it stays allocation-free and branch-light on
+// the hot path.
+
+/// Loudness-reference attack time constant (seconds): a sustained passage lifts
+/// the reference toward the current rms within about a second, so a single loud
+/// hop only nudges it and a stray transient cannot latch the calibration high.
+const LOUD_REF_ATTACK_TAU: f32 = 0.5;
+/// Loudness-reference release time constant (seconds): the reference decays back
+/// toward the floor very slowly, so it remembers the loudest recent passage and a
+/// quiet stretch reads genuinely quiet for many seconds before the scale
+/// recalibrates down.
+const LOUD_REF_RELEASE_TAU: f32 = 20.0;
+/// Floor under the loudness reference. It bounds the normalizing divisor so
+/// genuine silence and low-level noise stay near `0.0` instead of dividing up
+/// toward `1.0`, and it sits below any real musical level so quiet-mastered
+/// material still calibrates to its own loud passages.
+const LOUD_REF_MIN: f32 = 0.01;
+/// Headroom applied to the reference before the divide: `loudness = rms / (ref ×
+/// HEADROOM)`. A value above one keeps sustained program material comfortably
+/// below full scale (around `1/1.2 ≈ 0.83` when the reference has settled to the
+/// program level) while leaving room for true peaks above the running reference
+/// to approach `1.0`.
+const LOUD_HEADROOM: f32 = 1.2;
+
+/// The per-step follower fraction `1 - exp(-dt / tau)` toward a target over `dt`
+/// seconds with time constant `tau`. Precomputed once per format for the loudness
+/// reference so the hot path carries no `exp`. A non-positive `tau` (or
+/// non-finite `dt`) snaps straight to the target.
+#[inline]
+fn follow_fraction(dt: f32, tau: f32) -> f32 {
+    if tau > 0.0 && dt.is_finite() {
+        1.0 - (-dt / tau).exp()
+    } else {
+        1.0
+    }
+}
+
 /// Tuning for the DSP thread.
 #[derive(Clone, Copy, Debug)]
 pub struct DspConfig {
@@ -122,6 +173,14 @@ pub struct HopProcessor {
     tempo_bpm: f32,
     beat_phase: f32,
     beat_confidence: f32,
+    /// Slow auto-reference the raw rms is normalized against to produce
+    /// `FeatureSnapshot::loudness`. A peak-follower over rms; see the normalizer
+    /// notes at the top of this module.
+    loud_ref: f32,
+    /// Precomputed attack fraction for `loud_ref` at this format's hop period.
+    loud_attack_coeff: f32,
+    /// Precomputed release fraction for `loud_ref` at this format's hop period.
+    loud_release_coeff: f32,
     // The configs the analyzer/bands/onset were built from, kept so a
     // sample-rate/channel change ([`reformat`](HopProcessor::reformat)) can
     // rebuild them exactly as the constructor did.
@@ -183,11 +242,12 @@ impl HopProcessor {
         let band_splitter = BandSplitter::new(bands, sample_rate, fft_main, fft_bass);
         let onset_detector = OnsetDetector::new(onset, sample_rate, fft_main);
         let beat_tracker = BeatTracker::new(sample_rate, hop_frames);
+        let dt_seconds = hop_frames as f32 / sample_rate.max(1) as f32;
         Self {
             hop_frames,
             channels,
             generation: 0,
-            dt_seconds: hop_frames as f32 / sample_rate.max(1) as f32,
+            dt_seconds,
             interleaved: vec![0.0; hop_frames * channels],
             mono: vec![0.0; hop_frames],
             left: vec![0.0; hop_frames],
@@ -206,6 +266,9 @@ impl HopProcessor {
             tempo_bpm: 0.0,
             beat_phase: 0.0,
             beat_confidence: 0.0,
+            loud_ref: LOUD_REF_MIN,
+            loud_attack_coeff: follow_fraction(dt_seconds, LOUD_REF_ATTACK_TAU),
+            loud_release_coeff: follow_fraction(dt_seconds, LOUD_REF_RELEASE_TAU),
             spectrum_config: spectrum,
             bands_config: bands,
             onset_config: onset,
@@ -253,6 +316,12 @@ impl HopProcessor {
         self.tempo_bpm = 0.0;
         self.beat_phase = 0.0;
         self.beat_confidence = 0.0;
+        // A reopen is a level discontinuity (a device may deliver at a very
+        // different gain), so recalibrate the loudness reference from the floor
+        // and recompute the follow coefficients for the new hop period.
+        self.loud_ref = LOUD_REF_MIN;
+        self.loud_attack_coeff = follow_fraction(self.dt_seconds, LOUD_REF_ATTACK_TAU);
+        self.loud_release_coeff = follow_fraction(self.dt_seconds, LOUD_REF_RELEASE_TAU);
         // `generation` deliberately preserved: the grid keeps climbing.
     }
 
@@ -301,13 +370,20 @@ impl HopProcessor {
         }
 
         let (rms, peak) = self.deinterleave_rms_peak();
+        let loudness = self.update_loudness(rms);
 
         self.analyzer
             .process_hop(&self.mono, self.dt_seconds, &mut self.spectrum_out);
         self.run_bands_and_onset();
 
         self.generation += 1;
-        Some(self.snapshot(format, timestamp_ns, dropped_frames, false, rms, peak))
+        Some(self.snapshot(
+            format,
+            timestamp_ns,
+            dropped_frames,
+            false,
+            (rms, peak, loudness),
+        ))
     }
 
     /// Deinterleave `self.interleaved` into the mono/left/right scratch buffers
@@ -419,8 +495,15 @@ impl HopProcessor {
         // their averages relax and the onset-age clock keeps advancing while
         // capture is stalled.
         self.run_bands_and_onset();
+        let loudness = self.update_loudness(0.0);
         self.generation += 1;
-        self.snapshot(format, timestamp_ns, dropped_frames, true, 0.0, 0.0)
+        self.snapshot(
+            format,
+            timestamp_ns,
+            dropped_frames,
+            true,
+            (0.0, 0.0, loudness),
+        )
     }
 
     /// Advance every cached feature by one hop of silence on the **cheap** path:
@@ -463,6 +546,7 @@ impl HopProcessor {
         }
 
         let (rms, peak) = self.deinterleave_rms_peak();
+        let loudness = self.update_loudness(rms);
         self.generation += 1;
         if rms >= resume_rms {
             // Resume: the cheap path cannot reconstruct a live spectrum, so run
@@ -473,7 +557,13 @@ impl HopProcessor {
         } else {
             self.relax_features();
         }
-        Some(self.snapshot(format, timestamp_ns, dropped_frames, false, rms, peak))
+        Some(self.snapshot(
+            format,
+            timestamp_ns,
+            dropped_frames,
+            false,
+            (rms, peak, loudness),
+        ))
     }
 
     /// Idle-path counterpart to
@@ -487,19 +577,47 @@ impl HopProcessor {
         dropped_frames: u64,
     ) -> FeatureSnapshot {
         self.relax_features();
+        let loudness = self.update_loudness(0.0);
         self.generation += 1;
-        self.snapshot(format, timestamp_ns, dropped_frames, true, 0.0, 0.0)
+        self.snapshot(
+            format,
+            timestamp_ns,
+            dropped_frames,
+            true,
+            (0.0, 0.0, loudness),
+        )
     }
 
+    /// Advance the slow loudness reference by one hop of `rms` and return the
+    /// normalized loudness in `0.0..=1.0`. The reference peak-follows `rms` (fast
+    /// attack, very slow release toward the floor), and the loudness is
+    /// `rms / (ref × HEADROOM)` clamped to `0.0..=1.0`. Called once per hop on
+    /// every publish path. Allocation-free and branch-light — the follow
+    /// coefficients were precomputed for this format's hop period.
+    fn update_loudness(&mut self, rms: f32) -> f32 {
+        let (target, coeff) = if rms > self.loud_ref {
+            (rms, self.loud_attack_coeff)
+        } else {
+            (LOUD_REF_MIN, self.loud_release_coeff)
+        };
+        self.loud_ref += (target - self.loud_ref) * coeff;
+        if self.loud_ref < LOUD_REF_MIN {
+            self.loud_ref = LOUD_REF_MIN;
+        }
+        (rms / (self.loud_ref * LOUD_HEADROOM)).clamp(0.0, 1.0)
+    }
+
+    /// Build a snapshot. `levels` is the hop's `(rms, peak, loudness)` — grouped
+    /// so the hot-path stamp stays under the argument-count lint.
     fn snapshot(
         &self,
         format: StreamFormat,
         timestamp_ns: u64,
         dropped_frames: u64,
         starved: bool,
-        rms: f32,
-        peak: f32,
+        levels: (f32, f32, f32),
     ) -> FeatureSnapshot {
+        let (rms, peak, loudness) = levels;
         let mut snapshot = FeatureSnapshot {
             schema_version: FEATURE_SCHEMA_VERSION,
             generation: self.generation,
@@ -510,6 +628,7 @@ impl HopProcessor {
             dropped_frames,
             rms,
             peak,
+            loudness,
             ..FeatureSnapshot::default()
         };
         let bars = self.analyzer.bars();
@@ -1270,6 +1389,120 @@ mod tests {
             map.hop_stamp(HOP, NPF, 50_000_000),
             50_000_000,
             "stamp must never exceed now"
+        );
+    }
+
+    // -- loudness normalizer -----------------------------------------------
+
+    /// Hops per second at the fixture 48 kHz / 256-hop grid.
+    const HOPS_PER_S: usize = 48_000 / 256; // ≈187
+
+    /// A default mono processor at 48 kHz, the grid the normalizer's coefficients
+    /// are computed for.
+    fn loud_processor() -> HopProcessor {
+        HopProcessor::new(256, 1, 48_000)
+    }
+
+    /// Silence reads as zero loudness, and a sustained near-silence level well
+    /// below the reference floor is never amplified toward full scale — the floor
+    /// bounds the divisor. Without the floor the reference would decay toward zero
+    /// and divide a whisper up to `1.0`.
+    #[test]
+    fn loudness_quiet_and_floor_prevent_amplification() {
+        let mut p = loud_processor();
+        // Pure silence: exactly zero, hop after hop.
+        for _ in 0..4 * HOPS_PER_S {
+            assert_eq!(p.update_loudness(0.0), 0.0, "silence is zero loudness");
+        }
+        // A sustained level far below the floor (rms 0.005, floor 0.01): the
+        // reference cannot drop below the floor, so loudness stays well short of
+        // the ~0.83 a floorless normalizer would settle any sustained level to.
+        let mut last = 0.0;
+        for _ in 0..4 * HOPS_PER_S {
+            last = p.update_loudness(0.005);
+        }
+        assert!(
+            last < 0.5,
+            "near-silence must not be amplified toward full scale, got {last}"
+        );
+    }
+
+    /// A step from quiet to a sustained loud level: loudness jumps toward `1.0`
+    /// immediately (the reference lags), then converges toward the headroom target
+    /// `1/HEADROOM ≈ 0.83` as the reference catches up within a couple of attack
+    /// time constants.
+    #[test]
+    fn loudness_step_converges_to_headroom_target() {
+        let mut p = loud_processor();
+        let r = 0.4;
+
+        // The very first loud hop, with the reference still at the floor, reads
+        // essentially full scale.
+        let first = p.update_loudness(r);
+        assert!(
+            first > 0.95,
+            "the leading edge of a step reads hot, got {first}"
+        );
+
+        // After ~2× the attack constant (1 s) the reference has largely caught up
+        // and the value has descended toward the headroom target.
+        let mut v = first;
+        for _ in 0..HOPS_PER_S {
+            // ≈1 s of hops = ~2× the 0.5 s attack constant
+            v = p.update_loudness(r);
+        }
+        assert!(
+            (0.70..=0.98).contains(&v),
+            "within ~2× attack the value should approach the headroom target, got {v}"
+        );
+
+        // Fully settled, it sits at the headroom target regardless of the level.
+        for _ in 0..20 * HOPS_PER_S {
+            v = p.update_loudness(r);
+        }
+        let target = 1.0 / LOUD_HEADROOM;
+        assert!(
+            (v - target).abs() < 0.03,
+            "settled loudness {v} should sit at the headroom target {target}"
+        );
+    }
+
+    /// Scale invariance — the whole point. The SAME music-like envelope at ×1 and
+    /// ×0.1 absolute scale produces near-identical loudness trajectories once the
+    /// reference has settled, because the reference tracks each stream's own loud
+    /// passages. The envelope keeps regular peaks (a beat grid) so the fast attack
+    /// keeps the reference pinned near the peak in both streams.
+    #[test]
+    fn loudness_is_scale_invariant() {
+        let mut loud = loud_processor();
+        let mut quiet = loud_processor();
+
+        // A repeating one-second bar of eight "beats", each a decaying pluck: a
+        // regular peak structure like real program material.
+        let envelope = |hop: usize| -> f32 {
+            let per_beat = HOPS_PER_S / 8;
+            let phase = (hop % per_beat) as f32 / per_beat as f32;
+            0.2 + 0.7 * (-3.0 * phase).exp()
+        };
+
+        // Warm up so both references settle to their own scale.
+        for hop in 0..6 * HOPS_PER_S {
+            let e = envelope(hop);
+            loud.update_loudness(e);
+            quiet.update_loudness(e * 0.1);
+        }
+
+        // Then compare the trajectories over two more seconds.
+        let mut worst = 0.0f32;
+        for hop in (6 * HOPS_PER_S)..(8 * HOPS_PER_S) {
+            let e = envelope(hop);
+            let a = loud.update_loudness(e);
+            let b = quiet.update_loudness(e * 0.1);
+            worst = worst.max((a - b).abs());
+        }
+        assert!(
+            worst < 0.05,
+            "a ×1 and a ×0.1 copy of one envelope should track within 0.05, worst {worst}"
         );
     }
 

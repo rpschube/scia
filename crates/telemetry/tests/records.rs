@@ -24,6 +24,7 @@ fn every_record_kind_round_trips_through_jsonl() {
         Record::Hop(Hop {
             t_ms: 0.0,
             rms: 0.1,
+            loudness: None,
             bands: vec![1.0, 0.5, 0.2],
             onset: 0.0,
             beat_conf: None,
@@ -33,6 +34,7 @@ fn every_record_kind_round_trips_through_jsonl() {
         Record::Hop(Hop {
             t_ms: 5.333_333,
             rms: 0.42,
+            loudness: Some(0.68),
             bands: vec![1.2, 0.9, 0.3],
             onset: 0.6,
             beat_conf: Some(0.77),
@@ -89,6 +91,7 @@ fn buffer_does_not_grow_across_many_same_shape_records() {
     let mut hop = Hop {
         t_ms: 0.0,
         rms: 0.3,
+        loudness: Some(0.3),
         bands: vec![1.0, 0.5, 0.25],
         onset: 0.2,
         beat_conf: Some(0.5),

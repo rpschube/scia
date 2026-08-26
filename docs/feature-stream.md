@@ -131,7 +131,13 @@ calibration sessions.
 ## Frame schema
 
 Every frame carries the fields below. Names are stable within a schema version.
-The current schema version is **1**.
+The current schema version is **2**.
+
+> **Schema 2 added `loudness`.** A clip recorded under schema 1 (before the
+> `loudness` field) is rejected by a schema-2 build with a clear
+> `UnsupportedSchema` error rather than mis-parsed, so pre-bump recorded clips
+> must be re-rendered from source (the corpus is regenerable by design; see
+> [Offline render](#offline-render-from-a-file)).
 
 | field                | type       | meaning |
 | -------------------- | ---------- | ------- |
@@ -146,7 +152,8 @@ The current schema version is **1**.
 | `dropped_frames`     | u64        | Cumulative frames dropped to ring overflow, as of this hop. |
 | `rms`                | f32        | RMS level of the hop over the mono mix (`0.0..=1.0` for in-range audio). |
 | `peak`               | f32        | Peak absolute sample over the hop (`0.0..=1.0` for in-range audio). |
-| `lufs_momentary`     | f32        | Momentary loudness (LUFS). Reserved, `0` in schema 1. |
+| `loudness`           | f32        | Engine-normalized loudness in `0.0..=1.0`: the hop `rms` divided by a slow auto-reference, so it is independent of the listener's absolute level (sustained program sits ~`0.6..=0.85`, true peaks approach `1.0`, silence stays near `0.0`). The level driver renderers should read, not the raw `rms`. New in schema 2. |
+| `lufs_momentary`     | f32        | Momentary loudness (LUFS). Reserved, `0` in the current schema. |
 | `spectrum`           | f32 array  | Display spectrum: the valid log-spaced bars in `0.0..=1.0`. Its length is the analyzer's bar count (never more than 256). |
 | `bands`              | f32[3]     | Bass / mid / treble levels, each normalized to its own recent average (`1.0` = average, clamped `0.0..=4.0`). |
 | `flux`               | f32        | Half-wave-rectified spectral flux, normalized (`0.0..=1.0`). |
@@ -159,9 +166,11 @@ The current schema version is **1**.
 | `mid_side_ratio`     | f32        | Mid/side energy ratio. Reserved, `0` in schema 1. |
 | `chroma`             | f32[12]    | 12-bin chroma vector. Reserved (all `0`) in schema 1. |
 
-"Reserved" fields are present and part of the layout but always zero in schema
-1; they are filled by later analysis without a schema bump (adding a value to a
-field that was documented as reserved is not a breaking change).
+"Reserved" fields are present and part of the layout but always zero in the
+current schema; they are filled by later analysis without a schema bump (adding a
+value to a field that was documented as reserved is not a breaking change).
+`loudness`, by contrast, was a *new* field rather than a reserved one, so adding
+it bumped the schema from 1 to 2.
 
 ## Framing
 
@@ -176,7 +185,7 @@ carries its own `schema`, so a consumer can validate each line independently.
 Example line (spectrum truncated for readability):
 
 ```json
-{"schema":1,"generation":3,"timestamp_ns":1000000,"sample_rate":48000,"channels":2,"starved":false,"activity":"active","quiet_ms":0.0,"dropped_frames":0,"rms":0.5,"peak":0.8,"lufs_momentary":0.0,"spectrum":[0.0,0.25,0.5,1.0],"bands":[1.0,0.5,0.25],"flux":0.1,"onset":false,"onset_age_ms":0.0,"beat_phase":0.0,"beat_confidence":0.9,"tempo_bpm":120.0,"stereo_correlation":0.0,"mid_side_ratio":0.0,"chroma":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}
+{"schema":2,"generation":3,"timestamp_ns":1000000,"sample_rate":48000,"channels":2,"starved":false,"activity":"active","quiet_ms":0.0,"dropped_frames":0,"rms":0.5,"peak":0.8,"loudness":0.0,"lufs_momentary":0.0,"spectrum":[0.0,0.25,0.5,1.0],"bands":[1.0,0.5,0.25],"flux":0.1,"onset":false,"onset_age_ms":0.0,"beat_phase":0.0,"beat_confidence":0.9,"tempo_bpm":120.0,"stereo_correlation":0.0,"mid_side_ratio":0.0,"chroma":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}
 ```
 
 ### Binary
@@ -194,7 +203,7 @@ frame  = length(u32)  payload(length bytes)
   with `{`, never `S`).
 - **`schema`** — the stream's schema version as a `u16`. Validated once, at the
   header; a reader rejects a version it does not speak before reading any frame.
-- **`reserved`** — a `u16`, zero in schema 1.
+- **`reserved`** — a `u16`, zero in the current schema.
 - **`length`** — the byte length of the following payload, as a little-endian
   `u32`. A reader that hits end-of-stream exactly on a frame boundary stops
   cleanly; a short read mid-frame is an error.
@@ -204,8 +213,9 @@ The payload is the frame fields in the table's order, each little-endian:
 ```text
 schema u32 · generation u64 · timestamp_ns u64 · sample_rate u32 ·
 channels u16 · starved u8 · activity u8 (0 active, 1 quiet, 2 idle) ·
-quiet_ms f32 · dropped_frames u64 · rms f32 · peak f32 · lufs_momentary f32 ·
-spectrum_len u16 · spectrum (spectrum_len × f32) · bands (3 × f32) · flux f32 ·
+quiet_ms f32 · dropped_frames u64 · rms f32 · peak f32 · loudness f32 ·
+lufs_momentary f32 · spectrum_len u16 · spectrum (spectrum_len × f32) ·
+bands (3 × f32) · flux f32 ·
 onset u8 · onset_age_ms f32 · beat_phase f32 · beat_confidence f32 ·
 tempo_bpm f32 · stereo_correlation f32 · mid_side_ratio f32 · chroma (12 × f32)
 ```

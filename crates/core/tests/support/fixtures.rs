@@ -210,6 +210,7 @@ pub struct HopData {
     pub generation: u64,
     pub rms: f32,
     pub peak: f32,
+    pub loudness: f32,
     pub spectrum: Vec<f32>,
     pub bands: [f32; 3],
     pub flux: f32,
@@ -252,6 +253,7 @@ impl WavFixture {
                     generation: snap.generation,
                     rms: snap.rms,
                     peak: snap.peak,
+                    loudness: snap.loudness,
                     spectrum: snap.spectrum[..len].to_vec(),
                     bands: snap.bands,
                     flux: snap.flux,
@@ -278,6 +280,7 @@ pub struct SamplePoint {
     pub hop_gen: u64,
     pub rms: f64,
     pub peak: f64,
+    pub loudness: f64,
     pub spectrum: Vec<f64>,
     pub bands: [f64; 3],
     pub flux: f64,
@@ -333,6 +336,7 @@ pub fn compute_golden(name: &str) -> Golden {
                 hop_gen: h.generation,
                 rms: round6(h.rms),
                 peak: round6(h.peak),
+                loudness: round6(h.loudness),
                 spectrum: h.spectrum.iter().map(|&v| round6(v)).collect(),
                 bands: [round6(h.bands[0]), round6(h.bands[1]), round6(h.bands[2])],
                 flux: round6(h.flux),
@@ -385,6 +389,8 @@ const ABS_SPECTRUM: f64 = 0.02;
 const ABS_BANDS: f64 = 0.05;
 /// Absolute tolerance on normalized flux.
 const ABS_FLUX: f64 = 0.05;
+/// Absolute tolerance on normalized loudness (`0..=1`, same band as flux).
+const ABS_LOUDNESS: f64 = 0.02;
 /// Absolute tolerance on the onset-age clock (one hop at 48 kHz ≈ 5.33 ms).
 const ABS_ONSET_AGE_MS: f64 = 6.0;
 
@@ -430,6 +436,7 @@ pub fn compare(expected: &Golden, actual: &Golden) -> Vec<Mismatch> {
 
         check("rms", e.rms, a.rms, level_tol(e.rms));
         check("peak", e.peak, a.peak, level_tol(e.peak));
+        check("loudness", e.loudness, a.loudness, ABS_LOUDNESS);
         check("flux", e.flux, a.flux, ABS_FLUX);
         check(
             "onset_age_ms",

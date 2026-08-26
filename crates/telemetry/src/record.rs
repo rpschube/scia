@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! {"rec":"run_start","schema":1,"scene":"…","preset":"…"|null,"params":{…},"source":"…","hop_ms":…}
-//! {"rec":"hop","t_ms":…,"rms":…,"bands":[…],"onset":…,"beat_conf":…|null,"bpm":…|null,"canvas":{…}|null}
+//! {"rec":"hop","t_ms":…,"rms":…,"loudness":…?,"bands":[…],"onset":…,"beat_conf":…|null,"bpm":…|null,"canvas":{…}|null}
 //! {"rec":"event","t_ms":…,"kind":"…","detail":{…}}
 //! {"rec":"run_end","t_ms":…,"hops":…}
 //! ```
@@ -74,6 +74,11 @@ pub struct Hop {
     pub t_ms: f64,
     /// Hop RMS level.
     pub rms: f32,
+    /// Engine-normalized loudness in `0.0..=1.0` (rms against a slow
+    /// auto-reference), or `None` when the source did not supply it. Optional and
+    /// defaulted so an older record without the field still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loudness: Option<f32>,
     /// Per-band levels (three in schema 1).
     pub bands: Vec<f32>,
     /// Continuous onset strength for the hop (normalized spectral flux).
@@ -275,6 +280,7 @@ mod tests {
         Hop {
             t_ms: 12.5,
             rms: 0.25,
+            loudness: Some(0.7),
             bands: vec![1.0, 0.5, 0.25],
             onset: 0.3,
             beat_conf: Some(0.8),
@@ -332,5 +338,39 @@ mod tests {
         assert!(v["beat_conf"].is_null());
         assert!(v["bpm"].is_null());
         assert!(v["canvas"].is_null());
+    }
+
+    #[test]
+    fn loudness_is_omitted_when_absent_and_present_when_set() {
+        // Absent: the optional field is skipped entirely, so an older reader (and
+        // an older record) is unaffected.
+        let hop = Hop {
+            loudness: None,
+            ..sample_hop()
+        };
+        let mut w = RecordWriter::new(Vec::new());
+        w.hop(&hop).unwrap();
+        let line = String::from_utf8(w.into_inner()).unwrap();
+        assert!(
+            !line.contains("loudness"),
+            "absent loudness must not appear in the line: {line}"
+        );
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(v["loudness"].is_null());
+
+        // Present: it serializes and round-trips through the tagged enum.
+        let hop = Hop {
+            loudness: Some(0.72),
+            ..sample_hop()
+        };
+        let mut w = RecordWriter::new(Vec::new());
+        w.hop(&hop).unwrap();
+        let line = String::from_utf8(w.into_inner()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert!((v["loudness"].as_f64().unwrap() - 0.72).abs() < 1e-6);
+        match Record::from_line(line.trim()).unwrap() {
+            Record::Hop(h) => assert_eq!(h.loudness, Some(0.72)),
+            other => panic!("expected a hop, got {other:?}"),
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! The built-in `aurora` scene: field validity, the loudness-driven band, the
-//! level-independent normalizer, the no-jitter guarantee, drift continuity and
-//! continuity across a hot reload.
+//! visible loud/quiet swing, the no-jitter guarantee, drift continuity and
+//! continuity across a hot reload. (Level-independence of the response is now a
+//! property of the engine's loudness normalizer, tested in `scia-core`.)
 
 use scia_core::FeatureSnapshot;
 use scia_scenes::{Canvas, Primitive, Scene, SceneCtx, create_builtin};
@@ -13,10 +14,13 @@ fn aurora() -> Box<dyn Scene> {
     create_builtin("aurora").expect("aurora exists")
 }
 
-/// A snapshot with a given loudness and onset flag; nothing else is set.
-fn snap(rms: f32, onset: bool) -> FeatureSnapshot {
+/// A snapshot with a given loudness and onset flag; nothing else is set. The
+/// first argument is the engine-normalized `loudness` the scene drives from
+/// (mirrored into `rms` so the snapshot stays internally plausible).
+fn snap(loudness: f32, onset: bool) -> FeatureSnapshot {
     FeatureSnapshot {
-        rms,
+        rms: loudness,
+        loudness,
         onset,
         ..FeatureSnapshot::default()
     }
@@ -122,42 +126,10 @@ fn aurora_loudness_widens_the_band() {
     );
 }
 
-#[test]
-fn aurora_response_is_level_independent() {
-    // The adaptive loudness ceiling calibrates to each material's own loud
-    // passages, so two *sustained* signals at very different absolute levels — a
-    // quiet-mastered 0.08 and a loud 0.30 — both drive the normalized loudness to
-    // ~1.0 and must settle to essentially the same band width. This is the whole
-    // point of the normalizer: response independent of mastering level.
-    let frames = 300;
-    let dt = 0.05;
-
-    let mut quiet = aurora();
-    quiet.init(&SceneCtx::default());
-    let quiet_field = settle_and_render(quiet.as_mut(), 0.08, frames, dt);
-
-    let mut loud = aurora();
-    loud.init(&SceneCtx::default());
-    let loud_field = settle_and_render(loud.as_mut(), 0.30, frames, dt);
-
-    let quiet_extent = band_extent(&quiet_field);
-    let loud_extent = band_extent(&loud_field);
-
-    // They converge: settled widths differ by at most a row. (Measured: both
-    // settle to 54 rows — the band fills the field at normalized loudness ~1.)
-    let delta = (quiet_extent as i32 - loud_extent as i32).abs();
-    assert!(
-        delta <= 1,
-        "level-independent response: quiet-mastered ({quiet_extent}) and loud \
-         ({loud_extent}) settled band widths should converge, differ by {delta}"
-    );
-    // ...and both are genuinely widened, not converging on the narrow floor.
-    assert!(
-        quiet_extent >= 40 && loud_extent >= 40,
-        "both sustained levels should widen the band well past the quiet floor: \
-         quiet {quiet_extent}, loud {loud_extent}"
-    );
-}
+// Note: the level-independence of the response is now guaranteed by the engine's
+// loudness normalizer (see `loudness_is_scale_invariant` in `scia-core`'s DSP
+// tests) rather than by a per-scene ceiling, so the former
+// `aurora_response_is_level_independent` test moved there with the normalizer.
 
 #[test]
 fn aurora_loud_quiet_band_ratio_is_visible() {
@@ -173,12 +145,12 @@ fn aurora_loud_quiet_band_ratio_is_visible() {
 
     let mut loud = aurora();
     loud.init(&SceneCtx::default());
-    let loud_field = settle_and_render(loud.as_mut(), 0.30, frames, dt);
+    // A representative loud passage sits high on the normalized loudness scale.
+    let loud_field = settle_and_render(loud.as_mut(), 0.85, frames, dt);
 
     let quiet_extent = band_extent(&quiet_field);
     let loud_extent = band_extent(&loud_field);
 
-    // Measured: quiet floor ~18 rows, settled loud ~54 rows (ratio ~3x).
     assert!(
         quiet_extent > 0,
         "the quiet floor should still light a band, got {quiet_extent}"
@@ -253,16 +225,16 @@ fn aurora_state_round_trip() {
         a.update(&warm, dt);
     }
     let state = a.state();
-    // The loudness ceiling is part of the calibration that must survive a hot
-    // reload: after sustaining rms 0.6 it has climbed to roughly that level, and
-    // the round-trip below only reproduces the next render if `next` (rms 0.2,
-    // below the ceiling) reads the same normalized loudness on both scenes.
-    let ceil = state
-        .get("ceil")
-        .expect("state carries the loudness ceiling");
+    // The loudness envelope is the calibration that must survive a hot reload:
+    // after sustaining loudness 0.6 it has climbed toward that level, and the
+    // round-trip below only reproduces the next render if it reads the same
+    // envelope on both scenes.
+    let loud = state
+        .get("loud")
+        .expect("state carries the loudness envelope");
     assert!(
-        ceil > 0.4,
-        "the ceiling should have climbed toward the sustained level, got {ceil}"
+        loud > 0.4,
+        "the loudness envelope should have climbed toward the sustained level, got {loud}"
     );
     a.update(&next, dt);
     let field_a = render_field(a.as_mut()).2;

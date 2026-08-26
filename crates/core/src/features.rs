@@ -10,7 +10,7 @@
 /// Schema version of [`FeatureSnapshot`]. Bumped whenever the layout or field
 /// meaning changes so consumers (including a future serialized stream) can
 /// detect a mismatch.
-pub const FEATURE_SCHEMA_VERSION: u32 = 1;
+pub const FEATURE_SCHEMA_VERSION: u32 = 2;
 
 /// Number of display-spectrum bars reserved in every snapshot. The analyzer
 /// fills up to this many and sets [`FeatureSnapshot::spectrum_len`].
@@ -76,6 +76,13 @@ pub struct FeatureSnapshot {
     /// Peak absolute sample over the hop across all channels. Range
     /// `0.0..=1.0` for in-range audio.
     pub peak: f32,
+    /// Engine-normalized loudness in `0.0..=1.0`: the hop [`rms`](Self::rms)
+    /// divided by a slow auto-reference (see the DSP normalizer), so it is
+    /// independent of the listener's absolute level. Sustained program material
+    /// sits around `0.6..=0.85` and true peaks approach `1.0`; silence and noise
+    /// stay near `0.0`. This is the level driver scenes should read, not the raw
+    /// [`rms`](Self::rms). Computed once per hop on the DSP thread; new in schema 2.
+    pub loudness: f32,
     /// Momentary loudness (LUFS). Reserved, 0 in schema 1.
     pub lufs_momentary: f32,
     /// Display spectrum: log-spaced bars in `0.0..=1.0` spanning the
@@ -136,6 +143,7 @@ impl Default for FeatureSnapshot {
             dropped_frames: 0,
             rms: 0.0,
             peak: 0.0,
+            loudness: 0.0,
             lufs_momentary: 0.0,
             spectrum: [0.0; SPECTRUM_BINS],
             spectrum_len: 0,

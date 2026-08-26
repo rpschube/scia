@@ -361,8 +361,9 @@ impl Scene for EmberDrift {
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
 
         // Loudness follower drives the spawn rate; smoothed so a spawn burst
-        // eases in and out rather than chattering with the RMS.
-        let loud = f.rms.clamp(0.0, 1.0);
+        // eases in and out rather than chattering. Reads the engine-normalized
+        // loudness (0..1), not the raw rms, so real music actually spawns embers.
+        let loud = f.loudness.clamp(0.0, 1.0);
         self.loud_env += (loud - self.loud_env) * (1.0 - decay(dt, LOUD_TAU));
 
         // Onset envelope: snap to full on a fresh onset, otherwise decay. Fire on
@@ -589,10 +590,13 @@ mod tests {
         s
     }
 
-    /// An active snapshot at a given loudness, no onset.
-    fn active(rms: f32) -> FeatureSnapshot {
+    /// An active snapshot at a given loudness, no onset. The argument is the
+    /// engine-normalized `loudness` the scene now drives from; `rms` is set to the
+    /// same value so the snapshot stays internally plausible.
+    fn active(loudness: f32) -> FeatureSnapshot {
         FeatureSnapshot {
-            rms,
+            rms: loudness,
+            loudness,
             onset: false,
             onset_age_ms: 60_000.0,
             activity: Activity::Active,
@@ -640,6 +644,34 @@ mod tests {
             "louder audio spawns more embers: loud {loud_n} vs soft {soft_n}"
         );
         assert!(loud_n > 0, "a loud active passage spawns embers");
+    }
+
+    #[test]
+    fn realistic_rms_but_normalized_loudness_spawns_a_healthy_field() {
+        // The regression that motivated the engine-normalized loudness: real
+        // music sits around rms 0.08, but its normalized loudness is ~0.7. A scene
+        // reading raw rms spawned ~2 embers (canvas coverage ~0.001); reading
+        // `loudness` it must fill a healthy field. Drive a few seconds of such a
+        // snapshot and assert a healthy rendered primitive count.
+        let mut s = inited();
+        let f = FeatureSnapshot {
+            rms: 0.08,
+            loudness: 0.7,
+            onset: false,
+            onset_age_ms: 60_000.0,
+            activity: Activity::Active,
+            ..FeatureSnapshot::default()
+        };
+        for _ in 0..300 {
+            // ~9 s at 30 ms/frame, long enough to reach the steady ember count
+            s.update(&f, 0.03);
+        }
+        let prims = render_points(&mut s).len();
+        assert!(
+            prims > 20,
+            "realistic rms (0.08) with normalized loudness (0.7) should spawn a \
+             healthy ember field, got {prims} primitives"
+        );
     }
 
     #[test]

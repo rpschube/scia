@@ -62,6 +62,7 @@ fn hop_with_null_canvas_round_trips_through_shared_read_side() {
     let hop = Hop {
         t_ms: 1.0,
         rms: 0.1,
+        loudness: None,
         bands: vec![0.0, 0.0, 0.0],
         onset: 0.0,
         beat_conf: None,
