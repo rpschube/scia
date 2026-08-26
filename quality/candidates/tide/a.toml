@@ -1,0 +1,18 @@
+# tide / A — subtle audio response (the "restrained" side of the A/B).
+#
+# Contested dimension: response depth. `sensitivity` scales tide's transient
+# drift burst and swell heave; a low value keeps the surface close to its calm
+# base, reacting mostly through the slow loudness breathing and the front lift.
+# Compare against b.toml (dramatic) on the same clip.
+
+[preset]
+name = "tide-subtle"
+scene = "tide"
+description = "Stacked swells with a restrained onset response — gentle heaves over the loudness breathing and the bass front lift."
+mood = "fluid"
+
+[params]
+# Low audio-response depth: transients barely heave the swells.
+sensitivity = 0.5
+# A softer front-swell lift to match the restrained feel.
+response = 0.4

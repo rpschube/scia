@@ -1,0 +1,17 @@
+# aurora / B — dramatic audio response (the "reactive" side of the A/B).
+#
+# Contested dimension: response depth. `sensitivity` scales aurora's transient
+# onset swell and its drift burst; a high value makes each energy rise widen and
+# quicken the field noticeably. Compare against a.toml (subtle) on the same clip.
+
+[preset]
+name = "aurora-dramatic"
+scene = "aurora"
+description = "Calm interference field pushed to react — transients clearly swell the band and quicken the drift over the loudness breathing."
+mood = "serene"
+
+[params]
+# High audio-response depth: transients get a pronounced swell + drift burst.
+sensitivity = 1.8
+# A wider band swing with loudness to match the reactive feel.
+response = 0.5

@@ -1,0 +1,18 @@
+# aurora / A — subtle audio response (the "restrained" side of the A/B).
+#
+# Contested dimension: response depth. `sensitivity` scales aurora's transient
+# onset swell and its drift burst; a low value keeps the field close to its calm
+# base, reacting to the music mostly through the slow band/brightness breathing.
+# Compare against b.toml (dramatic) on the same clip.
+
+[preset]
+name = "aurora-subtle"
+scene = "aurora"
+description = "Calm interference field with a restrained onset response — barely-there transient swells over the loudness breathing."
+mood = "serene"
+
+[params]
+# Low audio-response depth: transients get only a gentle acknowledgment.
+sensitivity = 0.4
+# A touch less band swing to match the restrained feel.
+response = 0.24

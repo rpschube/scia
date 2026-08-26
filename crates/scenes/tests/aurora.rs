@@ -26,6 +26,17 @@ fn snap(loudness: f32, onset: bool) -> FeatureSnapshot {
     }
 }
 
+/// A snapshot with a given loudness and spectral flux (the transient driver the
+/// scene actually reads for its onset acknowledgment).
+fn snap_flux(loudness: f32, flux: f32) -> FeatureSnapshot {
+    FeatureSnapshot {
+        rms: loudness,
+        loudness,
+        flux,
+        ..FeatureSnapshot::default()
+    }
+}
+
 /// Render one frame and return the sole field's `(cols, rows, values)`.
 fn render_field(scene: &mut dyn Scene) -> (u16, u16, Vec<f32>) {
     let mut c = Canvas::new(16.0 / 9.0);
@@ -163,10 +174,11 @@ fn aurora_loud_quiet_band_ratio_is_visible() {
 }
 
 #[test]
-fn aurora_ignores_onset_at_equal_loudness() {
-    // Two scenes fed the SAME loudness; one has its onset flag flipping every
-    // frame, the other never. Nothing in aurora reads the onset, so the fields
-    // must be bit-for-bit identical after any number of frames.
+fn aurora_discrete_onset_flag_alone_is_inert() {
+    // Aurora acknowledges transients through the continuous spectral `flux`, not
+    // the discrete onset flag. Two scenes fed the SAME loudness and flux — one
+    // with its onset flag flipping every frame, the other never — must stay
+    // bit-for-bit identical: the boolean flag drives nothing on its own.
     let dt = 0.05;
     let rms = 0.5;
 
@@ -184,7 +196,77 @@ fn aurora_ignores_onset_at_equal_loudness() {
     let b = render_field(steady.as_mut()).2;
     assert_eq!(
         a, b,
-        "onset flips must not change the field at equal loudness"
+        "the discrete onset flag must not change the field at equal loudness/flux"
+    );
+}
+
+#[test]
+fn aurora_acknowledges_a_transient() {
+    // The onset acknowledgment fires on flux that rises ABOVE its recent average,
+    // not on the flux level itself (steady texture is not an onset). Settle at a
+    // low steady flux so the baseline is low, spike the flux for a few frames, and
+    // the band must swell — more total lit energy — then release when it falls.
+    let dt = 0.02;
+    let rms = 0.6;
+
+    let mut s = aurora();
+    s.init(&SceneCtx::default());
+    // Settle the flux baseline at a low steady level.
+    for _ in 0..300 {
+        s.update(&snap_flux(rms, 0.05), dt);
+    }
+    let steady: f32 = render_field(s.as_mut()).2.iter().sum();
+
+    // A transient: flux jumps well above its recent average for a few frames.
+    for _ in 0..4 {
+        s.update(&snap_flux(rms, 0.9), dt);
+    }
+    let onset: f32 = render_field(s.as_mut()).2.iter().sum();
+    assert!(
+        onset > steady,
+        "a transient (flux above baseline) should swell the band: onset {onset} \
+         should exceed steady {steady}"
+    );
+
+    // It must release: once the flux falls back and the field settles, the swell
+    // returns toward the steady baseline.
+    for _ in 0..300 {
+        s.update(&snap_flux(rms, 0.05), dt);
+    }
+    let settled: f32 = render_field(s.as_mut()).2.iter().sum();
+    assert!(
+        settled < onset,
+        "the transient swell must release once flux falls: settled {settled} \
+         should drop below the onset peak {onset}"
+    );
+}
+
+#[test]
+fn aurora_ignores_steady_flux() {
+    // Steady spectral texture is not an onset: two scenes at the same loudness,
+    // one held at high steady flux and one at low steady flux, must settle to the
+    // same band energy once each flux baseline has caught up — the novelty (flux
+    // above its own average) is what drives the swell, and it decays to zero under
+    // any sustained level.
+    let dt = 0.02;
+    let rms = 0.6;
+    let frames = 400;
+
+    let mut low = aurora();
+    low.init(&SceneCtx::default());
+    let mut high = aurora();
+    high.init(&SceneCtx::default());
+    for _ in 0..frames {
+        low.update(&snap_flux(rms, 0.1), dt);
+        high.update(&snap_flux(rms, 0.8), dt);
+    }
+    let low_sum: f32 = render_field(low.as_mut()).2.iter().sum();
+    let high_sum: f32 = render_field(high.as_mut()).2.iter().sum();
+    let rel = (high_sum - low_sum).abs() / low_sum.max(1e-6);
+    assert!(
+        rel < 0.02,
+        "sustained high vs low flux should settle to the same energy (novelty \
+         decays): low {low_sum} high {high_sum} (rel {rel})"
     );
 }
 
