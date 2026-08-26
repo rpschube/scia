@@ -1,0 +1,11 @@
+# starfall A — "streaky": a strong onset streak so the outer stars warp into long
+# lines on the beat (more kinetic, more onset gain, a little more jitter).
+# Contested dimension: streak length (excitement vs jitter).
+[preset]
+name = "starfall-streaky"
+scene = "starfall"
+description = "Starfield with strong onset streaks — kinetic warp on every beat."
+mood = "cosmic"
+
+[params]
+streak = 0.4

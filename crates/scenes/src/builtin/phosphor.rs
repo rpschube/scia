@@ -8,14 +8,23 @@
 //! Lissajous scope wanders. The frequency ratio `a:b` eases gently with the
 //! band levels, staying close to small integer-ish values so the figure always
 //! reads as a coherent curve rather than dissolving into noise. Amplitude opens
-//! fast on an onset and relaxes slowly, riding on a base amplitude that follows
-//! loudness, so the figure swells with the music and blooms on transients.
+//! on an onset and relaxes slowly, riding on a base amplitude that follows
+//! loudness, so the figure swells with the music and blooms on transients. The
+//! **deposit brightness** rides an energy envelope — a low quiet floor lifted by
+//! loudness and punched hard by an onset — so the trace burns bright on a loud
+//! beat and stays dim and calm when quiet; and the **precession speed** rides
+//! loudness, so the figure wanders fast (its trail smearing over more of the
+//! screen, moving more) when loud and nearly holds still when quiet. Driving the
+//! response through brightness and drift rather than the figure's size is what
+//! ties the beam's frame-to-frame motion to the music's level without leaving a
+//! large, static figure sitting still.
 //!
 //! A bright *beam head* — a few [`crate::canvas::Primitive::Point`]s at a point
 //! that races around the figure — is overdrawn on top of the dim decaying
 //! field, giving the single-hue CRT feel: a dim persistent trace under a hot
-//! moving spot. The field is coloured from a dim palette slot and the beam from
-//! a brighter one.
+//! moving spot. The head's brightness rides loudness and it flares on an onset.
+//! The field is coloured from a dim palette slot and the beam from a brighter
+//! one.
 //!
 //! # Internal resolution
 //!
@@ -29,7 +38,10 @@
 //! # Quiet / Idle
 //!
 //! Loudness and the onset envelope fall toward zero in quiet passages, so the
-//! figure collapses toward a small resting figure. When the DSP thread reports
+//! deposit dims, the precession stalls and the figure collapses toward a small,
+//! nearly still resting figure. Because normalized loudness reads a steady quiet
+//! drone as loud, a gate on the **raw** RMS damps the deposit and precession on
+//! genuinely quiet material too. When the DSP thread reports
 //! [`scia_core::Activity::Idle`] the scene stops depositing entirely and the
 //! field simply fades to black — the screen goes dark, like an idle scope.
 //!
@@ -39,10 +51,10 @@
 //! |--------------|---------|--------------|---------------------------------------------------------------|
 //! | `freq_a`     | `3.0`   | `1.0..=8.0`  | horizontal base frequency of the Lissajous figure             |
 //! | `freq_b`     | `2.0`   | `1.0..=8.0`  | vertical base frequency of the Lissajous figure               |
-//! | `decay`      | `0.5`   | `0.05..=3.0` | phosphor persistence time constant (seconds)                  |
-//! | `precession` | `0.6`   | `0.0..=4.0`  | precession speed: how fast the phase offset `δ` drifts (rad/s) |
-//! | `swell`      | `0.5`   | `0.0..=1.0`  | loudness-to-amplitude gain: how much loudness opens the figure |
-//! | `open`       | `0.45`  | `0.0..=1.0`  | onset amplitude opening: extra figure amplitude on a transient |
+//! | `decay`      | `0.17`  | `0.05..=3.0` | phosphor persistence time constant (seconds)                  |
+//! | `precession` | `0.6`   | `0.0..=4.0`  | precession base speed (loudness rides it): how fast `δ` drifts |
+//! | `swell`      | `0.45`  | `0.0..=1.0`  | loudness-to-amplitude gain: how much loudness opens the figure |
+//! | `open`       | `0.35`  | `0.0..=1.0`  | onset amplitude opening: extra figure amplitude on a transient |
 //!
 //! `freq_a`, `freq_b`, `decay`, `precession`, `swell` and `open` are live
 //! tuning scalars: the host re-applies them every frame through
@@ -51,8 +63,9 @@
 //! # Continuity
 //!
 //! [`Scene::state`] carries the precession phase, the beam-head phase, the eased
-//! frequency ratio, and the loudness and onset envelopes, so a hot reload
-//! resumes the drift and the response rather than snapping back to the start.
+//! frequency ratio, and the loudness, raw-RMS and onset envelopes, so a hot
+//! reload resumes the drift and the response rather than snapping back to the
+//! start.
 //! The persistence field itself is **not** carried: the whole figure is
 //! re-deposited every frame, so it re-appears immediately and only the fading
 //! afterglow re-accumulates over one decay time — the same judgment `starfall`
@@ -77,14 +90,24 @@ const DEPOSIT: f32 = 0.35;
 /// Resting-figure amplitude at silence (fraction of the field half-height), so a
 /// quiet-but-active passage still shows a small figure instead of a dot.
 const REST_AMP: f32 = 0.12;
-/// Loudness-follower time constant (seconds).
-const LOUD_TAU: f32 = 0.3;
-/// Onset-envelope decay time constant (seconds): the figure opens instantly and
-/// relaxes over roughly this long.
-const ONSET_TAU: f32 = 0.6;
+/// Loudness-follower time constant (seconds). Kept fairly short so the base
+/// amplitude tracks the music's level rather than lagging into a smear, which is
+/// what lets the figure's size move *with* loudness.
+const LOUD_TAU: f32 = 0.2;
+/// Onset-envelope decay time constant (seconds): the figure opens fast on a
+/// transient and relaxes over roughly this long. Short enough that each onset
+/// reads as a distinct bloom rather than a slow swell.
+const ONSET_TAU: f32 = 0.3;
 /// Frequency-ratio easing time constant (seconds): the a:b ratio drifts with the
 /// bands only very slowly, so the figure stays readable.
 const FREQ_TAU: f32 = 2.0;
+/// Raw-RMS smoothing time constant (seconds) for the level gate below.
+const RMS_TAU: f32 = 0.25;
+/// Raw-RMS level at which the level gate reaches full strength. The normalized
+/// loudness reads a steady quiet drone as loud, so without this the deposit and
+/// precession would keep such a clip moving; gating them on raw RMS keeps
+/// genuinely quiet material calm while leaving all louder clips untouched.
+const RMS_REF: f32 = 0.06;
 /// Maximum band-driven deviation of a base frequency (cycles), so the ratio
 /// stays near its integer-ish base and the figure never dissolves.
 const FREQ_DEV: f32 = 0.8;
@@ -118,7 +141,7 @@ pub static PARAMS: &[ParamSpec] = &[
     },
     ParamSpec {
         key: "decay",
-        default: 0.5,
+        default: 0.17,
         min: 0.05,
         max: 3.0,
         doc: "phosphor persistence time constant (seconds)",
@@ -132,14 +155,14 @@ pub static PARAMS: &[ParamSpec] = &[
     },
     ParamSpec {
         key: "swell",
-        default: 0.5,
+        default: 0.45,
         min: 0.0,
         max: 1.0,
         doc: "loudness-to-amplitude gain: how much loudness opens the figure",
     },
     ParamSpec {
         key: "open",
-        default: 0.45,
+        default: 0.35,
         min: 0.0,
         max: 1.0,
         doc: "onset amplitude opening: extra figure amplitude on a transient",
@@ -164,6 +187,8 @@ pub struct Phosphor {
     b_cur: f32,
     /// Smoothed loudness in `0.0..=1.0`, the base of the amplitude.
     loud_env: f32,
+    /// Smoothed raw RMS, for the level gate on the continuous responses.
+    rms_env: f32,
     /// Onset envelope in `0.0..=1.0`: snaps to 1 on an onset, decays to 0.
     onset_env: f32,
     /// Current figure amplitude (fraction of the field half-height), computed in
@@ -197,6 +222,7 @@ impl Phosphor {
             a_cur: 3.0,
             b_cur: 2.0,
             loud_env: 0.0,
+            rms_env: 0.0,
             onset_env: 0.0,
             amp: REST_AMP,
             depositing: true,
@@ -204,10 +230,10 @@ impl Phosphor {
             prev_onset_age_ms: 0.0,
             freq_a: 3.0,
             freq_b: 2.0,
-            decay: 0.5,
+            decay: 0.17,
             precession: 0.6,
-            swell: 0.5,
-            open: 0.45,
+            swell: 0.45,
+            open: 0.35,
         }
     }
 
@@ -247,6 +273,7 @@ impl Scene for Phosphor {
         self.a_cur = self.freq_a;
         self.b_cur = self.freq_b;
         self.loud_env = 0.0;
+        self.rms_env = 0.0;
         self.onset_env = 0.0;
         self.amp = REST_AMP;
         self.depositing = true;
@@ -265,9 +292,20 @@ impl Scene for Phosphor {
     fn update(&mut self, f: &scia_core::FeatureSnapshot, dt: f32) {
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
 
+        // Track raw RMS for the level gate: genuinely quiet material (low RMS)
+        // damps the continuous responses even when normalized loudness reads high.
+        self.rms_env += (f.rms.max(0.0) - self.rms_env) * (1.0 - decay(dt, RMS_TAU));
+        let rms_gate = (self.rms_env / RMS_REF).clamp(0.0, 1.0);
+
         // Precession drifts the phase offset; the beam head races around the
-        // figure. Both advance regardless of audio so the trace always lives.
-        self.precess = (self.precess + dt * self.precession).rem_euclid(TWO_PI);
+        // figure. Both advance regardless of audio so the trace always lives, but
+        // the precession speed rides loudness — the figure wanders faster when the
+        // music is loud and nearly holds still when it is quiet — so the field's
+        // frame-to-frame motion tracks the music's level, not just its onsets.
+        // `self.loud_env` is the previous frame's value here; it is refreshed just
+        // below, which is fine for a slowly-drifting phase.
+        let precess_rate = self.precession * (0.25 + 3.6 * self.loud_env * rms_gate);
+        self.precess = (self.precess + dt * precess_rate).rem_euclid(TWO_PI);
         self.head = (self.head + dt * HEAD_SPEED).rem_euclid(TWO_PI);
 
         // Ease the frequency ratio with the bands. Bands are normalized to
@@ -324,13 +362,24 @@ impl Scene for Phosphor {
         let b = self.b_cur;
         let delta = self.precess;
 
+        // Deposit brightness rides an energy envelope — a low quiet floor lifted
+        // by loudness and punched hard by an onset — so the trace is dim and calm
+        // when the music is quiet and burns bright on a loud beat. Driving the
+        // response through brightness (not the figure's size) keeps the beam's
+        // frame-to-frame motion tied to the music without the "big stable figure"
+        // that an amplitude-driven response leaves sitting still. The strong onset
+        // term is what gives a transient a sharp, well-correlated brightness jump.
+        let rms_gate = (self.rms_env / RMS_REF).clamp(0.0, 1.0);
+        let energy = (0.1 + (0.6 * self.loud_env + 1.1 * self.onset_env) * rms_gate).min(1.8);
+
         if self.depositing {
             // Sample the Lissajous curve along θ and deposit into the field.
+            let dep = DEPOSIT * energy;
             for s in 0..SAMPLES {
                 let theta = (s as f32 / SAMPLES as f32) * TWO_PI;
                 let x = 0.5 + ax * (a * theta + delta).sin();
                 let y = 0.5 + ay * (b * theta).sin();
-                deposit(&mut self.buf, x, y, DEPOSIT);
+                deposit(&mut self.buf, x, y, dep);
             }
         }
 
@@ -344,13 +393,19 @@ impl Scene for Phosphor {
         // Overdraw the bright beam head: a few points trailing the head phase,
         // fading back along the curve. Skipped while idle (nothing is lit).
         if self.depositing {
+            // The head flares on a transient: an onset briefly fattens the hot
+            // spot, so a beat reads as a bright bloom racing the figure rather
+            // than a steady dot. Its brightness rides loudness so the moving spot
+            // dims in quiet passages and blazes when loud.
+            let flare = 1.0 + 0.8 * self.onset_env;
+            let head_bright = 0.3 + 0.7 * self.loud_env;
             for i in 0..HEAD_POINTS {
                 let back = i as f32 * 0.05;
                 let theta = self.head - back;
                 let x = 0.5 + ax * (a * theta + delta).sin();
                 let y = 0.5 + ay * (b * theta).sin();
-                let bright = 1.0 - (i as f32 / HEAD_POINTS as f32) * 0.7;
-                let size = HEAD_SIZE * (1.0 - back);
+                let bright = (1.0 - (i as f32 / HEAD_POINTS as f32) * 0.7) * head_bright;
+                let size = HEAD_SIZE * (1.0 - back) * flare;
                 canvas.point(x, y, size, Style::new(BEAM_SLOT, bright));
             }
         }
@@ -363,6 +418,7 @@ impl Scene for Phosphor {
         s.set("a_cur", self.a_cur);
         s.set("b_cur", self.b_cur);
         s.set("loud_env", self.loud_env);
+        s.set("rms_env", self.rms_env);
         s.set("onset_env", self.onset_env);
         s.set("prev_onset", if self.prev_onset { 1.0 } else { 0.0 });
         s.set("prev_onset_age_ms", self.prev_onset_age_ms);
@@ -384,6 +440,9 @@ impl Scene for Phosphor {
         }
         if let Some(v) = s.get("loud_env") {
             self.loud_env = v;
+        }
+        if let Some(v) = s.get("rms_env") {
+            self.rms_env = v;
         }
         if let Some(v) = s.get("onset_env") {
             self.onset_env = v;

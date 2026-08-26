@@ -1,0 +1,11 @@
+# phosphor B — "smeary": a longer persistence so the figure leaves a calmer,
+# lingering afterglow. Contested dimension: persistence (responsiveness vs
+# afterglow calm).
+[preset]
+name = "phosphor-smeary"
+scene = "phosphor"
+description = "Phosphor with a longer persistence — a calmer, lingering afterglow."
+mood = "retro"
+
+[params]
+decay = 0.3

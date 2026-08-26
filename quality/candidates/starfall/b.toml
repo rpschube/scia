@@ -1,0 +1,11 @@
+# starfall B — "smooth": minimal onset streak (the shipped default), leaning on
+# the loudness-driven size swell and motion-blur tails so the field glides calmly
+# with less jitter. Contested dimension: streak length (excitement vs jitter).
+[preset]
+name = "starfall-smooth"
+scene = "starfall"
+description = "Starfield with minimal streaks — a smoother, glide-led field."
+mood = "cosmic"
+
+[params]
+streak = 0.05

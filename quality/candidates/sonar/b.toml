@@ -1,0 +1,11 @@
+# sonar B — "snappy": a short contact persistence so onset contacts flare and
+# clear quickly, keeping the sweep uncluttered. Contested dimension: contact
+# persistence (headline dwell vs quick clean flares).
+[preset]
+name = "sonar-snappy"
+scene = "sonar"
+description = "Radar sweep with quick-clearing contacts — snappy, uncluttered flares."
+mood = "vigilant"
+
+[params]
+decay = 1.0

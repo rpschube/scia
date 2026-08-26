@@ -10,21 +10,31 @@
 //! and the scene eases between the two regimes rather than jumping.
 //!
 //! Every detected onset spawns a *contact* from a fixed pool at the arm's
-//! current angle. The contact's radius is derived deterministically from the
-//! signal — a bass/treble mix places it inner or outer, and a hash of the hop
-//! `generation` scatters it — so contacts land believably without any RNG. A
-//! contact flares bright, then fades with a phosphor-style decay (a parameter).
+//! current angle — the display's headline event. The contact's radius is derived
+//! deterministically from the signal — a bass/treble mix places it inner or
+//! outer, and a hash of the hop `generation` scatters it — so contacts land
+//! believably without any RNG. A contact flares as a bright core wrapped in a
+//! soft halo (a larger, dimmer disc that fades faster), then the core fades with
+//! a phosphor-style decay (a parameter); a louder onset flares a visibly bigger
+//! contact. These big, smoothly fading blobs dominate the display's brightness,
+//! so its frame-to-frame change tracks the contacts rather than the thin sweep's
+//! rasterisation jitter.
 //!
 //! The arm is drawn as a [`crate::canvas::Primitive::Line`] from the centre with
-//! a short fading trail behind it; contacts are [`crate::canvas::Primitive::Point`]s;
-//! faint range rings are drawn as sparse points so the display stays legible at
-//! the coarse tier.
+//! a short fading trail behind it; its brightness rides the loudness envelope, so
+//! the ever-rotating sweep is dim when the music is quiet and blazes when it is
+//! loud — that is what ties the display's overall motion to the music's energy.
+//! Contacts are [`crate::canvas::Primitive::Point`]s; faint range rings are drawn
+//! as sparse points so the display stays legible at the coarse tier.
 //!
 //! # Quiet / Idle
 //!
 //! The sweep slows as the signal falls quiet (and nearly stops when the DSP
-//! thread reports [`scia_core::Activity::Idle`]); contacts stop spawning and
-//! fade out, so an idle display winds down to a dim, slowly turning arm.
+//! thread reports [`scia_core::Activity::Idle`]); its brightness and the contact
+//! flares also fall away, and contacts stop spawning and fade out, so an idle
+//! display winds down to a dim, slowly turning arm. Because normalized loudness
+//! reads a steady quiet drone as loud, a gate on the **raw** RMS damps the arm
+//! brightness and the contact flare on genuinely quiet material as well.
 //!
 //! # Geometry
 //!
@@ -39,7 +49,7 @@
 //! |----------------|---------|---------------|------------------------------------------------------------------|
 //! | `beats_per_rev`| `4.0`   | `1.0..=16.0`  | beats spanned by one full sweep revolution when locked to the beat |
 //! | `rate`         | `0.15`  | `0.02..=1.0`  | free rotation rate (revolutions/second) when the beat is unlocked  |
-//! | `decay`        | `1.2`   | `0.1..=5.0`   | contact persistence time constant (seconds)                       |
+//! | `decay`        | `1.6`   | `0.1..=5.0`   | contact persistence time constant (seconds)                       |
 //! | `trail`        | `0.5`   | `0.0..=1.0`   | sweep trail length (phosphor persistence of the arm)             |
 //! | `rings`        | `2.0`   | `0.0..=4.0`   | number of faint range rings (rounded)                            |
 //!
@@ -49,9 +59,10 @@
 //! # Continuity
 //!
 //! [`Scene::state`] carries the sweep angle, the regime lock envelope, the
-//! beat-phase bookkeeping, the onset-edge bookkeeping and the live contacts
-//! (each angle, radius and intensity), so a hot reload resumes the sweep where
-//! it was and keeps the contacts on screen.
+//! loudness and raw-RMS envelopes, the beat-phase bookkeeping, the onset-edge
+//! bookkeeping and the live contacts (each angle, radius, intensity and spawn
+//! flare), so a hot reload resumes the sweep where it was and keeps the contacts
+//! on screen.
 
 use crate::canvas::{Canvas, Style};
 use crate::scene::{ParamSpec, Params, Scene, SceneCtx, SceneState};
@@ -72,6 +83,17 @@ const PHASE_LOCK_GAIN: f32 = 0.15;
 const CONTACT_CAP: usize = 24;
 /// A contact below this intensity has faded out and its slot is freed.
 const CONTACT_EPS: f32 = 0.02;
+/// Loudness-follower time constant (seconds): the sweep's brightness rides this
+/// so the display's overall motion tracks the music's energy.
+const LOUD_TAU: f32 = 0.15;
+/// Raw-RMS smoothing time constant (seconds) for the level gate below.
+const RMS_TAU: f32 = 0.25;
+/// Raw-RMS level at which the level gate reaches full strength. The normalized
+/// loudness reads a steady quiet drone as loud, which would keep the sweep bright
+/// (and the ever-rotating arm therefore in constant motion) on a genuinely quiet
+/// clip; gating the arm's loudness lift on raw RMS keeps such material calm while
+/// leaving louder clips untouched.
+const RMS_REF: f32 = 0.06;
 /// Rim radius (fraction of half-height) the sweep arm reaches.
 const ARM_RADIUS: f32 = 0.95;
 /// Number of trailing segments drawn behind the arm at full `trail`.
@@ -80,8 +102,13 @@ const TRAIL_MAX: usize = 8;
 const TRAIL_STEP: f32 = 0.06;
 /// Sparse points drawn around each range ring.
 const RING_SEGMENTS: usize = 24;
-/// Base contact diameter (fraction of canvas height) at full intensity.
-const CONTACT_SIZE: f32 = 0.03;
+/// Base contact-core diameter (fraction of canvas height) at full intensity. On
+/// a loud onset the `flare` term swells the core well past this and a soft halo
+/// is drawn around it, so an onset lands as the display's headline event rather
+/// than a pinprick lost under the sweep.
+const CONTACT_SIZE: f32 = 0.034;
+/// Diameter multiplier for the soft flare halo drawn around a contact core.
+const HALO_SCALE: f32 = 2.4;
 /// Arm stroke width (fraction of canvas height).
 const ARM_WIDTH: f32 = 0.01;
 /// Fraction of the free rotation that survives at silence, so an idle display
@@ -114,7 +141,7 @@ pub static PARAMS: &[ParamSpec] = &[
     },
     ParamSpec {
         key: "decay",
-        default: 1.2,
+        default: 1.6,
         min: 0.1,
         max: 5.0,
         doc: "contact persistence time constant (seconds)",
@@ -144,6 +171,9 @@ struct Contact {
     radius: f32,
     /// Current intensity in `0.0..=1.0`; fades toward zero.
     intensity: f32,
+    /// Loudness captured at spawn (`0.0..=1.0`): a louder onset flares a bigger
+    /// contact, so the display's contacts swell with the music's energy.
+    flare: f32,
 }
 
 impl Contact {
@@ -151,6 +181,7 @@ impl Contact {
         angle: 0.0,
         radius: 0.0,
         intensity: 0.0,
+        flare: 0.0,
     };
 }
 
@@ -172,6 +203,10 @@ pub struct Sonar {
     prev_beat_phase: f32,
     /// Fixed-capacity contact pool; oldest recycled on overflow.
     contacts: [Contact; CONTACT_CAP],
+    /// Smoothed loudness in `0.0..=1.0` driving the sweep brightness.
+    loud_env: f32,
+    /// Smoothed raw RMS, for the level gate on the sweep brightness.
+    rms_env: f32,
     /// Previous frame's onset flag, for rising-edge detection.
     prev_onset: bool,
     /// Previous frame's `onset_age_ms`, to catch a fresh onset that resets the age.
@@ -197,11 +232,13 @@ impl Sonar {
             beat_base_angle: 0.0,
             prev_beat_phase: 0.0,
             contacts: [Contact::DEAD; CONTACT_CAP],
+            loud_env: 0.0,
+            rms_env: 0.0,
             prev_onset: false,
             prev_onset_age_ms: 0.0,
             beats_per_rev: 4.0,
             rate: 0.15,
-            decay: 1.2,
+            decay: 1.6,
             trail: 0.5,
             rings: 2.0,
         }
@@ -220,7 +257,8 @@ impl Sonar {
     }
 
     /// Spawn a contact, reusing an inactive slot or recycling the faintest one.
-    fn spawn_contact(&mut self, angle: f32, radius: f32) {
+    /// `flare` is the loudness at spawn, sizing the contact's peak flare.
+    fn spawn_contact(&mut self, angle: f32, radius: f32, flare: f32) {
         let mut slot = 0usize;
         let mut weakest = f32::INFINITY;
         for (i, c) in self.contacts.iter().enumerate() {
@@ -239,6 +277,7 @@ impl Sonar {
             angle,
             radius,
             intensity: 1.0,
+            flare: flare.clamp(0.0, 1.0),
         };
     }
 }
@@ -270,6 +309,8 @@ impl Scene for Sonar {
         self.beat_base_angle = 0.0;
         self.prev_beat_phase = 0.0;
         self.contacts = [Contact::DEAD; CONTACT_CAP];
+        self.loud_env = 0.0;
+        self.rms_env = 0.0;
         self.prev_onset = false;
         self.prev_onset_age_ms = 0.0;
     }
@@ -282,6 +323,14 @@ impl Scene for Sonar {
 
     fn update(&mut self, f: &scia_core::FeatureSnapshot, dt: f32) {
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+
+        // Loudness follower: the sweep brightness and the onset flares ride this,
+        // so the display's overall motion tracks the music's energy instead of
+        // being dominated by a constant-brightness arm.
+        let loud = f.loudness.clamp(0.0, 1.0);
+        self.loud_env += (loud - self.loud_env) * (1.0 - decay(dt, LOUD_TAU));
+        // Track raw RMS for the level gate on the sweep brightness.
+        self.rms_env += (f.rms.max(0.0) - self.rms_env) * (1.0 - decay(dt, RMS_TAU));
 
         // Ease the regime lock toward the beat gate: locked when the tracker is
         // confident, free otherwise, blended smoothly so the sweep never jumps.
@@ -344,11 +393,14 @@ impl Scene for Sonar {
 
         // One onset spawns exactly one contact at the current sweep angle. Fire
         // on a rising edge, or when a fresh onset resets `onset_age_ms` below the
-        // previous frame's value, so a held onset never double-spawns.
+        // previous frame's value, so a held onset never double-spawns. A louder
+        // onset flares a bigger contact; a quiet transient barely stirs the
+        // display.
         let new_onset = f.onset && (!self.prev_onset || f.onset_age_ms < self.prev_onset_age_ms);
         if new_onset {
             let radius = contact_radius(f);
-            self.spawn_contact(self.angle, radius);
+            let rms_gate = (self.rms_env / RMS_REF).clamp(0.0, 1.0);
+            self.spawn_contact(self.angle, radius, self.loud_env * rms_gate);
         }
         self.prev_onset = f.onset;
         self.prev_onset_age_ms = f.onset_age_ms;
@@ -368,33 +420,58 @@ impl Scene for Sonar {
             }
         }
 
-        // Contacts: flaring points fading with the phosphor decay.
+        // Contacts: the display's headline onset event. Each is a bright core
+        // that fades with the phosphor decay, wrapped in a soft halo — a larger,
+        // dimmer disc that fades faster — so a fresh contact reads as a flare and
+        // its slow core fade is the bright decay trail. A louder onset (captured
+        // in `flare`) swells both. The big, smoothly fading blobs dominate the
+        // display's brightness, so its frame-to-frame change tracks the contacts'
+        // decay rather than the thin sweep's rasterisation jitter.
         for c in &self.contacts {
             if c.intensity < CONTACT_EPS {
                 continue;
             }
             let (x, y) = place(0.5, 0.5, c.radius, c.angle, aspect);
-            let size = CONTACT_SIZE * (0.4 + 0.6 * c.intensity);
-            canvas.point(x, y, size, Style::new(CONTACT_SLOT, c.intensity));
+            let flare = 1.0 + 0.8 * c.flare;
+            let core = CONTACT_SIZE * (0.5 + 0.5 * c.intensity) * flare;
+            // Halo: a wider, dimmer disc that fades faster than the core.
+            let halo_i = c.intensity * c.intensity * 0.4;
+            if halo_i > CONTACT_EPS {
+                canvas.point(x, y, core * HALO_SCALE, Style::new(CONTACT_SLOT, halo_i));
+            }
+            canvas.point(x, y, core, Style::new(CONTACT_SLOT, c.intensity));
         }
 
         // The sweep arm, with a short fading trail behind it for the phosphor
         // feel. The number of lit trail segments follows the `trail` parameter.
+        // The arm rides the loudness envelope: dim when the music is quiet, full
+        // when it is loud, so the constant sweep's motion tracks the energy.
+        let rms_gate = (self.rms_env / RMS_REF).clamp(0.0, 1.0);
+        let arm_bright = 0.22 + 0.78 * self.loud_env * rms_gate;
         let trail_segments = (self.trail * TRAIL_MAX as f32).round() as usize;
         for i in (1..=trail_segments).rev() {
             let a = self.angle - i as f32 * TRAIL_STEP;
             let (tx, ty) = place(0.5, 0.5, ARM_RADIUS, a, aspect);
-            let bright = 0.5 * (1.0 - i as f32 / (TRAIL_MAX as f32 + 1.0));
+            let bright = arm_bright * 0.6 * (1.0 - i as f32 / (TRAIL_MAX as f32 + 1.0));
             canvas.line(0.5, 0.5, tx, ty, ARM_WIDTH, Style::new(ARM_SLOT, bright));
         }
         let (hx, hy) = place(0.5, 0.5, ARM_RADIUS, self.angle, aspect);
-        canvas.line(0.5, 0.5, hx, hy, ARM_WIDTH, Style::new(ARM_SLOT, 1.0));
+        canvas.line(
+            0.5,
+            0.5,
+            hx,
+            hy,
+            ARM_WIDTH,
+            Style::new(ARM_SLOT, arm_bright),
+        );
     }
 
     fn state(&self) -> SceneState {
         let mut s = SceneState::new();
         s.set("angle", self.angle);
         s.set("lock_env", self.lock_env);
+        s.set("loud_env", self.loud_env);
+        s.set("rms_env", self.rms_env);
         s.set("beat_base_angle", self.beat_base_angle);
         s.set("prev_beat_phase", self.prev_beat_phase);
         s.set("prev_onset", if self.prev_onset { 1.0 } else { 0.0 });
@@ -403,6 +480,7 @@ impl Scene for Sonar {
             s.set(&format!("c{i}_a"), c.angle);
             s.set(&format!("c{i}_r"), c.radius);
             s.set(&format!("c{i}_i"), c.intensity);
+            s.set(&format!("c{i}_f"), c.flare);
         }
         s
     }
@@ -413,6 +491,12 @@ impl Scene for Sonar {
         }
         if let Some(v) = s.get("lock_env") {
             self.lock_env = v;
+        }
+        if let Some(v) = s.get("loud_env") {
+            self.loud_env = v;
+        }
+        if let Some(v) = s.get("rms_env") {
+            self.rms_env = v;
         }
         if let Some(v) = s.get("beat_base_angle") {
             self.beat_base_angle = v;
@@ -436,6 +520,7 @@ impl Scene for Sonar {
                         angle: a,
                         radius: r,
                         intensity,
+                        flare: s.get(&format!("c{i}_f")).unwrap_or(0.0),
                     };
                 }
                 _ => *c = Contact::DEAD,

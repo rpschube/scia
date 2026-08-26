@@ -1,0 +1,10 @@
+# lattice A — "present": a brighter base glow so the field fills the frame and
+# reads with more standing presence. Contested dimension: base presence vs calm.
+[preset]
+name = "lattice-present"
+scene = "lattice"
+description = "Lattice with a brighter base glow — more standing presence."
+mood = "serene"
+
+[params]
+glow = 0.5
