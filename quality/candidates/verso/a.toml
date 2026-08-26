@@ -1,0 +1,17 @@
+# verso A/B — the trail dimension, side A: FLEETING.
+#
+# The contested taste: how much of the canvas should the falling trail fill? Side A
+# keeps verso closer to its minimal, literal roots — the marks fall away quickly,
+# so the title reads over a light, fleeting scatter rather than a full veil. Side B
+# (b.toml) lets the trail linger into a dense dropped veil. Both ride the retuned
+# defaults for everything else; only `trail` (the mark lifetime) differs.
+
+[preset]
+name = "verso-fleeting"
+scene = "verso"
+description = "A restrained verso: marks fall away quickly, the title over a light scatter."
+
+[params]
+# trail 1.0 is the default lifetime multiplier; 0.55 shortens each mark's life so
+# the veil stays sparse and literal. Range 0.0..=2.0.
+trail = 0.55

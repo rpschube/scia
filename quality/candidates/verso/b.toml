@@ -1,0 +1,17 @@
+# verso A/B — the trail dimension, side B: LINGERING VEIL.
+#
+# The contested taste: how much of the canvas should the falling trail fill? Side B
+# lets each mark linger, so the dropped dots stack into a full veil raining beneath
+# the title — the fuller-canvas reading. Side A (a.toml) keeps it fleeting and
+# minimal. Both ride the retuned defaults for everything else; only `trail` (the
+# mark lifetime) differs.
+
+[preset]
+name = "verso-veil"
+scene = "verso"
+description = "A lush verso: marks linger into a full veil raining beneath the title."
+
+[params]
+# trail 1.0 is the default lifetime multiplier; 1.8 lets the marks linger into a
+# dense falling veil. Range 0.0..=2.0.
+trail = 1.8

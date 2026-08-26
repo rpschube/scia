@@ -1,0 +1,16 @@
+# ember-drift A/B — the density dimension, side B: LUSH.
+#
+# The contested taste: how many embers should the field carry? Side B fills it
+# lusher — a denser drift of embers so the frame reads as a rising sheet of sparks
+# rather than a few lone ones. Side A (a.toml) keeps it genuinely sparse. Both ride
+# the retuned defaults for everything else; only `spawn` differs.
+
+[preset]
+name = "ember-lush"
+scene = "ember-drift"
+description = "A lush rising-ember field: a denser drift of sparks filling the frame."
+
+[params]
+# spawn 5.0 is the default; 10.0 roughly doubles the population for a fuller drift.
+# Range 0.0..=40.0.
+spawn = 10.0

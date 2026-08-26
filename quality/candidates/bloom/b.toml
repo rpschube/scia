@@ -1,0 +1,17 @@
+# bloom A/B — the spread dimension, side B: SPRAWLING.
+#
+# The contested taste: how much of the frame should the mandala claim? Side B throws
+# the figure all the way to the edges — a full-bleed kaleidoscope that fills the
+# frame corner to corner. Side A (a.toml) pulls it in to an intimate jewel. Both
+# ride the retuned defaults for everything else; only `radius` (the base overall
+# spread) differs.
+
+[preset]
+name = "bloom-sprawling"
+scene = "bloom"
+description = "A sprawling mandala: thrown to the edges, filling the frame corner to corner."
+
+[params]
+# radius 0.9 is the default base spread; 1.0 pushes the figure to the frame edges.
+# Range 0.1..=1.0.
+radius = 1.0

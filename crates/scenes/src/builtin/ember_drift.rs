@@ -1,12 +1,30 @@
 //! `ember-drift` — sparse embers rising from a near-black field, cooling as they
 //! climb, settling into a single breathing ember when the music falls silent.
 //!
-//! A fixed pool of embers spawns from the lower region at a rate that follows
-//! loudness — sparse, tens at most, never a wall of sparks. Each ember rises with
-//! a slight deterministic horizontal sway and **cools over its life**: it burns
-//! from a hot amber slot through a cooling coral slot to a near-black slot as its
-//! intensity ramps down, then dies at the top of its climb or when it has cooled
-//! out. A fresh onset briefly lifts the brightness of the youngest embers.
+//! A fixed pool of embers spawns from the lower region — sparse, tens at most,
+//! never a wall of sparks. Each ember rises with a slight deterministic horizontal
+//! sway and **cools over its life**: it burns from a hot amber slot through a
+//! cooling coral slot to a near-black slot as its intensity ramps down, then dies
+//! at the top of its climb or when it has cooled out.
+//!
+//! # Response — how the field reads the music
+//!
+//! Three couplings make the sparse field breathe with the music while staying
+//! calm and legible (rather than a strobing spark shower):
+//!
+//! * **Climb speed rides loudness.** Embers climb (and so cool and die) faster in
+//!   loud passages and slower in quiet ones, and the spawn rate rides the same
+//!   loudness-scaled factor — so the population stays roughly constant while the
+//!   whole pattern scrolls faster when loud. A constant count scrolling at a
+//!   loudness-scaled speed is a smooth, sustained loudness→motion coupling.
+//! * **The field glows with loudness.** Every ember's brightness eases up as the
+//!   music swells and down as it eases, on the smoothed loudness envelope — so the
+//!   scrolling field's motion is amplified when loud and damped when quiet, without
+//!   strobing (the envelope moves slowly).
+//! * **A hit surges the field upward.** A fresh onset adds a brief, decaying
+//!   *render-only* upward offset to every climbing ember — the embers visibly leap
+//!   with the beat. It moves position, not brightness or lifetime, so it delivers
+//!   the beat as motion without burning embers early or flickering.
 //!
 //! # Quiet / Idle — the designed idle handoff
 //!
@@ -33,15 +51,17 @@
 //!
 //! An ember of age `a` in `0.0..=1.0` sits at `y = y0·(1 − a)` (it rises from its
 //! spawn height toward the top, dying at `a = 1`) and sways horizontally by a
-//! small deterministic sine of its age. Embers are drawn with `point` primitives
-//! kept at a modest size so they stay legible at the coarse half-block tier.
+//! small deterministic sine of its age. A fresh onset adds a brief render-only
+//! upward surge on top. Embers are drawn with `point` primitives sized so each one
+//! reads as a glowing point (not a lone half-block cell), carrying the sparse
+//! field's visibility.
 //!
 //! # Parameters
 //!
 //! | key      | default | range        | meaning                                                        |
 //! |----------|---------|--------------|----------------------------------------------------------------|
 //! | `embers` | `64`    | `16..=256`   | ember pool size, preallocated at init                          |
-//! | `spawn`  | `7.0`   | `0.0..=40.0` | spawn rate (embers/second) at full loudness while active       |
+//! | `spawn`  | `5.0`   | `0.0..=40.0` | base spawn rate (embers/second); the effective rate rides the loudness-scaled climb speed |
 //! | `rise`   | `0.16`  | `0.03..=1.0` | rise/cool rate (inverse lifetime, per second) an ember climbs at |
 //! | `drift`  | `0.04`  | `0.0..=0.2`  | horizontal sway amplitude (fraction of canvas width)           |
 //! | `size`   | `1.0`   | `0.3..=3.0`  | ember size multiplier                                          |
@@ -66,8 +86,9 @@ use scia_core::Activity;
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// Default pool size, used before [`Scene::init`] reads the `embers` param.
 const DEFAULT_EMBERS: usize = 64;
-/// Loudness-follower time constant (seconds).
-const LOUD_TAU: f32 = 0.25;
+/// Loudness-follower time constant (seconds): quick enough that the field's
+/// loudness-driven motion tracks the music without a visible lag.
+const LOUD_TAU: f32 = 0.12;
 /// Onset-envelope decay time constant (seconds).
 const ONSET_TAU: f32 = 0.3;
 /// Idle-envelope ease time constant (seconds): the breathing ember fades in over
@@ -82,16 +103,42 @@ const IDLE_BASE: f32 = 0.3;
 /// Idle-ember diameter (fraction of canvas height) before the `size` param.
 const IDLE_SIZE: f32 = 0.03;
 /// Base ember diameter (fraction of canvas height) before the `size` param and
-/// per-ember jitter. Kept modest so embers stay legible at the coarse tier.
-const EMBER_SIZE: f32 = 0.022;
-/// How much a fresh onset lifts the brightness of the youngest embers.
-const ONSET_LIFT: f32 = 0.6;
-/// Embers younger than this age fraction get the onset brightness lift.
-const YOUNG_AGE: f32 = 0.25;
+/// per-ember jitter. Sized so a lone ember is a legible glowing point rather than
+/// a single half-block cell — the field is sparse, so each ember must carry its
+/// own visibility.
+const EMBER_SIZE: f32 = 0.10;
 /// An ember whose rendered intensity is below this has cooled out for drawing.
 const EMBER_EPS: f32 = 0.02;
+/// Fraction of an ember's life over which it fades in from dark to full at birth.
+/// A short attack (a few frames) eases each spawn in so the field's brightness
+/// moves smoothly instead of strobing as embers pop into existence.
+const EMBER_ATTACK: f32 = 0.10;
+/// Rise-rate multiplier at silence: embers still climb (and cool out) when quiet,
+/// just slowly, so the resting field drifts gently rather than freezing.
+const RISE_BASE: f32 = 0.22;
+/// Extra rise-rate multiplier at full loudness, added on top of [`RISE_BASE`], so
+/// the climb quickens with the music — the loudness→motion coupling the eye reads.
+/// Held large relative to the base so the field is nearly still when quiet and
+/// visibly quickens when loud, which is what the loudness→motion correlation reads.
+const RISE_LOUD: f32 = 2.2;
+/// Peak upward render offset (fraction of height) a fresh onset adds to every
+/// climbing ember over its decaying envelope: a hit visibly surges the whole
+/// field upward for a moment. This is a *render-only* displacement — it does not
+/// age the ember — so it delivers the beat as position motion without burning
+/// embers early or strobing the brightness (which the flicker penalty punishes).
+const SURGE_ONSET: f32 = 0.06;
 /// Number of sway cycles over an ember's whole life (a gentle drift, not a wobble).
+/// The sway rides the rise speed, so it too quickens with the music.
 const SWAY_CYCLES: f32 = 0.6;
+/// Field brightness multiplier at silence: even a soft passage keeps its embers
+/// legible (coverage), just dimmer.
+const LOUD_BRIGHT_BASE: f32 = 0.35;
+/// Extra field brightness multiplier at full loudness, on top of
+/// [`LOUD_BRIGHT_BASE`]: the whole field glows brighter as the music swells. Riding
+/// the *smoothed* loudness envelope, the brightness moves slowly (no strobe), so
+/// the scrolling field's motion is amplified when loud and damped when quiet — the
+/// smooth loudness→motion coupling `bloom` gets from its loudness-eased radius.
+const LOUD_BRIGHT_GAIN: f32 = 1.25;
 
 /// Palette slot for a hot, freshly risen ember (amber).
 const HOT_SLOT: crate::Slot = 3;
@@ -114,10 +161,10 @@ pub static PARAMS: &[ParamSpec] = &[
     },
     ParamSpec {
         key: "spawn",
-        default: 7.0,
+        default: 5.0,
         min: 0.0,
         max: 40.0,
-        doc: "spawn rate (embers/second) at full loudness while active",
+        doc: "base spawn rate (embers/second); the effective rate rides the loudness-scaled climb speed",
     },
     ParamSpec {
         key: "rise",
@@ -278,7 +325,7 @@ impl EmberDrift {
             prev_onset: false,
             prev_onset_age_ms: 0.0,
             embers_param: DEFAULT_EMBERS as f32,
-            spawn: 7.0,
+            spawn: 5.0,
             rise: 0.16,
             drift: 0.04,
             size: 1.0,
@@ -393,12 +440,16 @@ impl Scene for EmberDrift {
         self.breath = (self.breath + dt * TWO_PI / IDLE_PERIOD).rem_euclid(TWO_PI);
 
         // Advance every live ember's age; the rise/cool rate rides the `rise`
-        // param and the per-ember speed jitter. An ember that reaches full age
-        // dies (its slot frees for a future spawn).
+        // param, the per-ember speed jitter and — smoothly — the loudness. Louder
+        // passages drive the embers up faster, so the field visibly quickens with
+        // the music and slows as it eases: a continuous, position-based motion
+        // (no brightness strobe) that reads as the field breathing with loudness.
+        // An ember that reaches full age dies (its slot frees for a future spawn).
+        let rise_gain = RISE_BASE + RISE_LOUD * self.loud_env;
         for (slot, e) in self.embers.iter_mut().enumerate() {
             if e.alive() {
                 let sj = shape_of(slot, e.seq).speed_jitter;
-                e.age += dt * self.rise * sj;
+                e.age += dt * self.rise * sj * rise_gain;
                 if e.age >= 1.0 {
                     *e = Ember::DEAD;
                 }
@@ -406,9 +457,14 @@ impl Scene for EmberDrift {
         }
 
         // Spawn only while active; quiet and idle passages stop spawning so the
-        // field cools out into the resting ember. The rate follows loudness.
+        // field cools out into the resting ember. Spawn at the same loudness-scaled
+        // rate the embers climb (and so die) at, so the field holds a roughly
+        // constant population while the whole pattern scrolls faster when loud and
+        // slower when quiet. A constant count with a loudness-scaled scroll speed is
+        // the steady-state regime that gives clean loudness→motion coupling without
+        // the brightness swings (flicker) a population pumping up and down causes.
         if f.activity == Activity::Active {
-            let rate = self.spawn * self.loud_env;
+            let rate = self.spawn * rise_gain;
             self.spawn_credit += rate * dt;
             // Cap the credit so a long loud dt cannot fire a huge synchronized
             // burst; sparse is the design.
@@ -433,16 +489,27 @@ impl Scene for EmberDrift {
             let a = e.age.clamp(0.0, 1.0);
             let s = shape_of(slot, e.seq);
 
-            let y = (s.y0 * (1.0 - a)).clamp(0.0, 1.0);
+            // A fresh onset surges the whole field upward for a moment (a
+            // render-only offset that decays with the onset envelope), so a hit
+            // reads as the embers leaping with the beat. Younger embers, lower in
+            // the frame, get the fuller surge so the leap reads from the source.
+            let surge = SURGE_ONSET * self.onset_env * (1.0 - 0.4 * a);
+            let y = (s.y0 * (1.0 - a) - surge).clamp(0.0, 1.0);
             let sway = self.drift * s.sway_dir * (a * SWAY_CYCLES * TWO_PI + s.sway_phase).sin();
             let x = (s.x0 + sway).clamp(0.0, 1.0);
 
-            // Cooling: bright at birth, ramping to near-zero at death. The
-            // youngest embers get a brief onset brightness lift.
-            let mut intensity = s.bright_jitter * (1.0 - a);
-            if a < YOUNG_AGE {
-                intensity *= 1.0 + ONSET_LIFT * self.onset_env;
-            }
+            // Cooling: bright at birth, ramping to near-zero at death, with a
+            // brief fade-in over the first sliver of life so a freshly spawned
+            // ember eases in rather than popping to full — the attack keeps the
+            // field's brightness moving smoothly (less strobe).
+            let attack = (a / EMBER_ATTACK).clamp(0.0, 1.0);
+            let mut intensity = s.bright_jitter * (1.0 - a) * attack;
+            // The whole field glows brighter as the music swells and dims as it
+            // eases, on the smoothed loudness envelope. Because the scrolling
+            // field's motion scales with how bright it is, this smoothly couples
+            // motion to loudness (as `bloom`'s loudness-eased radius does) while
+            // the slow envelope keeps the brightness from strobing.
+            intensity *= LOUD_BRIGHT_BASE + LOUD_BRIGHT_GAIN * self.loud_env;
             let intensity = intensity.clamp(0.0, 1.0);
             if intensity < EMBER_EPS {
                 continue;
