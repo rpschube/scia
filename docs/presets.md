@@ -167,7 +167,7 @@ table).
 | `bass`      | `bands[0]` clamped to `0..1`          | bass band level                                              |
 | `mid`       | `bands[1]` clamped to `0..1`          | mid band level                                               |
 | `treb`      | `bands[2]` clamped to `0..1`          | treble band level                                            |
-| `loud`      | `rms`                                 | loudness                                                     |
+| `loud`      | `loudness`                            | normalized loudness, `0..1`, level-independent               |
 | `peak`      | `peak`                                | peak sample of the hop                                       |
 | `onset`     | onset **envelope**                    | `1.0` on an onset hop, then an exponential decay (τ ≈ 250 ms) so the expression sees a usable envelope, not a one-frame spike |
 | `flux`      | `flux`                                | spectral flux                                                |
@@ -207,7 +207,7 @@ Each feature reads one field of the DSP `FeatureSnapshot` and is clamped to
 | `bass`  | `bands[0]`                                        | bass band level                            |
 | `mid`   | `bands[1]`                                        | mid band level                             |
 | `treb`  | `bands[2]`                                        | treble band level                          |
-| `loud`  | `rms`                                              | loudness                                   |
+| `loud`  | `loudness`                                         | normalized loudness, `0..1`, level-independent |
 | `peak`  | `peak`                                             | peak sample of the hop                     |
 | `onset` | `onset`                                            | `1.0` on an onset hop, else `0.0`          |
 | `flux`  | `flux`                                             | spectral flux                              |

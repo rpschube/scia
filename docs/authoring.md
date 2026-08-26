@@ -118,7 +118,7 @@ other name is rejected at load, at that entry's `file:line:col`:
 | `bass` | `bands[0]` | clamped to `0..1` |
 | `mid` | `bands[1]` | clamped to `0..1` |
 | `treb` | `bands[2]` | clamped to `0..1` |
-| `loud` | `rms` | clamped to `0..1` |
+| `loud` | `loudness` | normalized loudness, `0..1`, level-independent |
 | `peak` | `peak` | clamped to `0..1` |
 | `onset` | onset **envelope** | `1.0` on an onset hop, then an exponential decay (τ ≈ 250 ms), so you get a usable curve, not a one-frame spike |
 | `flux` | `flux` | clamped to `0..1` |

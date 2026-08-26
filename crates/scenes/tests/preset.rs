@@ -235,7 +235,10 @@ fn pow_and_step_curves() {
     let mut params = Params::new();
     set.seed(&mut params);
     let mut f = snap(false);
-    f.rms = 0.5;
+    // `loud` reads the engine-normalized loudness, not raw rms: set a
+    // contradictory rms so the test fails if the mapping ever reads rms again.
+    f.loudness = 0.5;
+    f.rms = 0.9;
     set.apply(&f, 0.016, &mut params);
     let v = params.get("punch").unwrap();
     assert!((v - 0.25).abs() < 1e-6, "pow(0.5, 2) = 0.25, got {v}");
@@ -254,11 +257,13 @@ fn pow_and_step_curves() {
     let mut params = Params::new();
     set.seed(&mut params);
     let mut lo = snap(false);
-    lo.rms = 0.3;
+    lo.loudness = 0.3;
+    lo.rms = 0.9;
     set.apply(&lo, 0.016, &mut params);
     assert_eq!(params.get("punch").unwrap(), 0.0, "below threshold -> 0");
     let mut hi = snap(false);
-    hi.rms = 0.6;
+    hi.loudness = 0.6;
+    hi.rms = 0.1;
     set.apply(&hi, 0.016, &mut params);
     assert_eq!(params.get("punch").unwrap(), 1.0, "above threshold -> 1");
 }
@@ -278,7 +283,8 @@ fn scale_and_offset_applied() {
     let mut params = Params::new();
     set.seed(&mut params);
     let mut f = snap(false);
-    f.rms = 0.8;
+    f.loudness = 0.8;
+    f.rms = 0.1;
     set.apply(&f, 0.016, &mut params);
     // offset + scale * curve(clamp(0.8)) = 0.2 + 0.5 * 0.8 = 0.6.
     let v = params.get("punch").unwrap();
@@ -306,8 +312,11 @@ fn expression_mapping_drives_param_per_frame() {
     let mut params = Params::new();
     layer.mappings.seed(&mut params);
 
+    // `loud` in an expression is the engine-normalized loudness; a decoy rms
+    // keeps the test honest about which field drives the mapping.
     let mut f = FeatureSnapshot {
-        rms: 0.8,
+        loudness: 0.8,
+        rms: 0.1,
         ..FeatureSnapshot::default()
     };
     layer.mappings.apply(&f, 0.016, &mut params);
@@ -315,7 +324,7 @@ fn expression_mapping_drives_param_per_frame() {
     assert!((v - 0.4).abs() < 1e-6, "loud * 0.5 = 0.4, got {v}");
 
     // A quieter frame moves the mapped value the same frame.
-    f.rms = 0.2;
+    f.loudness = 0.2;
     layer.mappings.apply(&f, 0.016, &mut params);
     let v = params.get("gap").unwrap();
     assert!((v - 0.1).abs() < 1e-6, "loud * 0.5 = 0.1, got {v}");
@@ -379,7 +388,8 @@ fn mixed_table_and_expression_preset() {
     layer.mappings.seed(&mut params);
 
     let mut f = snap(true);
-    f.rms = 0.6;
+    f.loudness = 0.6;
+    f.rms = 0.1;
     layer.mappings.apply(&f, 0.016, &mut params);
     assert!(
         (params.get("punch").unwrap() - 1.0).abs() < 1e-6,

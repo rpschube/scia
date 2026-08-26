@@ -29,8 +29,9 @@ impl UserData for FeaturesUd {
         // The documented scalar feature API. Each getter clones one `f32` (or
         // `bool`) out of the shared snapshot — no allocation, no table build.
         fields.add_field_method_get("rms", |_, this| Ok(this.0.borrow().rms));
-        // `loud` is an alias for `rms`, the everyday name for loudness.
-        fields.add_field_method_get("loud", |_, this| Ok(this.0.borrow().rms));
+        // `loud` is the engine-normalized loudness (`0..=1`, level-independent),
+        // the everyday name for loudness; `rms` above stays the raw signal.
+        fields.add_field_method_get("loud", |_, this| Ok(this.0.borrow().loudness));
         fields.add_field_method_get("peak", |_, this| Ok(this.0.borrow().peak));
         fields.add_field_method_get("flux", |_, this| Ok(this.0.borrow().flux));
         fields.add_field_method_get("onset", |_, this| Ok(this.0.borrow().onset));
