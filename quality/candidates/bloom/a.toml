@@ -1,0 +1,17 @@
+# bloom A/B — the spread dimension, side A: INTIMATE.
+#
+# The contested taste: how much of the frame should the mandala claim? Side A pulls
+# it in to an intimate figure centred in the frame with dark around it, so the
+# kaleidoscope reads as a jewel rather than a wall. Side B (b.toml) throws it out to
+# the edges. Both ride the retuned defaults for everything else; only `radius` (the
+# base overall spread) differs.
+
+[preset]
+name = "bloom-intimate"
+scene = "bloom"
+description = "An intimate mandala: pulled in to a centred jewel with dark around it."
+
+[params]
+# radius 0.9 is the default base spread; 0.62 pulls the figure in from the edges.
+# Range 0.1..=1.0.
+radius = 0.62

@@ -1,14 +1,16 @@
 //! `bloom` — a six-fold kaleidoscope mandala breathing with the mids, its core
 //! flashing on every onset. The maximal, screensaver-grade scene.
 //!
-//! One 60° wedge of structure is computed — a small fan of curved arms whose
-//! radius and thickness breathe with the mid band — and mirrored six-fold by
-//! rotation, so the whole figure is a mandala with true six-fold rotational
-//! symmetry. The arms in the wedge each have their own length and bend, so the
-//! symmetry is exactly six-fold rather than an accidental higher order. A slow
-//! global rotation turns the whole mandala; loudness eases its overall radius,
-//! so it opens with the music. Every detected onset flashes a bright core at the
-//! centre — a cluster of concentric points with a fast attack and slower decay.
+//! One 60° wedge of structure is computed — a fan of curved arms whose radius and
+//! thickness breathe with the mid band — and mirrored six-fold by rotation, so the
+//! whole figure is a mandala with true six-fold rotational symmetry. Six arms per
+//! wedge, densely sampled and drawn with overlapping points, fan into continuous
+//! glowing filaments that fill the disc rather than a sparse skeleton; each arm
+//! has its own length and bend, so the symmetry is exactly six-fold rather than an
+//! accidental higher order. A slow global rotation turns the whole mandala;
+//! loudness eases its overall radius, so it opens with the music. Every detected
+//! onset flashes a bright core at the centre — a cluster of concentric points with
+//! a fast attack and slower decay.
 //!
 //! # Quiet / Idle
 //!
@@ -37,9 +39,9 @@
 //! | key       | default | range        | meaning                                                     |
 //! |-----------|---------|--------------|-------------------------------------------------------------|
 //! | `rotate`  | `0.05`  | `0.0..=0.5`  | global rotation speed (revolutions/second) while active     |
-//! | `radius`  | `0.6`   | `0.1..=1.0`  | base overall radius (fraction of the canvas half-height)    |
+//! | `radius`  | `0.9`   | `0.1..=1.0`  | base overall radius (fraction of the canvas half-height)    |
 //! | `swell`   | `0.4`   | `0.0..=1.0`  | loudness-to-radius gain: how much loudness opens the mandala |
-//! | `breathe` | `0.5`   | `0.0..=1.0`  | mid-band gain on petal radius and thickness (the breath)    |
+//! | `breathe` | `0.35`  | `0.0..=1.0`  | mid-band gain on petal radius and thickness (the breath)    |
 //! | `flash`   | `0.8`   | `0.0..=1.0`  | onset core-flash gain                                       |
 //! | `size`    | `1.0`   | `0.3..=3.0`  | point size multiplier                                       |
 //!
@@ -62,13 +64,16 @@ const TWO_PI: f32 = std::f32::consts::TAU;
 const SYMMETRY: usize = 6;
 /// The wedge angle one symmetry copy spans (radians).
 const WEDGE: f32 = TWO_PI / SYMMETRY as f32;
-/// Points sampled along each arm from the centre outward.
-const SEGMENTS: usize = 9;
+/// Points sampled along each arm from the centre outward. Enough that the arms
+/// read as continuous glowing filaments filling the disc, not a dotted skeleton.
+const SEGMENTS: usize = 16;
 /// Per-arm outer-length fractions (of the overall radius). Distinct per arm so
-/// the wedge has internal structure and the symmetry is exactly six-fold.
-const ARM_LEN: [f32; 4] = [1.0, 0.62, 0.86, 0.72];
+/// the wedge has internal structure and the symmetry is exactly six-fold. Six arms
+/// per wedge fan the mandala densely enough to read as a filled figure, not a
+/// skeleton, while the varied lengths keep the symmetry exactly six-fold.
+const ARM_LEN: [f32; 6] = [1.0, 0.62, 0.86, 0.72, 0.94, 0.78];
 /// Per-arm angular bend across the arm (radians). Distinct per arm, as above.
-const ARM_BEND: [f32; 4] = [0.10, -0.20, 0.06, -0.30];
+const ARM_BEND: [f32; 6] = [0.10, -0.20, 0.06, -0.30, -0.12, 0.22];
 /// Loudness-follower time constant (seconds).
 const LOUD_TAU: f32 = 0.3;
 /// Mid-band-follower time constant (seconds): the breath eases rather than jumps.
@@ -80,8 +85,10 @@ const ONSET_TAU: f32 = 0.35;
 const RADIUS_FLOOR: f32 = 0.25;
 /// Mid-band gain on petal radius bulge (scaled by the `breathe` param).
 const BREATHE_R: f32 = 0.35;
-/// Base point diameter (fraction of canvas height) before the `size` param.
-const POINT_SIZE: f32 = 0.016;
+/// Base point diameter (fraction of canvas height) before the `size` param. Sized
+/// so neighbouring points on an arm overlap into a continuous glowing filament,
+/// filling the mandala rather than dotting it.
+const POINT_SIZE: f32 = 0.042;
 /// Number of concentric points in the bright central core.
 const CORE_POINTS: usize = 4;
 /// Base core diameter (fraction of canvas height) before the `size` param.
@@ -110,7 +117,7 @@ pub static PARAMS: &[ParamSpec] = &[
     },
     ParamSpec {
         key: "radius",
-        default: 0.6,
+        default: 0.9,
         min: 0.1,
         max: 1.0,
         doc: "base overall radius (fraction of the canvas half-height)",
@@ -124,7 +131,7 @@ pub static PARAMS: &[ParamSpec] = &[
     },
     ParamSpec {
         key: "breathe",
-        default: 0.5,
+        default: 0.35,
         min: 0.0,
         max: 1.0,
         doc: "mid-band gain on petal radius and thickness (the breath)",
@@ -189,9 +196,9 @@ impl Bloom {
             prev_onset: false,
             prev_onset_age_ms: 0.0,
             rotate: 0.05,
-            radius: 0.6,
+            radius: 0.9,
             swell: 0.4,
-            breathe: 0.5,
+            breathe: 0.35,
             flash: 0.8,
             size: 1.0,
         }
@@ -232,10 +239,14 @@ impl Bloom {
             let r = overall_r * len * tf * bulge;
             let a = ang + bend * (tf * std::f32::consts::PI).sin();
             let (x, y) = place(r, a, self.aspect);
+            // The point keeps most of its size at rest and only gently pulses with
+            // the breath, so the per-frame size change — and the motion it adds on
+            // otherwise-quiet passages — stays modest while the base fills the
+            // mandala.
             let size = POINT_SIZE
                 * self.size
                 * (0.5 + 0.5 * tf)
-                * (0.7 + 0.6 * self.breathe * self.mid_env);
+                * (0.85 + 0.3 * self.breathe * self.mid_env);
             let intensity = (petal_bright * (0.45 + 0.55 * tf)).clamp(0.0, 1.0);
             canvas.point(x, y, size, Style::new(arm_slot(tf), intensity));
         }

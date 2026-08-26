@@ -1,0 +1,16 @@
+# ember-drift A/B — the density dimension, side A: SPARSE.
+#
+# The contested taste: how many embers should the field carry? Side A keeps it
+# genuinely sparse — a handful of large, bright embers rising through the dark, so
+# each one is an event you can follow. Side B (b.toml) fills the field lusher. Both
+# ride the retuned defaults for everything else; only `spawn` differs.
+
+[preset]
+name = "ember-sparse"
+scene = "ember-drift"
+description = "A sparse rising-ember field: few, large, legible embers."
+
+[params]
+# spawn 5.0 is the default; 3.0 thins the field to a sparse scatter (~half as many
+# embers alive). Range 0.0..=40.0.
+spawn = 3.0
