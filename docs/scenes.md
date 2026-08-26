@@ -66,9 +66,12 @@ state — there are no shared globals.
 
 ### Features (`update`)
 
-Scalar fields, each already normalized for display: `rms` / `loud`, `peak`,
+Scalar fields, each already normalized for display: `loud` (normalized
+loudness, `0..1`, level-independent — the everyday loudness field), `peak`,
 `flux`, `onset` (boolean), `onset_age` (ms), `bass` / `mid` / `treb`,
-`beat_phase`, `beat` (confidence), `tempo` (BPM), `width`, `bar_count`. The
+`beat_phase`, `beat` (confidence), `tempo` (BPM), `width`, `bar_count`, and
+`rms` — the raw signal loudness, the escape hatch for a scene that wants the
+un-normalized level rather than `loud`. The
 display spectrum crosses as one table the host rewrites in place each tick,
 handed to `init` as `ctx.bars` (`bars[1..=bar_count]`); `features:bar(i)` is a
 1-based convenience read of the same data.

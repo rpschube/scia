@@ -442,10 +442,11 @@ fn mapping_makes_the_presenter_feature_responsive() {
     let plain = parse_preset("[preset]\nname = \"p\"\nscene = \"spectra\"\n", None)
         .expect("valid plain preset");
 
-    // Two snapshots with identical spectra but different loudness.
+    // Two snapshots with identical spectra but different loudness. The `loud`
+    // feature reads the engine-normalized `loudness`, not raw rms.
     let quiet = flat_snapshot(8, 0.6);
     let mut loud = flat_snapshot(8, 0.6);
-    loud.rms = 0.9;
+    loud.loudness = 0.9;
 
     // The mapped preset paints differently under the two loudness levels: the
     // live `gap` mapping reaches the render on the same frame it is folded in.

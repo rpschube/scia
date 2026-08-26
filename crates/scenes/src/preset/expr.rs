@@ -64,7 +64,9 @@ impl ExprEnv {
             bass: c(f.bands[0]),
             mid: c(f.bands[1]),
             treb: c(f.bands[2]),
-            loud: c(f.rms),
+            // Engine-normalized loudness (`0..=1`, level-independent), not raw
+            // rms — the same signal the builtin scenes read as `f.loudness`.
+            loud: c(f.loudness),
             peak: c(f.peak),
             onset: f64::from(onset_env.clamp(0.0, 1.0)),
             flux: c(f.flux),

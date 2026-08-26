@@ -178,14 +178,17 @@ fn mapped_param_reaches_the_same_frame_render() {
     };
     let values = [0.5f32; 8];
 
-    let bar_width_at = |rms: f32| -> f32 {
+    let bar_width_at = |loud: f32| -> f32 {
         let mut s = spectra();
         s.init(&SceneCtx::default());
         let mut set = MappingSet::new(std::slice::from_ref(&mapping));
         let mut params = Params::new();
         set.seed(&mut params);
         let mut sn = snap(&values, false);
-        sn.rms = rms;
+        // `loud` reads the normalized loudness; a fixed decoy rms proves the
+        // mapping no longer reads the raw field.
+        sn.loudness = loud;
+        sn.rms = 0.5;
         let prims = mapped_frame(s.as_mut(), &mut set, &mut params, &sn, 0.016);
         bar_xwh(&prims[0]).1
     };
@@ -263,7 +266,7 @@ fn expression_mapped_param_reaches_the_same_frame_render() {
     // like the table form. Exercises the compile-at-load, eval-per-frame path.
     let values = [0.5f32; 8];
 
-    let bar_width_at = |rms: f32| -> f32 {
+    let bar_width_at = |loud: f32| -> f32 {
         let preset = parse_preset(
             "[preset]\nname = \"a\"\nscene = \"spectra\"\n[map]\ngap = \"loud * 0.8\"\n",
             None,
@@ -274,7 +277,10 @@ fn expression_mapped_param_reaches_the_same_frame_render() {
         let mut params = Params::new();
         layer.mappings.seed(&mut params);
         let mut sn = snap(&values, false);
-        sn.rms = rms;
+        // `loud` in the expression reads the normalized loudness; a fixed decoy
+        // rms proves the expression no longer reads the raw field.
+        sn.loudness = loud;
+        sn.rms = 0.5;
         let prims = mapped_frame(
             layer.scene.as_mut(),
             &mut layer.mappings,

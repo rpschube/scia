@@ -96,6 +96,67 @@ fn golden_render_is_repeatable() {
     assert_eq!(a.primitives(), b.primitives(), "render is deterministic");
 }
 
+/// Exposes `features.loud` and `features.rms` as two bar heights so a test can
+/// read exactly which snapshot field each name resolves to.
+const LOUD_VS_RMS_SCENE: &str = r#"
+local loud = 0
+local rms = 0
+return {
+  id = "loudprobe",
+  mood = "test",
+  summary = "loud and rms as bar heights",
+  update = function(features, dt)
+    loud = features.loud
+    rms = features.rms
+  end,
+  render = function(canvas)
+    canvas:bar(0.0, 1.0 - loud, 0.5, loud, 0, 1.0)
+    canvas:bar(0.5, 1.0 - rms, 0.5, rms, 1, 1.0)
+  end,
+}
+"#;
+
+#[test]
+fn luau_loud_reads_normalized_loudness_not_raw_rms() {
+    // A Luau scene's `features.loud` must resolve to the engine-normalized
+    // `loudness`, while `features.rms` stays the raw signal. Drive a snapshot
+    // where the two differ so the test discriminates.
+    let mut scene = LuauScene::from_source(LOUD_VS_RMS_SCENE, "loudprobe", LuauLimits::default())
+        .expect("compiles");
+    scene.init(&SceneCtx::default());
+
+    let snap = FeatureSnapshot {
+        rms: 0.08,
+        loudness: 0.7,
+        ..FeatureSnapshot::default()
+    };
+    scene.update(&snap, 1.0 / 60.0);
+    let mut canvas = Canvas::new(1.0);
+    scene.render(&mut canvas);
+
+    let prims = canvas.primitives();
+    assert_eq!(prims.len(), 2, "one bar for loud, one for rms");
+    let heights: Vec<f32> = prims
+        .iter()
+        .map(|p| {
+            let Primitive::Bar { h, .. } = p else {
+                panic!("every primitive is a bar, got {p:?}");
+            };
+            *h
+        })
+        .collect();
+    assert!(
+        (heights[0] - 0.7).abs() < 1e-4,
+        "`loud` reflects loudness (0.7), got {}",
+        heights[0]
+    );
+    assert!(
+        (heights[1] - 0.08).abs() < 1e-4,
+        "`rms` stays the raw signal (0.08), got {}",
+        heights[1]
+    );
+}
+
 #[test]
 fn shipped_scenes_construct_and_render() {
     // A representative "loud, mid-onset" snapshot.

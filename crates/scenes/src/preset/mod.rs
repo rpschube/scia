@@ -89,7 +89,7 @@ pub enum Feature {
     Mid,
     /// `bands[2]` — treble band level.
     Treb,
-    /// `rms` — loudness.
+    /// `loudness` — engine-normalized loudness (`0..=1`, level-independent).
     Loud,
     /// `peak` — peak sample of the hop.
     Peak,
@@ -548,7 +548,7 @@ fn feature_value(feature: Feature, f: &FeatureSnapshot) -> f32 {
         Feature::Bass => f.bands[0],
         Feature::Mid => f.bands[1],
         Feature::Treb => f.bands[2],
-        Feature::Loud => f.rms,
+        Feature::Loud => f.loudness,
         Feature::Peak => f.peak,
         Feature::Onset => {
             if f.onset {
