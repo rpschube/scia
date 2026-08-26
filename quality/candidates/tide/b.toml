@@ -1,0 +1,18 @@
+# tide / B — dramatic audio response (the "reactive" side of the A/B).
+#
+# Contested dimension: response depth. `sensitivity` scales tide's transient
+# drift burst and swell heave; a high value makes each energy rise heave the
+# whole surface and quicken the drift. Compare against a.toml (subtle) on the
+# same clip.
+
+[preset]
+name = "tide-dramatic"
+scene = "tide"
+description = "Stacked swells pushed to react — transients clearly heave every ridge and quicken the drift over the loudness breathing."
+mood = "fluid"
+
+[params]
+# High audio-response depth: transients heave the swells hard.
+sensitivity = 1.6
+# A stronger front-swell lift with the low band to match the reactive feel.
+response = 1.1
