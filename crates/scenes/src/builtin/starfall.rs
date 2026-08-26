@@ -12,9 +12,9 @@
 //! so the field reads with depth.
 //!
 //! There is no beat tracker yet (`beat_phase`/`tempo_bpm` are reserved zeros),
-//! so the motion is driven entirely from the onset stream and the loudness of
-//! the mono mix. `lufs_momentary` is reserved (0 in schema 1) too, so loudness
-//! is read from `rms`; swap to LUFS once that field is computed.
+//! so the motion is driven entirely from the onset stream and the
+//! engine-normalized `loudness` (the mono rms divided by a slow auto-reference),
+//! which is level-independent so real music actually drives the stream speed.
 //!
 //! # Geometry
 //!
@@ -376,9 +376,9 @@ impl Scene for Starfall {
     }
 
     fn update(&mut self, f: &scia_core::FeatureSnapshot, dt: f32) {
-        // Loudness follower: momentary LUFS is reserved (0) in schema 1, so ride
-        // the stream speed on the mono RMS, smoothed toward its target.
-        let loud = f.rms.clamp(0.0, 1.0);
+        // Loudness follower: ride the stream speed on the engine-normalized
+        // loudness (0..1), not the raw rms, smoothed toward its target.
+        let loud = f.loudness.clamp(0.0, 1.0);
         let k = 1.0 - decay(dt, LOUD_TAU);
         self.loud_env += (loud - self.loud_env) * k;
 
@@ -552,12 +552,15 @@ mod tests {
     use crate::canvas::Primitive;
     use scia_core::FeatureSnapshot;
 
-    /// A snapshot carrying an onset flag, an `onset_age_ms` and an rms.
-    fn snap(onset: bool, onset_age_ms: f32, rms: f32) -> FeatureSnapshot {
+    /// A snapshot carrying an onset flag, an `onset_age_ms` and a loudness. The
+    /// last argument is the engine-normalized `loudness` the scene drives from
+    /// (mirrored into `rms` so the snapshot stays plausible).
+    fn snap(onset: bool, onset_age_ms: f32, loudness: f32) -> FeatureSnapshot {
         FeatureSnapshot {
             onset,
             onset_age_ms,
-            rms,
+            rms: loudness,
+            loudness,
             ..FeatureSnapshot::default()
         }
     }

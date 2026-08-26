@@ -12,21 +12,16 @@
 //!
 //! # Loudness normalization
 //!
-//! Raw `rms` is a poor width driver: real music sits around `0.1..=0.25`, so a
-//! width fed the bare level barely moves and the band reads as static regardless
-//! of the gain the response is tuned for. Instead the scene normalizes loudness
-//! against an adaptive reference before the envelope. A slow **loudness ceiling**
-//! peak-follows `rms` — a fast attack ([`CEILING_ATTACK_TAU`]) so a sustained
-//! passage raises it within a second, a very slow release ([`CEILING_RELEASE_TAU`],
-//! ~10 s) so it remembers the loudest recent passage, and a floor
-//! ([`CEILING_FLOOR`]) so genuine silence can never divide the ratio up toward one.
-//! The envelope is then driven by `min(1, rms / ceiling)`. The consequence is that
-//! the response is *level-independent*: on any material — quiet-mastered or
-//! brick-walled — the ceiling calibrates to that material's own loud passages, so
-//! sustained loud stretches push the driver toward `1.0` and quiet stretches fall
-//! toward `0.0`, and two recordings at very different absolute levels settle to the
-//! same band width. The ceiling is a slow calibration reference, not a reactive
-//! signal: it never adds per-frame motion, so the calm-scene invariant holds.
+//! The band width is driven by the engine-normalized `loudness` — the mono rms
+//! divided by a slow auto-reference, computed once on the DSP thread and already
+//! level-independent (`0..=1`, sustained program ~0.6..=0.85). The scene folds
+//! that driver through its own slow width envelope; it no longer keeps a private
+//! loudness ceiling, since the engine now performs that normalization for every
+//! consumer. The consequence stands: on any material — quiet-mastered or
+//! brick-walled — sustained loud stretches push the driver up and quiet stretches
+//! fall toward `0.0`, so two recordings at very different absolute levels settle
+//! to the same band width. The engine reference is a slow calibration, not a
+//! reactive signal: it adds no per-frame motion, so the calm-scene invariant holds.
 //!
 //! # Internal resolution
 //!
@@ -66,9 +61,9 @@
 //!
 //! # Continuity
 //!
-//! [`Scene::state`] carries the three wave phases, the loudness envelope and the
-//! loudness ceiling, so a hot reload resumes the drift, the current band width and
-//! the loudness calibration rather than snapping back to the start.
+//! [`Scene::state`] carries the three wave phases and the loudness envelope, so a
+//! hot reload resumes the drift and the current band width rather than snapping
+//! back to the start.
 
 use crate::canvas::{Canvas, Style};
 use crate::scene::{ParamSpec, Params, Scene, SceneCtx, SceneState};
@@ -92,19 +87,6 @@ const TWO_PI: f32 = std::f32::consts::TAU;
 const ATTACK_TAU: f32 = 0.6;
 /// Loudness-follower time constant while the band is settling back (seconds).
 const RELEASE_TAU: f32 = 1.5;
-/// Loudness-ceiling attack time constant (seconds): a sustained passage lifts the
-/// reference within about a second, while a single loud hop only nudges it, so a
-/// stray transient cannot latch the calibration high.
-const CEILING_ATTACK_TAU: f32 = 0.3;
-/// Loudness-ceiling release time constant (seconds): the reference decays back
-/// toward the floor very slowly, so it remembers the loudest recent passage and a
-/// quiet stretch reads quiet for several seconds before the scale recalibrates.
-const CEILING_RELEASE_TAU: f32 = 10.0;
-/// Floor under the loudness ceiling. The normalized driver is `rms / ceiling`, so
-/// the floor bounds the divisor: genuine silence and near-silence stay near `0.0`
-/// instead of dividing up toward `1.0`, and it sits below any real musical level
-/// so quiet-mastered material still calibrates to its own loud passages.
-const CEILING_FLOOR: f32 = 0.05;
 /// Starting phases, offset so the first frame already has texture.
 const INITIAL_PHASES: [f32; NWAVES] = [0.0, 2.0, 4.0];
 
@@ -186,9 +168,6 @@ pub struct Aurora {
     phase: [f32; NWAVES],
     /// Slow loudness envelope in `0.0..=1.0`; drives the band width only.
     loud_env: f32,
-    /// Adaptive loudness ceiling: a slow peak-follower over `rms` that the raw
-    /// level is normalized against before the envelope. See the module docs.
-    loud_ceiling: f32,
     /// Field speed multiplier.
     drift: f32,
     /// Spatial-frequency multiplier.
@@ -211,7 +190,6 @@ impl Aurora {
         Self {
             phase: INITIAL_PHASES,
             loud_env: 0.0,
-            loud_ceiling: CEILING_FLOOR,
             drift: 1.0,
             scale: 1.0,
             band: 0.10,
@@ -251,7 +229,6 @@ impl Scene for Aurora {
         self.read_params(&ctx.params);
         self.phase = INITIAL_PHASES;
         self.loud_env = 0.0;
-        self.loud_ceiling = CEILING_FLOOR;
         self.buf.clear();
         self.buf.resize(COLS * ROWS, 0.0);
     }
@@ -270,25 +247,11 @@ impl Scene for Aurora {
         }
 
         // The only audio-driven quantity is the band width, and it is folded
-        // through a slow follower — never an onset, never a per-frame spike.
-        // `lufs_momentary` is reserved (0 in schema 1), so loudness is read from
-        // `rms`; swap to LUFS once that field is computed.
-        //
-        // First update the adaptive loudness ceiling: a peak-follower over rms
-        // with a fast attack and a very slow release, floored so silence can't
-        // divide the ratio up. Then normalize the raw level against it, so the
-        // driver is level-independent — sustained loud → ~1, quiet → ~0 — on any
-        // material. The ceiling is a slow calibration reference; it adds no
-        // per-frame motion of its own.
-        let rms = f.rms.clamp(0.0, 1.0);
-        let (ceil_target, ceil_tau) = if rms > self.loud_ceiling {
-            (rms, CEILING_ATTACK_TAU)
-        } else {
-            (CEILING_FLOOR, CEILING_RELEASE_TAU)
-        };
-        self.loud_ceiling += (ceil_target - self.loud_ceiling) * follow_coeff(dt, ceil_tau);
-        self.loud_ceiling = self.loud_ceiling.max(CEILING_FLOOR);
-        let target = (rms / self.loud_ceiling).clamp(0.0, 1.0);
+        // through a slow follower — never an onset, never a per-frame spike. It
+        // reads the engine-normalized `loudness` (already level-independent,
+        // `0..=1`); the scene no longer keeps its own loudness ceiling, since the
+        // engine performs that normalization for every consumer.
+        let target = f.loudness.clamp(0.0, 1.0);
         let tau = if target > self.loud_env {
             ATTACK_TAU
         } else {
@@ -348,7 +311,6 @@ impl Scene for Aurora {
             s.set(&format!("phase{k}"), *p);
         }
         s.set("loud", self.loud_env);
-        s.set("ceil", self.loud_ceiling);
         s
     }
 
@@ -360,9 +322,6 @@ impl Scene for Aurora {
         }
         if let Some(loud) = s.get("loud") {
             self.loud_env = loud;
-        }
-        if let Some(ceil) = s.get("ceil") {
-            self.loud_ceiling = ceil.max(CEILING_FLOOR);
         }
     }
 }

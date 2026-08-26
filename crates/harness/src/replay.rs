@@ -208,6 +208,7 @@ pub fn run(req: &RunRequest) -> RunOutput {
         records.push(Record::Hop(Hop {
             t_ms,
             rms: frame.rms,
+            loudness: Some(frame.loudness),
             bands: frame.bands.to_vec(),
             onset: frame.flux,
             beat_conf: Some(frame.beat_confidence),

@@ -26,15 +26,14 @@
 //!
 //! # Loudness normalization
 //!
-//! Raw `rms` is a poor brightness driver — real music sits around `0.1..=0.25`,
-//! so a level fed the bare value barely moves. As in `aurora`, loudness is
-//! normalized against an adaptive **ceiling** (a fast-attack, slow-release
-//! peak-follower over `rms`, floored so silence cannot divide the ratio up)
-//! before it drives the level envelope. The result is level-independent: on any
-//! material the ceiling calibrates to that material's own loud passages. In
-//! `Quiet`/`Idle` the input `rms` falls, the ceiling releases and the level
-//! envelope eases the field down gracefully — the same handling `aurora` relies
-//! on — while the swells keep drifting so the surface never freezes.
+//! The overall brightness breathes with the engine-normalized `loudness` — the
+//! mono rms divided by a slow auto-reference, computed once on the DSP thread and
+//! already level-independent (`0..=1`, sustained program ~0.6..=0.85). The scene
+//! folds that driver through its own slow level envelope; it no longer keeps a
+//! private loudness ceiling, since the engine now performs that normalization for
+//! every consumer. In `Quiet`/`Idle` the input loudness falls and the envelope
+//! eases the field down gracefully while the swells keep drifting so the surface
+//! never freezes.
 //!
 //! # Parameters
 //!
@@ -52,10 +51,9 @@
 //!
 //! # Continuity
 //!
-//! [`Scene::state`] carries the four swell phases, the loudness envelope, the
-//! loudness ceiling and the front-lift (low-band) envelope, so a hot reload
-//! resumes the drift, the current brightness and the front swell's lift rather
-//! than snapping back to the start.
+//! [`Scene::state`] carries the four swell phases, the loudness envelope and the
+//! front-lift (low-band) envelope, so a hot reload resumes the drift, the current
+//! brightness and the front swell's lift rather than snapping back to the start.
 
 use crate::canvas::{Canvas, Style};
 use crate::scene::{ParamSpec, Params, Scene, SceneCtx, SceneState};
@@ -77,12 +75,6 @@ const TWO_PI: f32 = std::f32::consts::TAU;
 const ATTACK_TAU: f32 = 0.5;
 /// Level-envelope time constant while easing back down (seconds).
 const RELEASE_TAU: f32 = 1.4;
-/// Loudness-ceiling attack time constant (seconds); see `aurora`'s docs.
-const CEILING_ATTACK_TAU: f32 = 0.3;
-/// Loudness-ceiling release time constant (seconds).
-const CEILING_RELEASE_TAU: f32 = 10.0;
-/// Floor under the loudness ceiling, bounding the normalizing divisor.
-const CEILING_FLOOR: f32 = 0.05;
 /// Front-lift (low-band) follower time constant (seconds): a calm swell of the
 /// front ridge with the bass, never a per-frame twitch.
 const BASS_TAU: f32 = 0.35;
@@ -165,8 +157,6 @@ pub struct Tide {
     phase: [f32; NSWELLS],
     /// Slow loudness envelope in `0.0..=1.0`; breathes the brightness.
     loud_env: f32,
-    /// Adaptive loudness ceiling: a slow peak-follower over `rms`.
-    loud_ceiling: f32,
     /// Low-band envelope in `0.0..=1.0`; lifts and swells the front ridge.
     bass_env: f32,
     /// Swell speed multiplier.
@@ -191,7 +181,6 @@ impl Tide {
         Self {
             phase: INITIAL_PHASES,
             loud_env: 0.0,
-            loud_ceiling: CEILING_FLOOR,
             bass_env: 0.0,
             drift: 1.0,
             swell: 0.12,
@@ -232,7 +221,6 @@ impl Scene for Tide {
         self.read_params(&ctx.params);
         self.phase = INITIAL_PHASES;
         self.loud_env = 0.0;
-        self.loud_ceiling = CEILING_FLOOR;
         self.bass_env = 0.0;
         self.buf.clear();
         self.buf.resize(COLS * ROWS, 0.0);
@@ -251,20 +239,10 @@ impl Scene for Tide {
             *p = (*p + dt * self.drift * SPEEDS[k]).rem_euclid(TWO_PI);
         }
 
-        // Overall level breathes with loudness. `lufs_momentary` is reserved (0
-        // in schema 1), so loudness is read from `rms`; normalize it against an
-        // adaptive ceiling (as `aurora` does) so the response is level-
-        // independent, then fold the normalized driver through a slow envelope.
-        // In `Quiet`/`Idle` the raw rms falls and this eases the field down.
-        let rms = f.rms.clamp(0.0, 1.0);
-        let (ceil_target, ceil_tau) = if rms > self.loud_ceiling {
-            (rms, CEILING_ATTACK_TAU)
-        } else {
-            (CEILING_FLOOR, CEILING_RELEASE_TAU)
-        };
-        self.loud_ceiling += (ceil_target - self.loud_ceiling) * follow_coeff(dt, ceil_tau);
-        self.loud_ceiling = self.loud_ceiling.max(CEILING_FLOOR);
-        let loud_target = (rms / self.loud_ceiling).clamp(0.0, 1.0);
+        // Overall level breathes with the engine-normalized loudness (already
+        // level-independent, `0..=1`), folded through a slow envelope. In
+        // `Quiet`/`Idle` the input loudness falls and this eases the field down.
+        let loud_target = f.loudness.clamp(0.0, 1.0);
         let loud_tau = if loud_target > self.loud_env {
             ATTACK_TAU
         } else {
@@ -328,7 +306,6 @@ impl Scene for Tide {
             s.set(&format!("phase{k}"), *p);
         }
         s.set("loud", self.loud_env);
-        s.set("ceil", self.loud_ceiling);
         s.set("bass", self.bass_env);
         s
     }
@@ -341,9 +318,6 @@ impl Scene for Tide {
         }
         if let Some(v) = s.get("loud") {
             self.loud_env = v;
-        }
-        if let Some(v) = s.get("ceil") {
-            self.loud_ceiling = v.max(CEILING_FLOOR);
         }
         if let Some(v) = s.get("bass") {
             self.bass_env = v;

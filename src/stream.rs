@@ -534,6 +534,7 @@ mod tests {
             dropped_frames: 0,
             rms,
             peak: rms,
+            loudness: rms,
             lufs_momentary: 0.0,
             spectrum: vec![0.1, 0.2, 0.3, 0.4],
             bands: [1.0, 0.5, 0.25],

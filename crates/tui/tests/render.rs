@@ -318,7 +318,7 @@ fn overlay_panel_shows_every_signal() {
         "overlay missing tier label: {panel:?}"
     );
     assert!(
-        panel.contains("schema v1"),
+        panel.contains("schema v2"),
         "overlay missing schema: {panel:?}"
     );
     // The spectrum strip drew at least one eighth-block glyph.
@@ -594,7 +594,7 @@ fn chrome_yields_to_the_debug_overlay_when_both_are_visible() {
     let buf = render(120, 40, &snap, &ui);
     let panel = rows(&buf, 35, 40, 120);
     assert!(
-        panel.contains("bass") && panel.contains("schema v1"),
+        panel.contains("bass") && panel.contains("schema v2"),
         "the debug overlay owns its claimed rows: {panel:?}"
     );
     // The instrument rail's VU marker must not appear anywhere — the overlay

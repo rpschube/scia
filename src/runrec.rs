@@ -95,6 +95,7 @@ impl RunRecorder {
             hop: Hop {
                 t_ms: 0.0,
                 rms: 0.0,
+                loudness: None,
                 bands: Vec::with_capacity(3),
                 onset: 0.0,
                 beat_conf: None,
@@ -145,6 +146,7 @@ impl RunRecorder {
     fn write_hop(&mut self, snap: &FeatureSnapshot) {
         self.hop.t_ms = Self::snap_t_ms(snap);
         self.hop.rms = snap.rms;
+        self.hop.loudness = Some(snap.loudness);
         self.hop.bands.clear();
         self.hop.bands.extend_from_slice(&snap.bands);
         // The continuous onset strength (normalized spectral flux); the discrete

@@ -95,6 +95,10 @@ pub struct FeatureFrame {
     pub rms: f32,
     /// Peak absolute sample over the hop (`0.0..=1.0` for in-range audio).
     pub peak: f32,
+    /// Engine-normalized loudness in `0.0..=1.0`: rms divided by a slow
+    /// auto-reference, level-independent. New in schema 2. See
+    /// [`FeatureSnapshot::loudness`](scia_core::FeatureSnapshot::loudness).
+    pub loudness: f32,
     /// Momentary loudness (LUFS). Reserved, 0 in schema 1.
     pub lufs_momentary: f32,
     /// Display spectrum: the valid log-spaced bars in `0.0..=1.0`. Its length is
@@ -140,6 +144,7 @@ impl FeatureFrame {
             dropped_frames: snap.dropped_frames,
             rms: snap.rms,
             peak: snap.peak,
+            loudness: snap.loudness,
             lufs_momentary: snap.lufs_momentary,
             spectrum: snap.spectrum[..len].to_vec(),
             bands: snap.bands,
@@ -175,6 +180,7 @@ impl FeatureFrame {
             dropped_frames: self.dropped_frames,
             rms: self.rms,
             peak: self.peak,
+            loudness: self.loudness,
             lufs_momentary: self.lufs_momentary,
             spectrum,
             spectrum_len: len as u16,
@@ -314,6 +320,7 @@ pub fn encode_binary_payload(frame: &FeatureFrame) -> Vec<u8> {
     out.extend_from_slice(&frame.dropped_frames.to_le_bytes());
     out.extend_from_slice(&frame.rms.to_le_bytes());
     out.extend_from_slice(&frame.peak.to_le_bytes());
+    out.extend_from_slice(&frame.loudness.to_le_bytes());
     out.extend_from_slice(&frame.lufs_momentary.to_le_bytes());
     // Spectrum: a u16 count then that many f32 bars.
     let len = frame.spectrum.len().min(SPECTRUM_BINS) as u16;
@@ -406,6 +413,7 @@ pub fn decode_binary_payload(bytes: &[u8]) -> Result<FeatureFrame, StreamError> 
     let dropped_frames = c.u64()?;
     let rms = c.f32()?;
     let peak = c.f32()?;
+    let loudness = c.f32()?;
     let lufs_momentary = c.f32()?;
     let spec_len = (c.u16()? as usize).min(SPECTRUM_BINS);
     let mut spectrum = Vec::with_capacity(spec_len);
@@ -437,6 +445,7 @@ pub fn decode_binary_payload(bytes: &[u8]) -> Result<FeatureFrame, StreamError> 
         dropped_frames,
         rms,
         peak,
+        loudness,
         lufs_momentary,
         spectrum,
         bands,
@@ -781,6 +790,7 @@ mod tests {
             dropped_frames: 42,
             rms: 0.123_45,
             peak: 1.0,
+            loudness: 0.678_9,
             lufs_momentary: -14.0,
             spectrum,
             bands: [0.0, 1.5, 4.0],
@@ -897,6 +907,27 @@ mod tests {
     }
 
     #[test]
+    fn old_schema_frame_is_rejected() {
+        // A frame recorded under the previous schema (1) — before `loudness` — is
+        // rejected by this build (schema 2) with the same clear error, so a
+        // stale clip cannot be mis-parsed against the new layout.
+        assert_eq!(
+            STREAM_SCHEMA_VERSION, 2,
+            "this test pins the current schema"
+        );
+        let mut frame = sample_frame();
+        frame.schema = 1;
+        let line = serde_json::to_string(&frame).unwrap();
+        match from_json_line(&line) {
+            Err(StreamError::UnsupportedSchema { found, expected }) => {
+                assert_eq!(found, 1);
+                assert_eq!(expected, STREAM_SCHEMA_VERSION);
+            }
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_binary_header_schema_is_rejected() {
         let mut header = [0u8; BINARY_HEADER_LEN];
         header[..4].copy_from_slice(&STREAM_MAGIC);
@@ -968,9 +999,9 @@ mod tests {
         let frame = FeatureFrame::from_snapshot(&snap);
         let line = to_json_line(&frame).unwrap();
         let expected = concat!(
-            r#"{"schema":1,"generation":3,"timestamp_ns":1000000,"sample_rate":48000,"#,
+            r#"{"schema":2,"generation":3,"timestamp_ns":1000000,"sample_rate":48000,"#,
             r#""channels":2,"starved":false,"activity":"active","quiet_ms":0.0,"#,
-            r#""dropped_frames":0,"rms":0.5,"peak":0.8,"lufs_momentary":0.0,"#,
+            r#""dropped_frames":0,"rms":0.5,"peak":0.8,"loudness":0.0,"lufs_momentary":0.0,"#,
             r#""spectrum":[0.0,0.25,0.5,1.0],"bands":[1.0,0.5,0.25],"flux":0.1,"#,
             r#""onset":false,"onset_age_ms":0.0,"beat_phase":0.0,"beat_confidence":0.9,"#,
             r#""tempo_bpm":120.0,"stereo_correlation":0.0,"mid_side_ratio":0.0,"#,
