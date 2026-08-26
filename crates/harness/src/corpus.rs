@@ -22,7 +22,15 @@ use crate::synth::{SynthSpec, synth_spec};
 pub const COMMIT_SIZE_LIMIT: usize = 1_000_000;
 
 /// One clip in the corpus manifest.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Beyond the identity/hash fields, an entry may carry **provenance** so a clip
+/// rendered offline from freely-licensed source audio is fully regenerable: the
+/// source's title/artist/license/URL, the hash of the exact downloaded source
+/// file, the segment cut from it, the render gain, and a free-text one-liner of
+/// the reproduction pipeline. Every provenance field defaults to empty and is
+/// omitted from the serialised TOML when unset, so a pure-synth entry that
+/// carries none of them round-trips byte-identically.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClipEntry {
     /// Stable clip id (also the file stem and the `run --clip` key).
     pub id: String,
@@ -32,15 +40,46 @@ pub struct ClipEntry {
     pub path: String,
     /// Clip duration in seconds.
     pub duration_s: f32,
-    /// SHA-256 of the encoded clip bytes, lowercase hex.
+    /// SHA-256 of the encoded FEATURE-CLIP file bytes, lowercase hex.
     pub sha256: String,
     /// Free-form notes.
     #[serde(default)]
     pub notes: String,
-    /// When `true`, the clip is regenerated and hash-compared rather than
-    /// hashed from a committed file.
+    /// When `true`, the clip is regenerated in-repo from a [`SynthSpec`] and
+    /// hash-compared rather than hashed from a committed file.
     #[serde(default)]
     pub generated: bool,
+
+    // --- Provenance (for clips rendered offline from downloaded source audio) ---
+    /// Source work's title.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Source work's artist / author.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub artist: String,
+    /// Source licence, e.g. "CC BY 4.0" or "Public Domain".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub license: String,
+    /// Page or file URL the source audio came from.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_url: String,
+    /// SHA-256 of the exact downloaded source audio file, pre-transcode,
+    /// lowercase hex.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub audio_sha256: String,
+    /// Start offset of the slice cut from the source, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_start_s: Option<f32>,
+    /// Length of the slice cut from the source, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_len_s: Option<f32>,
+    /// The `--gain-db` applied at render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f32>,
+    /// Free-text one-liner of the exact reproduction pipeline (e.g. the ffmpeg
+    /// transcode + `scia --from-file` command shapes).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub render_cmd: String,
 }
 
 /// The corpus manifest: a list of clip entries.
@@ -143,6 +182,7 @@ pub fn synth_clip(spec: &SynthSpec, corpus_root: &Path) -> Result<SynthOutcome, 
             spec.bpm, spec.sample_rate, spec.channels
         ),
         generated: !committed,
+        ..ClipEntry::default()
     };
 
     let manifest_path = corpus_root.join("manifest.toml");
@@ -201,6 +241,16 @@ fn verify_entry(entry: &ClipEntry, corpus_root: &Path) -> VerifyResult {
         let path = corpus_root.join(&entry.path);
         match std::fs::read(&path) {
             Ok(bytes) => sha256_hex(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return VerifyResult {
+                    id: entry.id.clone(),
+                    ok: false,
+                    detail: format!(
+                        "file missing — re-render from source, see manifest provenance ({})",
+                        path.display()
+                    ),
+                };
+            }
             Err(e) => {
                 return VerifyResult {
                     id: entry.id.clone(),
@@ -252,6 +302,7 @@ mod tests {
             sha256: "abc123".to_string(),
             notes: "n".to_string(),
             generated: false,
+            ..ClipEntry::default()
         });
         m.upsert(ClipEntry {
             id: "a-clip".to_string(),
@@ -261,11 +312,159 @@ mod tests {
             sha256: "def456".to_string(),
             notes: String::new(),
             generated: true,
+            ..ClipEntry::default()
         });
         // Sorted by id.
         assert_eq!(m.clips[0].id, "a-clip");
         let text = m.to_toml().unwrap();
         let back: Manifest = toml::from_str(&text).unwrap();
         assert_eq!(back.clips, m.clips);
+    }
+
+    /// Path to the committed corpus manifest, relative to this crate.
+    fn committed_manifest_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../quality/corpus/manifest.toml")
+    }
+
+    #[test]
+    fn committed_manifest_loads_and_resaves_byte_stable() {
+        let path = committed_manifest_path();
+        let original = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let manifest = Manifest::load(&path).expect("committed manifest loads");
+        // The synth entry predates the provenance fields and must keep loading
+        // without them; rendered entries carry them. Both live in the manifest.
+        assert!(!manifest.clips.is_empty(), "manifest has at least one clip");
+        let synth = manifest.clip("synth-music").expect("synth entry present");
+        assert!(synth.generated);
+        assert!(synth.title.is_empty());
+        assert!(synth.source_url.is_empty());
+        // Re-serialising loses nothing: byte-identical to the committed file.
+        assert_eq!(manifest.to_toml().unwrap(), original);
+    }
+
+    #[test]
+    fn entry_with_all_provenance_fields_round_trips() {
+        let mut m = Manifest::default();
+        let entry = ClipEntry {
+            id: "rendered-clip".to_string(),
+            genre: "jazz".to_string(),
+            path: "clips/rendered-clip.ndjson".to_string(),
+            duration_s: 20.0,
+            sha256: "feedface".to_string(),
+            notes: "rendered offline from source".to_string(),
+            generated: false,
+            title: "Some Tune".to_string(),
+            artist: "Some Artist".to_string(),
+            license: "CC BY 4.0".to_string(),
+            source_url: "https://example.org/audio.flac".to_string(),
+            audio_sha256: "0badc0de".to_string(),
+            segment_start_s: Some(12.5),
+            segment_len_s: Some(20.0),
+            gain_db: Some(-3.0),
+            render_cmd: "ffmpeg -i src.flac -ar 48000 out.wav && scia --from-file out.wav \
+                --gain-db -3"
+                .to_string(),
+        };
+        m.upsert(entry.clone());
+        let text = m.to_toml().unwrap();
+        let back: Manifest = toml::from_str(&text).unwrap();
+        assert_eq!(back.clips, m.clips);
+        assert_eq!(back.clips[0], entry);
+    }
+
+    #[test]
+    fn entry_without_provenance_serialises_without_those_keys() {
+        let mut m = Manifest::default();
+        m.upsert(ClipEntry {
+            id: "plain".to_string(),
+            genre: "synthetic".to_string(),
+            path: "clips/plain.ndjson".to_string(),
+            duration_s: 30.0,
+            sha256: "abc123".to_string(),
+            notes: String::new(),
+            generated: true,
+            ..ClipEntry::default()
+        });
+        let text = m.to_toml().unwrap();
+        // None of the provenance keys are emitted when unset.
+        for key in [
+            "title",
+            "artist",
+            "license",
+            "source_url",
+            "audio_sha256",
+            "segment_start_s",
+            "segment_len_s",
+            "gain_db",
+            "render_cmd",
+        ] {
+            assert!(
+                !text.contains(key),
+                "unset provenance key `{key}` leaked into TOML:\n{text}"
+            );
+        }
+        // And it still round-trips.
+        let back: Manifest = toml::from_str(&text).unwrap();
+        assert_eq!(back.clips, m.clips);
+    }
+
+    #[test]
+    fn verify_missing_non_generated_clip_fails_but_others_still_checked() {
+        let root =
+            std::env::temp_dir().join(format!("scia-corpus-verify-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // One committed clip that exists on disk, one that is missing.
+        let clips_dir = root.join("clips");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        let present_bytes = b"present clip bytes\n";
+        std::fs::write(clips_dir.join("present.ndjson"), present_bytes).unwrap();
+        let present_sha = sha256_hex(present_bytes);
+
+        let mut m = Manifest::default();
+        m.upsert(ClipEntry {
+            id: "present".to_string(),
+            genre: "rock".to_string(),
+            path: "clips/present.ndjson".to_string(),
+            duration_s: 5.0,
+            sha256: present_sha,
+            notes: String::new(),
+            generated: false,
+            ..ClipEntry::default()
+        });
+        m.upsert(ClipEntry {
+            id: "missing".to_string(),
+            genre: "jazz".to_string(),
+            path: "clips/missing.ndjson".to_string(),
+            duration_s: 5.0,
+            sha256: "deadbeef".to_string(),
+            notes: String::new(),
+            generated: false,
+            source_url: "https://example.org/src.flac".to_string(),
+            ..ClipEntry::default()
+        });
+        m.save(&root.join("manifest.toml")).unwrap();
+
+        let results = verify(&root).expect("verify runs to completion");
+        assert_eq!(
+            results.len(),
+            2,
+            "both clips are reported, none aborts the run"
+        );
+
+        let present = results.iter().find(|r| r.id == "present").unwrap();
+        assert!(present.ok, "present clip verifies: {}", present.detail);
+
+        let missing = results.iter().find(|r| r.id == "missing").unwrap();
+        assert!(!missing.ok, "missing clip fails");
+        assert!(
+            missing.detail.contains("file missing")
+                && missing.detail.contains("re-render from source"),
+            "missing-file detail is a clear provenance hint: {}",
+            missing.detail
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
