@@ -1,4 +1,256 @@
 [[clip]]
+id = "ambient-eternity"
+genre = "ambient"
+path = "clips/ambient-eternity.bin"
+duration_s = 35.0
+sha256 = "3c2a112a981a965b964d8f88f2feb31a74755b9c1a7d93ae04ac61be1d346b03"
+notes = "FLAC source; beatless regime"
+generated = false
+title = "Eternity"
+artist = "Stellardrone"
+license = "CC BY 3.0"
+source_url = "https://archive.org/details/Stellardrone-LightYears"
+audio_sha256 = "c76b0bc49fe5ba970b17f192834f6c04cfcc0e35d7b78ce55dcb3fa24c1883e7"
+segment_start_s = 340.0
+segment_len_s = 35.0
+gain_db = 1.4
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "ambient-ultra-deep-field"
+genre = "ambient"
+path = "clips/ambient-ultra-deep-field.bin"
+duration_s = 35.0
+sha256 = "0ce5625847b8b19f8c4a8df99907c1f7f826259e13c88942ef183ee99bd2f668"
+notes = "deliberately UN-normalized quiet clip (-27.3 LUFS integrated) - the auto-gain/quiet-path test; FLAC source"
+generated = false
+title = "Ultra Deep Field"
+artist = "Stellardrone"
+license = "CC BY 3.0"
+source_url = "https://archive.org/details/Stellardrone-LightYears"
+audio_sha256 = "9b4dc3f636dd6bb9733fd3a3dc217ee7255c3d8f60e85e59abd2b659e82b31f0"
+segment_start_s = 5.0
+segment_len_s = 35.0
+gain_db = 0.0
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "ambient-unraveling"
+genre = "ambient"
+path = "clips/ambient-unraveling.bin"
+duration_s = 35.0
+sha256 = "4819dbd844ec3b43e6b309d18249d6630d35a79a4e32253d97f2ad8ec0fb6684"
+notes = "slow string builds"
+generated = false
+title = "Unraveling"
+artist = "Scott Buckley"
+license = "CC BY 4.0"
+source_url = "https://www.scottbuckley.com.au/library/unraveling/"
+audio_sha256 = "82ed105724e6ee31d2007615472cb4e3621000edbff9a4aaf6a64789c32bece5"
+segment_start_s = 325.0
+segment_len_s = 35.0
+gain_db = 0.8
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "classical-beethoven5-i"
+genre = "classical"
+path = "clips/classical-beethoven5-i.bin"
+duration_s = 35.0
+sha256 = "200fb86b1f785a8a900931c2c2e9d0d7180b6d0596536fd9afa2aa5c5fd1475e"
+notes = "orchestral dynamic range"
+generated = false
+title = "Symphony No. 5 in C minor, I. Allegro con brio"
+artist = "Beethoven / Musopen"
+license = "Public Domain"
+source_url = "https://archive.org/details/SymphonyNo.5"
+audio_sha256 = "38002eab8db091ac099a55a94c8ab1a2ddd8a646eb88c4f39e36db7770c8007b"
+segment_start_s = 30.0
+segment_len_s = 35.0
+gain_db = 9.1
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "classical-goldberg-aria"
+genre = "classical"
+path = "clips/classical-goldberg-aria.bin"
+duration_s = 35.0
+sha256 = "dc11fd8e095e141d955bd3810dd142e33dc2f8fb01dd2aba1aca8137e98facc4"
+notes = "solo piano, rubato"
+generated = false
+title = "Goldberg Variations BWV 988 - Aria"
+artist = "Kimiko Ishizaka"
+license = "CC0 / Public Domain"
+source_url = "https://archive.org/details/OpenGoldbergVariations"
+audio_sha256 = "a36593c51a4afb80f6494abf975cb7b51e35f9fa6903f456edf53a31106b3749"
+segment_start_s = 195.0
+segment_len_s = 35.0
+gain_db = 11.2
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "hiphop-gotta-love-me"
+genre = "hiphop"
+path = "clips/hiphop-gotta-love-me.bin"
+duration_s = 35.0
+sha256 = "665cc30213a6e5c3157a647791aa5597bdb84c79886d12ab68e31f30c78e91ee"
+notes = "vocal-centric regime"
+generated = false
+title = "Gotta Love Me"
+artist = "Kellee Maize"
+license = "CC BY 4.0"
+source_url = "https://freemusicarchive.org/music/Kellee_Maize/The_5th_Element/03_Gotta_Love_Me/"
+audio_sha256 = "b389a2fc5c4682b2e37bfc70d7e3886bc75b36afeaa8ca20d5c72ea0dfdf9705"
+segment_start_s = 105.0
+segment_len_s = 35.0
+gain_db = -5.4
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "hiphop-why"
+genre = "hiphop"
+path = "clips/hiphop-why.bin"
+duration_s = 35.0
+sha256 = "73af4719aa7a46fb92d5e2bdb06b9eaeee4c85a63a68c8e14128a752b130c8e3"
+notes = "FMA serves the CC mixtape _06_ file for this track page"
+generated = false
+title = "Why"
+artist = "Mc Norman"
+license = "CC BY-SA 4.0"
+source_url = "https://freemusicarchive.org/music/Mc_Norman/Creative_Commons_The_2015_Unofficial_Mixtape/07_Why/"
+audio_sha256 = "a789218c02d154096d7ae7c464033d9434578f2b71dd6d4f2839c828806b7a01"
+segment_start_s = 190.0
+segment_len_s = 35.0
+gain_db = -5.6
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "house-fresh-flowers"
+genre = "house"
+path = "clips/house-fresh-flowers.bin"
+duration_s = 35.0
+sha256 = "ecf50b16862ccbed505ce28f02d88b8ba7a1052873a270d3f7e4faf34deba6a5"
+notes = ""
+generated = false
+title = "Fresh Flowers"
+artist = "1000 Handz"
+license = "CC BY 4.0"
+source_url = "https://freemusicarchive.org/music/1000-handz/cc-by-free-to-use-dancehouse-instrumentals/fresh-flowers/"
+audio_sha256 = "9edb277e1de43d856a9f4cad95091f9227b080375a91bf57558a16b39a402143"
+segment_start_s = 80.0
+segment_len_s = 35.0
+gain_db = -2.4
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "house-magnetz"
+genre = "house"
+path = "clips/house-magnetz.bin"
+duration_s = 35.0
+sha256 = "835aa8ed62957fc1fcc555f4fbc2d6a0c3df296e55b3f8dfdf37950c39efdb76"
+notes = ""
+generated = false
+title = "Magnetz"
+artist = "1000 Handz"
+license = "CC BY 4.0"
+source_url = "https://freemusicarchive.org/music/1000-handz/cc-by-free-to-use-dancehouse-instrumentals/magnetz/"
+audio_sha256 = "eff9be79067dc2382a7e439dbac10b58d949914a6addefe03935902bce406880"
+segment_start_s = 90.0
+segment_len_s = 35.0
+gain_db = -3.0
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "house-urbana-metronica"
+genre = "house"
+path = "clips/house-urbana-metronica.bin"
+duration_s = 35.0
+sha256 = "019a4a0dcbb42adb5526160dc35f79b626b36f0ff41ebb5ec0009389fd22e2ce"
+notes = "source is 128 kbps MP3; download needs Referer header from the file page"
+generated = false
+title = "Urbana-Metronica (wooh-yeah mix)"
+artist = "spinningmerkaba"
+license = "CC BY 3.0"
+source_url = "http://ccmixter.org/files/jlbrock44/33345"
+audio_sha256 = "5994ee5023c20bd748b8bfe5c28a2ed69c2338855b9077487cadf51299c2f9e7"
+segment_start_s = 45.0
+segment_len_s = 35.0
+gain_db = -4.7
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "rock-gypsy-song"
+genre = "rock"
+path = "clips/rock-gypsy-song.bin"
+duration_s = 35.0
+sha256 = "e684e7b1147d4705e79208c7d68bb97d9da37887968759350ef51e1d9dfb0bff"
+notes = "NC license - internal eval only"
+generated = false
+title = "The Gypsy Song"
+artist = "The Freak Fandango Orchestra"
+license = "CC BY-NC 4.0"
+source_url = "https://freemusicarchive.org/music/The_Freak_Fandango_Orchestra/Wild_Goats_and_Useless_Heroes/The_Gypsy_Song/"
+audio_sha256 = "116ac3e08219cd21ba9216252703e757e276793259c364af3d744871b0d81c6f"
+segment_start_s = 5.0
+segment_len_s = 35.0
+gain_db = -3.5
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "rock-rain-purple-frontiers"
+genre = "rock"
+path = "clips/rock-rain-purple-frontiers.bin"
+duration_s = 35.0
+sha256 = "2f57daf6699c72f061742b995e6623de5febcfe3d13c45ad4c82bc682d3bd6bf"
+notes = "source only available at 64 kbps MP3 - high-band spectrum dulled"
+generated = false
+title = "Rain in Purple Frontiers"
+artist = "Lorenzo's Music"
+license = "CC BY-SA 4.0"
+source_url = "https://freemusicarchive.org/music/Lorenzos_Music/single/rain-in-purple-frontiers/"
+audio_sha256 = "8113ca9d2dd7fa4e30155dc27dba135089d96ee58f7acf019076fb2592a8f53c"
+segment_start_s = 100.0
+segment_len_s = 35.0
+gain_db = 0.0
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "spoken-raven-chenevert"
+genre = "spoken"
+path = "clips/spoken-raven-chenevert.bin"
+duration_s = 35.0
+sha256 = "98119aa66058e28ee13e19a02fc962221ae14a57661b6293027530571a81d56a"
+notes = "second narrator; mono source"
+generated = false
+title = "The Raven"
+artist = "E.A. Poe, read by Phil Chenevert (LibriVox)"
+license = "Public Domain"
+source_url = "https://archive.org/details/ravenandpoemspoe_pc_librivox"
+audio_sha256 = "8fa3df4ca7d1d425079b5fb46f5dfabee01e87b1dc1088639641059120b76250"
+segment_start_s = 190.0
+segment_len_s = 35.0
+gain_db = 8.0
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "spoken-raven-goringe"
+genre = "spoken"
+path = "clips/spoken-raven-goringe.bin"
+duration_s = 35.0
+sha256 = "709009d3cb5e5f9ffa9ee4cffd6bfe5e1cb24793e7a952abe7a8f703284a7e7e"
+notes = "not-music regime; mono source"
+generated = false
+title = "The Raven"
+artist = "E.A. Poe, read by Chris Goringe (LibriVox)"
+license = "Public Domain"
+source_url = "https://archive.org/details/raven"
+audio_sha256 = "4602da8cd84c94e00784b2288e6f77c01a1049f46ebccaba08d863d57b3dd783"
+segment_start_s = 415.0
+segment_len_s = 35.0
+gain_db = 11.3
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
 id = "synth-music"
 genre = "synthetic"
 path = "clips/synth-music.ndjson"
@@ -6,3 +258,75 @@ duration_s = 30.0
 sha256 = "7268f375d7506e6b3884f9585a928a534f469c4f0008d61b058854c15eaadd92"
 notes = "deterministic synthetic clip: music @ 112 bpm, 48000 hz, 2ch"
 generated = true
+
+[[clip]]
+id = "tempo-dropoff"
+genre = "tempo-ambiguous"
+path = "clips/tempo-dropoff.bin"
+duration_s = 35.0
+sha256 = "cb29e3cd4745697cd93e94518f52b54f5f76576c4637298fb5859e3ee07da526"
+notes = "~80 bpm swung, parses half- or double-time; quietest source (-29.5 LUFS), normalized +15.5 dB"
+generated = false
+title = "The Dropoff"
+artist = "Blue Dot Sessions"
+license = "CC BY-NC 4.0"
+source_url = "https://freemusicarchive.org/music/Blue_Dot_Sessions/sketchbook-3/the-dropoff/"
+audio_sha256 = "7f7dab4c820cfbc253791872deaf81b4d022cda7c7936b5421e3bd1f8e69448f"
+segment_start_s = 50.0
+segment_len_s = 35.0
+gain_db = 15.5
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "tempo-spacy-tracy"
+genre = "tempo-ambiguous"
+path = "clips/tempo-spacy-tracy.bin"
+duration_s = 35.0
+sha256 = "f01dd8110403536b6e36f1c0b8cb7e5669521073a829c0234a900c17c0679db7"
+notes = "lo-fi downtempo, half/double-time hats; ND license - internal eval only"
+generated = false
+title = "Spacy Tracy (ID 2465)"
+artist = "Lobo Loco"
+license = "CC BY-NC-ND 4.0"
+source_url = "https://freemusicarchive.org/music/Lobo_Loco/danca/spacy-tracy-id-2465/"
+audio_sha256 = "42e2463b499f2a0b0d89b2101dd54e60c08ed4911467329f29702df32959f755"
+segment_start_s = 305.0
+segment_len_s = 35.0
+gain_db = -2.8
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "transient-balrog-boogie"
+genre = "transient"
+path = "clips/transient-balrog-boogie.bin"
+duration_s = 35.0
+sha256 = "2df65ac14c0bfd4e6580cdcca6a875c4391277cada8d6ecfdd9d0fdc11b89130"
+notes = "fast swing-metal, live drums; ND license - internal eval only"
+generated = false
+title = "Balrog Boogie"
+artist = "Diablo Swing Orchestra"
+license = "CC BY-NC-ND 3.0"
+source_url = "https://archive.org/details/jamendo-049216"
+audio_sha256 = "ba551ece055d74407f86bde8139a1a1a46597cb0b4d452d54290b6c943f6a81b"
+segment_start_s = 5.0
+segment_len_s = 35.0
+gain_db = -4.7
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"
+
+[[clip]]
+id = "transient-relativity"
+genre = "transient"
+path = "clips/transient-relativity.bin"
+duration_s = 35.0
+sha256 = "620467109814291416350b0fe97da5025f8e483d106167ad531570a62b65f1e8"
+notes = "drum & bass ~170 bpm"
+generated = false
+title = "Relativity"
+artist = "1000 Handz"
+license = "CC BY 4.0"
+source_url = "https://freemusicarchive.org/music/1000-handz/cc-by-free-to-use-drum-bass-instrumentals/relativity/"
+audio_sha256 = "30a9e7381995cd3a34befde59fb5ac133e15a80814d8e199ad09b095943e20c8"
+segment_start_s = 120.0
+segment_len_s = 35.0
+gain_db = -5.5
+render_cmd = "ffmpeg -ss <segment_start_s> -t <segment_len_s> -i <source> -ar 48000 -ac 2 -c:a pcm_s16le seg.wav && scia --from-file seg.wav --gain-db <gain_db> --output binary > <path>"

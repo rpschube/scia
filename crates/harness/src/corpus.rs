@@ -332,19 +332,13 @@ mod tests {
         let original = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let manifest = Manifest::load(&path).expect("committed manifest loads");
-        // The pure-synth entry must carry no provenance fields.
+        // The synth entry predates the provenance fields and must keep loading
+        // without them; rendered entries carry them. Both live in the manifest.
         assert!(!manifest.clips.is_empty(), "manifest has at least one clip");
-        for clip in &manifest.clips {
-            assert!(clip.title.is_empty());
-            assert!(clip.artist.is_empty());
-            assert!(clip.license.is_empty());
-            assert!(clip.source_url.is_empty());
-            assert!(clip.audio_sha256.is_empty());
-            assert!(clip.segment_start_s.is_none());
-            assert!(clip.segment_len_s.is_none());
-            assert!(clip.gain_db.is_none());
-            assert!(clip.render_cmd.is_empty());
-        }
+        let synth = manifest.clip("synth-music").expect("synth entry present");
+        assert!(synth.generated);
+        assert!(synth.title.is_empty());
+        assert!(synth.source_url.is_empty());
         // Re-serialising loses nothing: byte-identical to the committed file.
         assert_eq!(manifest.to_toml().unwrap(), original);
     }
