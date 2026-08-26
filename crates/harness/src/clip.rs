@@ -144,15 +144,27 @@ pub fn resolve(arg: &str, corpus_root: &Path) -> Result<ResolvedClip, ClipError>
     })
 }
 
-/// Infer the hop cadence in milliseconds from the first two frames' timestamps,
-/// falling back to the canonical 256-frame hop at the clip's sample rate.
+/// Infer the hop cadence in milliseconds as the median of the clip's positive
+/// inter-frame timestamp deltas, falling back to the canonical 256-frame hop at
+/// the clip's sample rate when no positive delta exists.
+///
+/// The median, not the first delta: a live capture's opening gap is a warm-up
+/// transient (the recorder's first tick samples a not-yet-settled pipeline), and
+/// real Windows loopback clips jitter frame-to-frame — a single outlier must not
+/// set the cadence that latency metrics are converted through.
 #[must_use]
 pub fn infer_hop_ms(frames: &[FeatureFrame]) -> f32 {
-    if let (Some(a), Some(b)) = (frames.first(), frames.get(1)) {
-        let dt_ns = b.timestamp_ns.saturating_sub(a.timestamp_ns);
-        if dt_ns > 0 {
-            return dt_ns as f32 / 1.0e6;
-        }
+    let mut deltas: Vec<u64> = frames
+        .windows(2)
+        .filter_map(|w| {
+            let dt = w[1].timestamp_ns.saturating_sub(w[0].timestamp_ns);
+            (dt > 0).then_some(dt)
+        })
+        .collect();
+    if !deltas.is_empty() {
+        let mid = deltas.len() / 2;
+        let (_, median, _) = deltas.select_nth_unstable(mid);
+        return *median as f32 / 1.0e6;
     }
     let sr = frames.first().map_or(48_000, |f| f.sample_rate).max(1);
     crate::synth::HOP_FRAMES as f32 / sr as f32 * 1000.0
@@ -162,4 +174,63 @@ pub fn infer_hop_ms(frames: &[FeatureFrame]) -> f32 {
 #[must_use]
 pub fn default_clip_path(corpus_root: &Path, id: &str) -> PathBuf {
     corpus_root.join("clips").join(format!("{id}.ndjson"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scia_core::stream::FeatureFrame;
+
+    /// A minimal valid frame at `timestamp_ns`; only the timestamp matters here.
+    fn frame_at(timestamp_ns: u64) -> FeatureFrame {
+        FeatureFrame {
+            schema: scia_core::STREAM_SCHEMA_VERSION,
+            generation: 0,
+            timestamp_ns,
+            sample_rate: 48_000,
+            channels: 2,
+            starved: false,
+            activity: scia_core::Activity::Active,
+            quiet_ms: 0.0,
+            dropped_frames: 0,
+            rms: 0.1,
+            peak: 0.1,
+            lufs_momentary: 0.0,
+            spectrum: vec![0.0; 4],
+            bands: [0.0; 3],
+            flux: 0.0,
+            onset: false,
+            onset_age_ms: 0.0,
+            beat_phase: 0.0,
+            beat_confidence: 0.0,
+            tempo_bpm: 0.0,
+            stereo_correlation: 0.0,
+            mid_side_ratio: 0.0,
+            chroma: [0.0; 12],
+        }
+    }
+
+    #[test]
+    fn hop_ms_is_the_median_delta_not_the_first() {
+        // A live capture's warm-up transient: first gap 47 ms, steady state 20 ms.
+        let mut ts = 0u64;
+        let mut frames = vec![frame_at(0)];
+        for (i, _) in (0..40).enumerate() {
+            ts += if i == 0 { 47_000_000 } else { 20_000_000 };
+            frames.push(frame_at(ts));
+        }
+        let hop = infer_hop_ms(&frames);
+        assert!((hop - 20.0).abs() < 0.01, "median expected, got {hop}");
+    }
+
+    #[test]
+    fn hop_ms_falls_back_on_flat_timestamps() {
+        let frames = vec![frame_at(5), frame_at(5), frame_at(5)];
+        let expected = crate::synth::HOP_FRAMES as f32 / 48_000.0 * 1000.0;
+        let hop = infer_hop_ms(&frames);
+        assert!(
+            (hop - expected).abs() < 1e-3,
+            "fallback expected, got {hop}"
+        );
+    }
 }
