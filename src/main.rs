@@ -19,6 +19,7 @@
 
 mod config;
 mod logging;
+mod offline;
 mod runrec;
 mod stream;
 
@@ -308,9 +309,39 @@ struct Cli {
 
     /// Feature frames per second for --output (1..=1000, default 60). While the
     /// engine is idle the stream drops to a slower keepalive cadence regardless.
-    /// Only valid with --output.
+    /// Only valid with --output. Rejected with --from-file (offline mode emits
+    /// one frame per DSP hop, not a subsampled rate).
     #[arg(long, value_name = "N", requires = "output")]
     rate: Option<u32>,
+
+    /// Render an audio FILE through the exact live DSP chain into a feature
+    /// stream, faster than realtime and bit-for-bit deterministic (US-CORPUS).
+    /// The input is WAV only: 16- or 24-bit PCM or 32-bit IEEE float, 48000 Hz,
+    /// mono or stereo (mono is duplicated to stereo). Requires --output; the
+    /// stream is one frame per DSP hop (the native ~187 fps hop cadence, richer
+    /// than the live --rate subsampling), so --rate is rejected. Mutually
+    /// exclusive with --input, --listen and every live-capture flag. Redirect
+    /// stdout to record a clip: `scia --from-file take.wav --output binary >
+    /// clip.bin`.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "output",
+        conflicts_with_all = ["input", "listen", "rate", "demo", "demo_signal", "demo_bpm", "device", "pipewire", "no_pipewire", "perf_mode", "no_route_watch", "headless", "seconds", "list_devices"]
+    )]
+    from_file: Option<PathBuf>,
+
+    /// Linear gain in decibels applied to the input samples before the DSP, so
+    /// corpus prep can loudness-normalize externally-measured files without
+    /// re-encoding. Only valid with --from-file; the default is 0 dB (no change).
+    /// A negative value attenuates (e.g. `--gain-db -6`).
+    #[arg(
+        long,
+        value_name = "DB",
+        requires = "from_file",
+        allow_hyphen_values = true
+    )]
+    gain_db: Option<f32>,
 
     /// Render the full TUI from a feature stream instead of capturing local
     /// audio. The argument is either a TCP address (e.g. 127.0.0.1:9000) served
@@ -576,8 +607,14 @@ fn main() -> ExitCode {
     }
 
     // Headless machine-readable output: no TUI. Drives the same engine (demo or
-    // live capture) and serialises its feature bus to stdout or a socket.
+    // live capture) and serialises its feature bus to stdout or a socket. With
+    // --from-file the source is an audio file rendered offline through the DSP
+    // chain instead of a live engine (--from-file requires --output, so the
+    // format is always present here).
     if let Some(format) = cli.output {
+        if let Some(path) = cli.from_file.clone() {
+            return offline::run_from_file(&path, format.encoding(), cli.gain_db.unwrap_or(0.0));
+        }
         return run_output_mode(&cli, &resolved, format.encoding());
     }
 

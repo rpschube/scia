@@ -14,15 +14,16 @@ frame it does not understand.
 ## Command line
 
 ```text
-scia --output json                 # NDJSON frames to stdout, no UI
-scia --output binary               # binary frames to stdout, no UI
-scia --output json --listen ADDR   # serve frames to every client on a TCP socket
-scia --output json --rate 30       # cap the frame cadence (frames per second)
-scia --demo --output json          # drive the stream from the synthetic feed
-scia --output binary > clip.bin    # record a clip to a file
-scia --input ADDR                  # render the full UI from a remote stream
-scia --input clip.bin              # render the full UI by replaying a clip file
-scia --input clip.bin --input-loop # ...looping the clip for extended listening
+scia --output json                    # NDJSON frames to stdout, no UI
+scia --output binary                  # binary frames to stdout, no UI
+scia --output json --listen ADDR      # serve frames to every client on a TCP socket
+scia --output json --rate 30          # cap the frame cadence (frames per second)
+scia --demo --output json             # drive the stream from the synthetic feed
+scia --output binary > clip.bin       # record a clip to a file
+scia --from-file take.wav --output binary > clip.bin  # render a file offline into a clip
+scia --input ADDR                     # render the full UI from a remote stream
+scia --input clip.bin                 # render the full UI by replaying a clip file
+scia --input clip.bin --input-loop    # ...looping the clip for extended listening
 ```
 
 - `--output <json|binary>` runs headless: no scene, chrome or overlay is drawn.
@@ -47,10 +48,58 @@ scia --input clip.bin --input-loop # ...looping the clip for extended listening
   end of file, for extended A/B listening. It is an error alongside a socket
   `--input`.
 
+- `--from-file <PATH>` renders an audio **file** through the exact live DSP
+  chain into the feature stream instead of capturing live audio — faster than
+  realtime and **bit-for-bit deterministic** (the same file and flags produce
+  byte-identical output). Requires `--output`; mutually exclusive with
+  `--input`, `--listen` and every live-capture flag. See
+  [Offline render](#offline-render-from-a-file).
+- `--gain-db <DB>` (with `--from-file` only) applies a linear gain, in decibels,
+  to the input samples before the DSP, so corpus prep can loudness-normalize
+  externally-measured files without re-encoding. Default `0` (no change).
+
 `--output` and `--input` are mutually exclusive, and each conflicts with the
 flags that do not apply to it (`--output` with the UI-only flags; `--input` with
 the local-capture flags). `--listen` and `--rate` are only accepted with
-`--output`; `--input-loop` only with `--input`.
+`--output`; `--input-loop` only with `--input`; `--gain-db` only with
+`--from-file`. `--rate` is rejected with `--from-file` (offline mode emits one
+frame per DSP hop, not a subsampled rate).
+
+## Offline render from a file
+
+`scia --from-file <wav> --output <json|binary>` renders an audio file through
+the same DSP pipeline the live capture path runs, writing the feature stream to
+stdout (or a clip file by redirection). It never starts the realtime engine
+threads and is not paced by a clock, so it runs as fast as the CPU allows.
+
+```text
+scia --from-file take.wav --output binary > clip.bin   # record a clip from a file
+scia --from-file take.wav --output json                # NDJSON frames to stdout
+scia --from-file take.wav --gain-db -6 --output binary > quiet.bin  # attenuated
+scia --input clip.bin                                  # replay the rendered clip in the UI
+```
+
+- **Deterministic.** The same file and the same flags produce byte-identical
+  output. Timestamps are the sample clock (the hop index times the hop period),
+  never wall time, so nothing about the machine or the moment of the run leaks
+  into the bytes. This is what lets the scene-quality golden corpus be
+  regenerated from source audio: the manifest stores the source plus hashes, no
+  committed binaries, and no loopback jitter.
+- **One frame per DSP hop.** Offline emits a frame for **every** analysis hop
+  (the native ~187 fps hop cadence at 48 kHz), richer than the live `--output`
+  default of 60 fps subsampling. `--rate` therefore has no meaning offline and
+  is rejected.
+- **Capture-period chunking.** The input is fed to the pipeline on the same
+  period boundaries a live capture backend delivers, so an offline feature
+  stream is comparable to a live one — the same hop/window cadence, just not
+  paced by a clock.
+- **Input format.** WAV only: 16- or 24-bit PCM or 32-bit IEEE float, **48000
+  Hz**, mono or stereo (a mono file is duplicated to stereo so the chain always
+  sees the stereo shape live capture delivers). Anything else is a clear error
+  naming the constraint; transcode with an external tool first.
+
+The output is exactly the `--output` wire form below, so a rendered clip is a
+valid input for `scia --input` and `scia-harness run` unchanged.
 
 ## Recording and replaying a clip
 
