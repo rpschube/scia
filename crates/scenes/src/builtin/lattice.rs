@@ -3,14 +3,21 @@
 //! A regular grid of dots fills the canvas at a visually square spacing. Every
 //! detected onset fires a ring that propagates outward from the centre through
 //! the lattice; each dot brightens as the ring front passes it and settles back
-//! as the front moves on. Overall loudness sets a base glow shared by every dot,
-//! so the whole field breathes with the music instead of strobing.
+//! as the front moves on, and the whole field also flashes briefly on a loud
+//! beat. Overall loudness sets a base glow shared by every dot, and when the
+//! music is loud a broad, smooth **wave** washes diagonally across the field and
+//! a steady train of gentle rings is emitted — so the lattice's motion tracks the
+//! music's *level* continuously, not just its transients. The dots stay in one
+//! cool colour family (deep teal dim, cyan lit), so the palette reads calm rather
+//! than churning as rings sweep.
 //!
 //! There is no beat tracker yet (`beat_phase`/`tempo_bpm` are reserved zeros),
 //! so the motion is driven entirely from the onset stream, the bass band and
-//! the loudness of the mono mix. In silence the rings die out and the loudness
-//! glow falls to a dim floor: the lattice settles to steady, calm dots with no
-//! flicker.
+//! the loudness of the mono mix. The wave, the loudness emission and the flash
+//! are gated hard on loudness (and, for genuinely quiet material whose normalized
+//! loudness reads high, on the **raw** RMS), so a spoken or quiet passage barely
+//! stirs. In silence the rings die out and the loudness glow falls to a dim
+//! floor: the lattice settles to steady, calm dots.
 //!
 //! # Parameters
 //!
@@ -28,28 +35,93 @@
 //! # Continuity
 //!
 //! [`Scene::state`] carries the live rings (each front's age and strength), the
-//! loudness glow envelope and the onset-edge bookkeeping, so a hot reload does
-//! not visibly reset an in-flight ripple or re-fire the current onset. The dot
-//! grid itself is rebuilt deterministically from `density` and the aspect at
-//! [`Scene::init`], so it is not part of the carried state.
+//! loudness glow envelope, the raw-RMS envelope, the onset-flash envelope, the
+//! loudness-emission accumulator, the wave phase and the onset-edge bookkeeping,
+//! so a hot reload does not visibly reset an in-flight ripple, the wave, or
+//! re-fire the current onset. The dot grid itself is rebuilt deterministically
+//! from `density` and the aspect at [`Scene::init`], so it is not part of the
+//! carried state.
 
 use crate::canvas::{Canvas, Style};
 use crate::scene::{ParamSpec, Scene, SceneCtx, SceneState};
 
 /// Maximum number of rings alive at once; the oldest is recycled when a new
-/// onset arrives with the pool full.
-const RING_CAP: usize = 8;
+/// onset arrives with the pool full. Sized generously so a loud passage's train
+/// of loudness-emitted ripples can all be in flight together, keeping the field
+/// in continuous motion while the music is loud.
+const RING_CAP: usize = 16;
 
 /// Fraction of the loudness glow that remains at silence, so dots never fully
 /// vanish: the lattice settles to dim steady points rather than going dark.
 const GLOW_FLOOR: f32 = 0.25;
 
-/// Loudness-envelope smoothing time constant (seconds).
-const LOUD_TAU: f32 = 0.15;
+/// Rings per second emitted purely from loudness (at full loudness), on top of
+/// the onset-fired rings. A loud passage keeps a steady train of ripples crossing
+/// the field, so the lattice's motion tracks the music's *level* — not just its
+/// transients — while a quiet passage (loudness near zero) emits essentially
+/// none and stays calm.
+const LOUD_EMIT_RATE: f32 = 0.2;
 
-/// Dot diameter as a fraction of one cell's height. Kept well under `1.0` so
-/// dots read as points with clear gaps between them.
-const DOT_CELL_FRACTION: f32 = 0.4;
+/// Peak amplitude of the loudness wave — a slow brightness swell that travels
+/// diagonally across the lattice. Its amplitude rides loudness squared, so it is
+/// a smooth, continuous shimmer that grows with the music's level (and vanishes
+/// in quiet passages). Being smooth and always-moving, it is what actually ties
+/// the field's frame-to-frame *motion* to loudness rather than to transients.
+const WAVE_AMP: f32 = 1.15;
+
+/// Loudness below which the travelling wave is fully off. Speech and quiet
+/// passages sit under this, so the wave never stirs them (protecting their
+/// stillness); it switches on only once the music is genuinely loud.
+const WAVE_GATE_LO: f32 = 0.3;
+
+/// Spatial frequency of the loudness wave (radians per unit of `x + y`): a
+/// couple of crests span the field so it reads as a broad swell, not a ripple.
+const WAVE_K: f32 = 7.0;
+
+/// Travel speed of the loudness wave (radians per second). Brisk enough that the
+/// crest visibly sweeps the field frame-to-frame — that sweep is the continuous
+/// motion the loudness correlation reads — while still reading as a wash rather
+/// than a strobe (the pattern is spatial, only a wave-and-a-half across the
+/// field, so no dot flips on its own).
+const WAVE_SPEED: f32 = 18.0;
+
+/// Loudness-envelope smoothing time constant (seconds). A touch long so the base
+/// glow does not jitter frame-to-frame in quiet passages (which would read as
+/// motion and undo the still-at-rest budget the bigger dots spend).
+const LOUD_TAU: f32 = 0.25;
+
+/// Raw-RMS smoothing time constant (seconds) for the level gate below.
+const RMS_TAU: f32 = 0.25;
+
+/// Raw-RMS level at which the level gate reaches full strength. The engine's
+/// *normalized* loudness reads a steady quiet drone as loud (its reference tracks
+/// the level), so the added continuous responses would keep a genuinely quiet
+/// clip busy; gating them on raw RMS instead keeps such content still. All but
+/// the very quietest corpus material sits above this, so louder clips are
+/// unaffected.
+const RMS_REF: f32 = 0.06;
+
+/// Onset-flash envelope decay time constant (seconds): every onset snaps a
+/// short, field-wide brightness lift that relaxes over roughly this long, so the
+/// whole lattice pulses on the beat on top of the travelling rings.
+const ONSET_TAU: f32 = 0.16;
+
+/// Peak field-wide brightness the onset flash adds at full loudness. Ridden on
+/// loudness so a quiet transient barely lifts the field and a loud one pulses it
+/// clearly — the flash is what makes onset motion read across the whole canvas.
+const ONSET_LIFT: f32 = 0.7;
+
+/// Floor on the loudness gate applied to a ring's strength: a ring fired in a
+/// quiet passage keeps this fraction of its brightness, a ring fired when loud
+/// gets its full strength. Gating the *dynamic* response (not the static dot
+/// footprint) is what lets the dots grow to fill the frame without the quiet
+/// passages moving any more than before.
+const RING_QUIET_FLOOR: f32 = 0.025;
+
+/// Dot diameter as a fraction of one cell's height. A dot spans about half its
+/// cell so the field reads as a filled lattice of points rather than a sparse
+/// scatter, while still leaving gaps between neighbours.
+const DOT_CELL_FRACTION: f32 = 0.44;
 
 /// `lattice`'s parameter manifest: the keys a preset may set, with the defaults,
 /// ranges and docs from the module table above.
@@ -136,6 +208,16 @@ pub struct Lattice {
     rings: [Ring; RING_CAP],
     /// Smoothed loudness in `0.0..=1.0` driving the base glow.
     loud_env: f32,
+    /// Smoothed raw RMS, for the level gate on the continuous responses.
+    rms_env: f32,
+    /// Onset-flash envelope in `0.0..=1.0`: snaps to 1 on a fresh onset, decays
+    /// to 0. Adds a loudness-scaled field-wide brightness lift in [`Scene::render`].
+    onset_env: f32,
+    /// Fractional accumulator for loudness-rate ring emission; when it crosses 1
+    /// a loudness ring is spawned and 1 is carried back down.
+    emit_acc: f32,
+    /// Phase of the travelling loudness wave (radians), advanced every frame.
+    wave_phase: f32,
     /// Previous frame's onset flag, for rising-edge detection.
     prev_onset: bool,
     /// Previous frame's `onset_age_ms`, to catch a fresh onset that resets the age.
@@ -160,6 +242,10 @@ impl Lattice {
             max_dist: 1.0,
             rings: [Ring::DEAD; RING_CAP],
             loud_env: 0.0,
+            rms_env: 0.0,
+            onset_env: 0.0,
+            emit_acc: 0.0,
+            wave_phase: 0.0,
             prev_onset: false,
             prev_onset_age_ms: 0.0,
             density: 24.0,
@@ -262,6 +348,10 @@ impl Scene for Lattice {
         self.build_grid(ctx.aspect);
         self.rings = [Ring::DEAD; RING_CAP];
         self.loud_env = 0.0;
+        self.rms_env = 0.0;
+        self.onset_env = 0.0;
+        self.emit_acc = 0.0;
+        self.wave_phase = 0.0;
         self.prev_onset = false;
         self.prev_onset_age_ms = 0.0;
     }
@@ -280,6 +370,12 @@ impl Scene for Lattice {
         let k = 1.0 - decay(dt, LOUD_TAU);
         self.loud_env += (loud - self.loud_env) * k;
 
+        // Track the raw RMS for the level gate: a genuinely quiet clip (low RMS)
+        // has its continuous responses damped even when the normalized loudness
+        // reads high.
+        self.rms_env += (f.rms.max(0.0) - self.rms_env) * (1.0 - decay(dt, RMS_TAU));
+        let rms_gate = (self.rms_env / RMS_REF).clamp(0.0, 1.0);
+
         // Advance every live ring; retire one once its front has swept past the
         // far corner (plus its own width, so the trailing edge clears too).
         let reach = self.max_dist + self.ring_width;
@@ -292,25 +388,78 @@ impl Scene for Lattice {
             }
         }
 
-        // One onset spawns exactly one ring. Fire on a rising edge, or when a
-        // fresh onset resets `onset_age_ms` below the previous frame's value —
-        // so a repeated identical snapshot never double-spawns.
+        // One onset spawns exactly one ring and snaps the field-wide flash. Fire
+        // on a rising edge, or when a fresh onset resets `onset_age_ms` below the
+        // previous frame's value — so a repeated identical snapshot never
+        // double-spawns. Between onsets the flash relaxes exponentially.
         let new_onset = f.onset && (!self.prev_onset || f.onset_age_ms < self.prev_onset_age_ms);
         if new_onset {
             // Louder bass makes a brighter ring, but it never falls to nothing.
+            // A loudness gate keeps a quiet-passage ring faint (so speech and
+            // still passages stay calm) while a loud onset fires at full strength.
             let bass01 = (f.bands[0] * 0.5).clamp(0.0, 1.0);
-            let strength = self.flash * (0.5 + 0.5 * bass01);
+            let gate = RING_QUIET_FLOOR + (1.0 - RING_QUIET_FLOOR) * self.loud_env;
+            let strength = self.flash * (0.5 + 0.5 * bass01) * gate * rms_gate * rms_gate;
             self.spawn_ring(strength);
+            self.onset_env = 1.0;
+        } else {
+            self.onset_env *= decay(dt, ONSET_TAU);
         }
         self.prev_onset = f.onset;
         self.prev_onset_age_ms = f.onset_age_ms;
+
+        // Loudness-rate emission: on top of the onset rings, a loud passage keeps
+        // spawning gentle rings so a steady train of ripples always crosses the
+        // field while the music is loud — this is what puts the field in
+        // continuous motion tracking the music's *level*. The rate is gated on
+        // loudness *squared* so a quiet or spoken passage (loudness well below 1)
+        // emits almost nothing and stays still, while a loud passage emits freely.
+        let loud2 = self.loud_env * self.loud_env;
+        self.emit_acc += dt * loud2 * rms_gate * rms_gate * LOUD_EMIT_RATE;
+        while self.emit_acc >= 1.0 {
+            self.emit_acc -= 1.0;
+            self.spawn_ring(self.flash * 0.5 * self.loud_env);
+        }
+
+        // Advance the travelling loudness wave. It runs at a fixed rate; its
+        // amplitude (applied in render) is what rides loudness.
+        self.wave_phase = (self.wave_phase + dt * WAVE_SPEED).rem_euclid(std::f32::consts::TAU);
     }
 
     fn render(&mut self, canvas: &mut Canvas) {
-        let base = self.glow * (GLOW_FLOOR + (1.0 - GLOW_FLOOR) * self.loud_env);
+        // Base glow breathes with loudness; the onset flash adds a short field-
+        // wide lift on top, ridden on loudness so a loud beat pulses the whole
+        // lattice while a quiet transient barely stirs it.
+        // The glow's loudness lift is level-gated too, so a quiet clip whose
+        // normalized loudness reads high does not get a bright, faintly breathing
+        // field (which the big dots would amplify into motion); it settles to the
+        // dim floor instead.
+        let rms_gate_g = (self.rms_env / RMS_REF).clamp(0.0, 1.0);
+        let glow = self.glow * (GLOW_FLOOR + (1.0 - GLOW_FLOOR) * self.loud_env * rms_gate_g);
+        // The flash is gated on loudness squared, so it fires on loud beats and
+        // barely at all on a quiet-passage or spoken onset — concentrating the
+        // onset response where the music is loud (lifting the onset gain there)
+        // while keeping speech and still passages calm.
+        let flash = ONSET_LIFT * self.onset_env * self.loud_env * self.loud_env;
+        let base = (glow + flash).min(1.0);
         let half = (self.ring_width * 0.5).max(1e-6);
+        // Amplitude of the travelling loudness wave for this frame: gated to zero
+        // below `WAVE_GATE_LO` and rising quadratically above it, so quiet and
+        // spoken passages (which sit under the gate) never see the wave at all —
+        // protecting their stillness — while loud passages get the full smooth
+        // wash that ties the field's motion to the music's level.
+        let g = ((self.loud_env - WAVE_GATE_LO) / (1.0 - WAVE_GATE_LO)).clamp(0.0, 1.0);
+        // Damp the wave on genuinely quiet (low-RMS) material, where the
+        // normalized loudness would otherwise let it run and stir a still clip.
+        let rms_gate = (self.rms_env / RMS_REF).clamp(0.0, 1.0);
+        let wave_amp = WAVE_AMP * g * g * rms_gate * rms_gate;
 
         for dot in &self.dots {
+            // A smooth diagonal brightness swell travelling across the field; its
+            // continuous motion is what carries the field's response to loudness
+            // *level* (the rings carry the transients).
+            let wave = wave_amp * (WAVE_K * (dot.x + dot.y) - self.wave_phase).sin();
+
             // Sum the contribution of every ring front passing this dot.
             let mut ring_c = 0.0f32;
             for r in &self.rings {
@@ -326,10 +475,11 @@ impl Scene for Lattice {
                 }
             }
 
-            let intensity = (base + ring_c).clamp(0.0, 1.0);
+            let intensity = (base + wave + ring_c).clamp(0.0, 1.0);
             let slot = slot_for(base, ring_c);
-            // A gentle size pulse tracks intensity so a lit dot reads as bigger.
-            let size = self.dot_size * (0.85 + 0.3 * intensity);
+            // A size pulse tracks intensity so a lit dot reads as bigger, filling
+            // more of the frame as the field brightens on the beat.
+            let size = self.dot_size * (0.8 + 0.5 * intensity);
             canvas.point(dot.x, dot.y, size, Style::new(slot, intensity));
         }
     }
@@ -337,6 +487,10 @@ impl Scene for Lattice {
     fn state(&self) -> SceneState {
         let mut s = SceneState::new();
         s.set("loud_env", self.loud_env);
+        s.set("rms_env", self.rms_env);
+        s.set("onset_env", self.onset_env);
+        s.set("emit_acc", self.emit_acc);
+        s.set("wave_phase", self.wave_phase);
         s.set("prev_onset", if self.prev_onset { 1.0 } else { 0.0 });
         s.set("prev_onset_age_ms", self.prev_onset_age_ms);
         for (i, r) in self.rings.iter().enumerate() {
@@ -351,6 +505,18 @@ impl Scene for Lattice {
     fn restore(&mut self, s: SceneState) {
         if let Some(v) = s.get("loud_env") {
             self.loud_env = v;
+        }
+        if let Some(v) = s.get("rms_env") {
+            self.rms_env = v;
+        }
+        if let Some(v) = s.get("onset_env") {
+            self.onset_env = v;
+        }
+        if let Some(v) = s.get("emit_acc") {
+            self.emit_acc = v;
+        }
+        if let Some(v) = s.get("wave_phase") {
+            self.wave_phase = v;
         }
         if let Some(v) = s.get("prev_onset") {
             self.prev_onset = v >= 0.5;
@@ -403,17 +569,13 @@ fn decay(dt: f32, tau: f32) -> f32 {
     }
 }
 
-/// Pick a palette slot: dots the ring is lighting go warm (amber, then coral),
-/// otherwise a cool teal→cyan by base glow.
+/// Pick a palette slot. The lattice stays in one cool family — dim dots are a
+/// deep teal, lit dots (ring front passing, or a bright base glow) step up to
+/// cyan — so the mean drawn colour barely travels as rings sweep the field and
+/// the palette reads as calm rather than churning between warm and cool.
 #[inline]
 fn slot_for(base: f32, ring: f32) -> crate::Slot {
-    if ring > 0.05 {
-        if ring < 0.4 { 3 } else { 4 }
-    } else if base < 0.15 {
-        1
-    } else {
-        2
-    }
+    if ring > 0.05 || base >= 0.15 { 2 } else { 1 }
 }
 
 #[cfg(test)]

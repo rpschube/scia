@@ -2,19 +2,25 @@
 //! streaks on the beat.
 //!
 //! A fixed pool of stars drifts outward from the canvas centre along fixed
-//! per-star directions. Overall loudness rides the stream speed: the louder the
-//! track, the faster the field flows; in silence the speed falls to a slow floor
-//! so the field always drifts, never freezes. Every detected onset snaps up a
-//! streak envelope that stretches the **outer** field into radial lines — the
-//! stars past the middle of their travel elongate into streaks while the
-//! envelope is hot, then relax back to points as it decays. Inner stars and calm
-//! outer stars stay points throughout. Brightness rises gently toward the rim,
-//! so the field reads with depth.
+//! per-star directions. Overall loudness rides the stream speed, the star size
+//! and the brightness together: the louder the track, the faster the field
+//! flows, the larger and brighter each star swells; in silence the speed falls to
+//! a slow floor and the stars shrink and dim so the field always drifts calmly,
+//! never freezes. Every star trails a short **motion-blur tail** along its
+//! direction of travel (lengthening with the stream speed), so a star reads as a
+//! continuous glide rather than a blinking point — this, together with the
+//! loudness-driven size swell, is what keeps the streaming smooth on the coarse
+//! display grid. Every detected onset briefly extends the **outer** stars' tails
+//! into longer streaks (capped short) and then relaxes them. Brightness rises
+//! gently toward the rim, so the field reads with depth.
 //!
 //! There is no beat tracker yet (`beat_phase`/`tempo_bpm` are reserved zeros),
 //! so the motion is driven entirely from the onset stream and the
 //! engine-normalized `loudness` (the mono rms divided by a slow auto-reference),
-//! which is level-independent so real music actually drives the stream speed.
+//! which is level-independent so real music actually drives the stream speed. A
+//! secondary gate on the **raw** RMS damps the loudness-driven speed, size and
+//! brightness on genuinely quiet material (where the normalized loudness would
+//! otherwise read high), so a near-silent clip stays calm.
 //!
 //! # Geometry
 //!
@@ -41,8 +47,8 @@
 //! | key      | default | range       | meaning                                                           |
 //! |----------|---------|-------------|-------------------------------------------------------------------|
 //! | `stars`  | `192`   | `16..=512`  | number of stars in the pool, preallocated at init                 |
-//! | `speed`  | `0.35`  | `0.05..=2.0`| base outward speed (canvas units / second) that loudness rides on |
-//! | `streak` | `0.6`   | `0.0..=2.0` | streak-length gain on an onset (outer stars stretch into lines)   |
+//! | `speed`  | `0.2`   | `0.05..=2.0`| base outward speed (canvas units / second) that loudness rides on |
+//! | `streak` | `0.05`  | `0.0..=2.0` | streak-length gain on an onset (outer stars stretch into lines)   |
 //! | `size`   | `1.0`   | `0.2..=3.0` | star size multiplier                                              |
 //! | `spread` | `0.6`   | `0.0..=1.0` | spawn-direction spread: 1 spaces stars evenly around the circle, 0 scatters them into clusters |
 //!
@@ -54,9 +60,10 @@
 //!
 //! # Continuity
 //!
-//! [`Scene::state`] carries the loudness envelope, the streak (onset) envelope
-//! and the onset-edge bookkeeping, so a hot reload keeps the current flow speed
-//! and does not re-fire the streak. The star positions are **not** carried: the
+//! [`Scene::state`] carries the loudness envelope, the raw-RMS envelope, the
+//! streak (onset) envelope and the onset-edge bookkeeping, so a hot reload keeps
+//! the current flow speed and does not re-fire the streak. The star positions are
+//! **not** carried: the
 //! pool re-seeds deterministically at [`Scene::init`] and re-settles into a full
 //! field within a few frames, so a frame's worth of positions is not worth
 //! serializing — the same judgment `spectra` makes for its per-bar heights.
@@ -71,21 +78,62 @@ const SPEED_FLOOR: f32 = 0.15;
 /// Loudness-follower time constant (seconds).
 const LOUD_TAU: f32 = 0.15;
 
+/// Raw-RMS smoothing time constant (seconds) for the level gate below.
+const RMS_TAU: f32 = 0.25;
+
+/// Raw-RMS level at which the level gate reaches full strength. Normalized
+/// loudness reads a steady quiet clip as loud, which would keep the field
+/// streaming and swelling; gating the loudness-driven speed, size and brightness
+/// on raw RMS keeps genuinely quiet material calm while leaving louder clips
+/// untouched.
+const RMS_REF: f32 = 0.06;
+
 /// Streak-envelope decay time constant (seconds): the onset snap decays over
 /// roughly this long back to points.
 const ONSET_TAU: f32 = 0.25;
 
 /// Base star diameter as a fraction of the canvas height, before the `size`
 /// param and the per-star jitter scale it.
-const STAR_SIZE: f32 = 0.006;
+const STAR_SIZE: f32 = 0.044;
+
+/// Floor on the loudness gate applied to star *size*: stars are small (and cheap
+/// on the quiet-stillness budget) when the music is quiet and swell to their full
+/// multi-cell footprint when it is loud. The big loud-passage footprint is what
+/// turns the streaming into a smooth glide over the coarse grid — taming the
+/// jitter exactly where the music is busiest — without a large static field
+/// inflating the still passages.
+const SIZE_QUIET: f32 = 0.4;
+
+/// Base motion-blur tail length (fraction of the canvas) every star trails along
+/// its direction of travel, before it is scaled by the stream speed. A short
+/// tail turns each star's frame-to-frame hop into a continuous glide instead of a
+/// blinking point — the tails, not larger points, are what tame the streaming
+/// jitter, and because the tail rides the (loudness-driven) stream speed the
+/// field's motion tracks the music without any onset spike.
+const BASE_TAIL: f32 = 0.045;
 
 /// Brightness of an inner star; the rim reaches `1.0`. The field brightens
 /// gently outward so it reads with depth.
 const INNER_BRIGHT: f32 = 0.35;
 
+/// Floor on the loudness gate applied to star brightness: the field keeps this
+/// fraction of its brightness at silence and brightens toward full as the music
+/// swells, so overall brightness rides the music (and quiet passages dim and
+/// settle) rather than shimmering at a constant level.
+const STAR_QUIET: f32 = 0.25;
+
 /// A star past this fraction of its exit radius is an "outer" star that can
 /// streak; inner stars always render as points.
 const STREAK_MID: f32 = 0.5;
+
+/// Fraction of its travel over which a freshly spawned star fades up from dark,
+/// so a respawn eases in near the centre instead of popping into existence.
+const BIRTH_FADE: f32 = 0.08;
+
+/// Fraction of its travel (near the exit radius) over which a star fades back to
+/// dark before it recycles, so a rim star dims out instead of vanishing at full
+/// brightness — the single biggest source of frame-to-frame brightness jitter.
+const EXIT_FADE: f32 = 0.14;
 
 /// The streak envelope must exceed this to draw lines; below it the field has
 /// relaxed back to points.
@@ -94,9 +142,11 @@ const STREAK_EPS: f32 = 0.03;
 /// Maps the dimensionless speed factor onto a normalized streak length.
 const STREAK_LEN_SCALE: f32 = 0.35;
 
-/// Upper bound on a streak's normalized length, so a loud onset never draws a
-/// line across the whole canvas.
-const MAX_STREAK: f32 = 0.4;
+/// Upper bound on a streak's normalized length. Kept short: a streak's job here
+/// is to give each outer star a brief sustained tail that smooths its motion into
+/// a glide (taming flicker), not to fling a long line across the canvas — long
+/// streaks make the onset response spike far past the calm band we want.
+const MAX_STREAK: f32 = 0.16;
 
 /// Radius (aspect-corrected) a respawned star starts at, scattered up to this so
 /// a burst of respawns does not fire a synchronized ring out of the centre.
@@ -124,14 +174,14 @@ pub static PARAMS: &[ParamSpec] = &[
     },
     ParamSpec {
         key: "speed",
-        default: 0.35,
+        default: 0.2,
         min: 0.05,
         max: 2.0,
         doc: "base outward speed (canvas units / second) that loudness rides on",
     },
     ParamSpec {
         key: "streak",
-        default: 0.6,
+        default: 0.05,
         min: 0.0,
         max: 2.0,
         doc: "streak-length gain on an onset (outer stars stretch into lines)",
@@ -214,6 +264,8 @@ pub struct Starfall {
     // --- live state ----------------------------------------------------
     /// Smoothed loudness in `0.0..=1.0` driving the stream speed.
     loud_env: f32,
+    /// Smoothed raw RMS, for the level gate on the loudness-driven responses.
+    rms_env: f32,
     /// Streak envelope in `0.0..=1.0`: snaps to 1 on an onset, decays to 0.
     onset_env: f32,
     /// Previous frame's onset flag, for rising-edge detection.
@@ -238,12 +290,13 @@ impl Starfall {
             stars: Vec::new(),
             aspect: 1.0,
             loud_env: 0.0,
+            rms_env: 0.0,
             onset_env: 0.0,
             prev_onset: false,
             prev_onset_age_ms: 0.0,
             stars_param: DEFAULT_STARS as f32,
-            speed: 0.35,
-            streak: 0.6,
+            speed: 0.2,
+            streak: 0.05,
             size: 1.0,
             spread: 0.6,
         }
@@ -363,6 +416,7 @@ impl Scene for Starfall {
         self.read_params(&ctx.params);
         self.build_field(ctx.aspect);
         self.loud_env = 0.0;
+        self.rms_env = 0.0;
         self.onset_env = 0.0;
         self.prev_onset = false;
         self.prev_onset_age_ms = 0.0;
@@ -381,6 +435,10 @@ impl Scene for Starfall {
         let loud = f.loudness.clamp(0.0, 1.0);
         let k = 1.0 - decay(dt, LOUD_TAU);
         self.loud_env += (loud - self.loud_env) * k;
+        // Track raw RMS for the level gate: quiet material damps the loudness-
+        // driven speed even when the normalized loudness reads high.
+        self.rms_env += (f.rms.max(0.0) - self.rms_env) * (1.0 - decay(dt, RMS_TAU));
+        let rms_gate = (self.rms_env / RMS_REF).clamp(0.0, 1.0);
 
         // Streak envelope: snap to full on a fresh onset, otherwise decay. Fire
         // on a rising edge, or when a fresh onset resets `onset_age_ms` below the
@@ -398,7 +456,7 @@ impl Scene for Starfall {
         // floor, so silence is a slow drift, not a freeze. A star that leaves the
         // canvas respawns near the centre with a fresh deterministic sequence.
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
-        let speed_factor = self.speed * (SPEED_FLOOR + self.loud_env);
+        let speed_factor = self.speed * (SPEED_FLOOR + self.loud_env * rms_gate);
         for (i, star) in self.stars.iter_mut().enumerate() {
             star.radius += speed_factor * star.speed_jitter * dt;
             if star.radius > star.r_exit {
@@ -409,10 +467,21 @@ impl Scene for Starfall {
     }
 
     fn render(&mut self, canvas: &mut Canvas) {
+        // A raw-RMS level gate so a genuinely quiet clip stays calm even when its
+        // normalized loudness reads high; it damps the loudness term in the speed,
+        // brightness and size below.
+        let rms_gate = (self.rms_env / RMS_REF).clamp(0.0, 1.0);
+        let loud = self.loud_env * rms_gate;
         // The dimensionless speed factor (floor..≈1.15) drives streak length, so
         // streaks lengthen with loudness independently of the `speed` param.
-        let speed_factor = SPEED_FLOOR + self.loud_env;
+        let speed_factor = SPEED_FLOOR + loud;
         let streaking_env = self.onset_env;
+        // Loudness gate on brightness: the whole field dims in quiet passages and
+        // swells when loud, tying overall brightness to the music.
+        let loud_gate = STAR_QUIET + (1.0 - STAR_QUIET) * loud;
+        // Star size also rides loudness: small and calm when quiet, swelling to a
+        // smooth multi-cell footprint when loud.
+        let size_gate = SIZE_QUIET + (1.0 - SIZE_QUIET) * loud;
 
         for star in &self.stars {
             let frac = if star.r_exit > 0.0 {
@@ -424,45 +493,51 @@ impl Scene for Starfall {
             let hx = 0.5 + star.radius * star.cos / self.aspect;
             let hy = 0.5 + star.radius * star.sin;
 
-            let bright = (INNER_BRIGHT + (1.0 - INNER_BRIGHT) * frac).clamp(0.0, 1.0);
-            let base = STAR_SIZE * self.size * star.size_jitter;
+            // Ease brightness up at birth and down toward the exit so a recycled
+            // star never pops from full brightness to gone (or gone to full):
+            // that discontinuity is what read as flicker rather than motion.
+            let birth = (frac / BIRTH_FADE).clamp(0.0, 1.0);
+            let exit = ((1.0 - frac) / EXIT_FADE).clamp(0.0, 1.0);
+            let bright = ((INNER_BRIGHT + (1.0 - INNER_BRIGHT) * frac) * birth * exit * loud_gate)
+                .clamp(0.0, 1.0);
+            let base = STAR_SIZE * self.size * star.size_jitter * size_gate;
 
+            // Every star trails a short motion-blur tail along its direction of
+            // travel; the tail rides the stream speed, so it lengthens with
+            // loudness. An onset extends the *outer* stars' tails into bright
+            // streaks (capped short), the extra length being the onset response.
+            let blur = BASE_TAIL * (0.35 + speed_factor) * star.speed_jitter;
             let streaking = frac > STREAK_MID && streaking_env > STREAK_EPS;
-            if streaking {
-                // Length grows with the streak envelope, the speed factor and the
-                // per-star speed, capped so a loud onset never spans the canvas.
-                let len = (self.streak
-                    * streaking_env
-                    * speed_factor
-                    * star.speed_jitter
-                    * STREAK_LEN_SCALE)
-                    .min(MAX_STREAK);
-                // Screen-space unit direction of motion (motion grows the radius).
-                let dx = star.cos / self.aspect;
-                let mag = dx.hypot(star.sin).max(1e-6);
-                let ux = dx / mag;
-                let uy = star.sin / mag;
-                let tx = hx - ux * len;
-                let ty = hy - uy * len;
-                let width = base * 0.8;
-                canvas.line(
-                    tx,
-                    ty,
-                    hx,
-                    hy,
-                    width,
-                    Style::new(slot_for(frac, true), bright),
-                );
+            let streak_len = if streaking {
+                (self.streak * streaking_env * speed_factor * star.speed_jitter * STREAK_LEN_SCALE)
+                    .min(MAX_STREAK)
             } else {
-                let size = base * (0.55 + 0.9 * frac);
-                canvas.point(hx, hy, size, Style::new(slot_for(frac, false), bright));
-            }
+                0.0
+            };
+            let len = blur + streak_len;
+            // Screen-space unit direction of motion (motion grows the radius).
+            let dx = star.cos / self.aspect;
+            let mag = dx.hypot(star.sin).max(1e-6);
+            let ux = dx / mag;
+            let uy = star.sin / mag;
+            let tx = hx - ux * len;
+            let ty = hy - uy * len;
+            let width = base * (0.8 + 0.4 * frac);
+            canvas.line(
+                tx,
+                ty,
+                hx,
+                hy,
+                width,
+                Style::new(slot_for(frac, streaking), bright),
+            );
         }
     }
 
     fn state(&self) -> SceneState {
         let mut s = SceneState::new();
         s.set("loud_env", self.loud_env);
+        s.set("rms_env", self.rms_env);
         s.set("onset_env", self.onset_env);
         s.set("prev_onset", if self.prev_onset { 1.0 } else { 0.0 });
         s.set("prev_onset_age_ms", self.prev_onset_age_ms);
@@ -472,6 +547,9 @@ impl Scene for Starfall {
     fn restore(&mut self, s: SceneState) {
         if let Some(v) = s.get("loud_env") {
             self.loud_env = v;
+        }
+        if let Some(v) = s.get("rms_env") {
+            self.rms_env = v;
         }
         if let Some(v) = s.get("onset_env") {
             self.onset_env = v;
@@ -592,6 +670,17 @@ mod tests {
             .count()
     }
 
+    /// The longest line (streak/tail) in a render, in screen-space length.
+    fn max_line_len(prims: &[Primitive]) -> f32 {
+        prims
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::Line { x0, y0, x1, y1, .. } => Some((x1 - x0).hypot(y1 - y0)),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max)
+    }
+
     /// The index of the star closest to the centre; safe to advance a few frames
     /// without it reaching its exit radius.
     fn innermost(scene: &Starfall) -> usize {
@@ -605,34 +694,36 @@ mod tests {
     }
 
     #[test]
-    fn onset_streaks_appear_then_relax_to_points() {
+    fn onset_extends_streaks_then_relaxes() {
         let mut s = inited(1.0);
+        // Drive the streak mechanism with a meaningful gain (the shipped default
+        // keeps it gentle; here we exercise the mechanism itself).
+        s.streak = 0.8;
 
-        // A quiet frame: no onset, so the outer field is points, no lines.
+        // Every star trails a short motion-blur tail, so a render is always all
+        // lines — one per star — whether calm or hit.
         s.update(&quiet(), 0.05);
+        let calm = render_prims(&mut s);
         assert_eq!(
-            count_lines(&render_prims(&mut s)),
-            0,
-            "no streaks when calm"
+            count_lines(&calm),
+            s.stars.len(),
+            "every star trails a tail"
         );
+        let calm_len = max_line_len(&calm);
 
-        // An onset snaps the streak envelope to full: outer stars streak.
+        // An onset snaps the streak envelope to full: outer stars' tails extend
+        // into visibly longer streaks than the calm motion-blur tails.
         s.update(&snap(true, 0.0, 0.4), 0.05);
         let hot = render_prims(&mut s);
         assert!(
-            count_lines(&hot) > 0,
-            "an onset stretches outer stars into lines"
+            max_line_len(&hot) > calm_len * 1.5,
+            "an onset stretches outer stars into longer streaks: {} vs calm {}",
+            max_line_len(&hot),
+            calm_len
         );
 
-        // Every line lives beyond the mid-field (an inner star never streaks).
-        for p in &hot {
-            if let Primitive::Line { x1, y1, .. } = p {
-                let d = (x1 - 0.5).hypot(y1 - 0.5);
-                assert!(d > 1e-3, "a streak head is away from the centre");
-            }
-        }
-
-        // Let the envelope decay over a long silence: the field relaxes to points.
+        // Let the envelope decay over a long silence: the streaks relax back to
+        // the short calm tails.
         for _ in 0..80 {
             s.update(&quiet(), 0.05);
         }
@@ -641,10 +732,9 @@ mod tests {
             "streak envelope decayed: {}",
             s.onset_env
         );
-        assert_eq!(
-            count_lines(&render_prims(&mut s)),
-            0,
-            "streaks relaxed back to points"
+        assert!(
+            max_line_len(&render_prims(&mut s)) <= calm_len * 1.2,
+            "streaks relaxed back to the calm tail length"
         );
     }
 

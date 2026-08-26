@@ -1,0 +1,11 @@
+# phosphor A — "crisp": a short persistence so the trace is dynamic and the beam
+# reads sharp, maximising onset response. Contested dimension: persistence
+# (responsiveness vs afterglow calm).
+[preset]
+name = "phosphor-crisp"
+scene = "phosphor"
+description = "Phosphor with a short persistence — crisp, highly responsive trace."
+mood = "retro"
+
+[params]
+decay = 0.12

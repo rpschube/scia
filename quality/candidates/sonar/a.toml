@@ -1,0 +1,11 @@
+# sonar A — "lingering": a long contact persistence so onset contacts leave a
+# bright, slow-fading decay trail that dominates the display. Contested
+# dimension: contact persistence (headline dwell vs quick clean flares).
+[preset]
+name = "sonar-lingering"
+scene = "sonar"
+description = "Radar sweep with long-lived contacts — bright, lingering decay trails."
+mood = "vigilant"
+
+[params]
+decay = 2.5

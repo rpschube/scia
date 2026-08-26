@@ -1,0 +1,11 @@
+# lattice B — "calm": a dimmer base glow so the field sits quieter between beats,
+# leaning on the rings and the loudness wave for its motion. Contested dimension:
+# base presence vs calm.
+[preset]
+name = "lattice-calm"
+scene = "lattice"
+description = "Lattice with a dimmer base glow — calmer, motion-led."
+mood = "serene"
+
+[params]
+glow = 0.28
