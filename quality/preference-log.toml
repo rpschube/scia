@@ -29,3 +29,115 @@ scene = "*"
 clip = "*"
 winner = "neither"
 why = "album-art palettes lean too grey — bias vibrant unless the art is truly neutral"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "*"
+clip = "*"
+winner = "neither"
+why = "CROSS-CUTTING #1: color barely responds anywhere — every scene sticks to a few static colors; sensitivity must drive color (hue/saturation movement), not just brightness/triggers"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "*"
+clip = "*"
+winner = "neither"
+why = "CROSS-CUTTING #2: audio should drive the animations themselves, not just their triggers or brightness"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "ember-drift"
+clip = "house-magnetz"
+winner = "b"
+why = "lush wins; still too cold though better; wants color changing tied to movement sensitivity"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "verso"
+clip = "hiphop-gotta-love-me"
+winner = "b"
+why = "veil wins; too cold but better; NO color changing at all today; drops read as 'swimming sperm' — silhouette needs work"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "bloom"
+clip = "classical-beethoven5-i"
+winner = "b"
+why = "sprawling wins; sensitivity great, movement great; tie sensitivity into colors; smallest/resting state triggers a bit too easily"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "aurora"
+clip = "ambient-unraveling"
+winner = "b"
+why = "dramatic wins; pretty good — but response seems to drive only brightness; tie it to movement and blob shapes too"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "tide"
+clip = "ambient-eternity"
+winner = "a"
+why = "subtle wins only by default: waves flicker a lot and audio does not feel connected; b way too hectic; re-judge after flicker/coupling fix"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "lattice"
+clip = "house-magnetz"
+winner = "neither"
+why = "both pretty bad and near-indistinguishable; animations themselves are terrible — too subtle yet too busy, no color change; needs an animation rethink, not param tweaks"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "phosphor"
+clip = "hiphop-why"
+winner = "a"
+why = "crisp wins; pretty good; audio should impact the animations, not just their triggers"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "starfall"
+clip = "transient-balrog-boogie"
+winner = "a"
+why = "streaky wins, one of the best; great sensitivity; wants animation/color variety (streak origin always looks the same); find middle ground on streaks — or tie streak size to the sound"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "sonar"
+clip = "house-urbana-metronica"
+winner = "b"
+why = "snappy wins the pair, but the scene fails: audio doesn't feel like it drives anything, 'might as well be a screensaver'; candidate for tossing and replacing with a new idea (raindrop/SCIA-14?)"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "spectra"
+clip = "house-fresh-flowers"
+winner = "a"
+why = "still the benchmark, overall good; same color complaint as everywhere — stuck on few colors with little change"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "starfall"
+clip = "ambient-ultra-deep-field"
+winner = "neither"
+why = "on ambient it flickers/moves a lot while the music is slow chill constant — scenes must match the music's ENERGY CHARACTER, not just its level"
+
+[[verdict]]
+date = "2026-09-05"
+by = "maintainer"
+scene = "*"
+clip = "spoken-raven-goringe"
+winner = "a"
+why = "spoken-word behavior works great, just a bit too flickery"
