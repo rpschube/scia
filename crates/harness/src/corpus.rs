@@ -340,7 +340,9 @@ mod tests {
         assert!(synth.title.is_empty());
         assert!(synth.source_url.is_empty());
         // Re-serialising loses nothing: byte-identical to the committed file.
-        assert_eq!(manifest.to_toml().unwrap(), original);
+        // Newline-normalized: a Windows git checkout may hand the file over
+        // with CRLF line endings while the serializer always emits LF.
+        assert_eq!(manifest.to_toml().unwrap(), original.replace("\r\n", "\n"));
     }
 
     #[test]
