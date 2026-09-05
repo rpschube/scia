@@ -116,7 +116,7 @@ by = "maintainer"
 scene = "sonar"
 clip = "house-urbana-metronica"
 winner = "b"
-why = "snappy wins the pair, but the scene fails: audio doesn't feel like it drives anything, 'might as well be a screensaver'; candidate for tossing and replacing with a new idea (raindrop/SCIA-14?)"
+why = "snappy wins the pair, but the scene fails: audio doesn't feel like it drives anything, 'might as well be a screensaver'; TOSS and replace with the raindrop scene (SCIA-14) — maintainer-confirmed"
 
 [[verdict]]
 date = "2026-09-05"
@@ -137,7 +137,7 @@ why = "on ambient it flickers/moves a lot while the music is slow chill constant
 [[verdict]]
 date = "2026-09-05"
 by = "maintainer"
-scene = "*"
+scene = "starfall"
 clip = "spoken-raven-goringe"
 winner = "a"
 why = "spoken-word behavior works great, just a bit too flickery"
